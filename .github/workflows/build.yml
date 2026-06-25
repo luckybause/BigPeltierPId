@@ -1,8 +1,8 @@
 name: Build Windows EXE
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -27,9 +27,8 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name PeltierPID app/main.py
 
-      - name: Wgraj EXE do Release
-        uses: softprops/action-gh-release@v2
+      - name: Zapisz EXE jako Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/PeltierPID.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: PeltierPID-Windows
+          path: dist/PeltierPID.exe
