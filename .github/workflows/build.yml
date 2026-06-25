@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Skonfiguruj Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Zainstaluj zaleznosci
+        run: |
+          python -m pip install --upgrade pip
+          pip install customtkinter pyserial matplotlib pyinstaller
+
+      - name: Zbuduj EXE
+        run: |
+          pyinstaller --onefile --windowed --name PeltierPID app/main.py
+
+      - name: Wgraj EXE do Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PeltierPID.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
