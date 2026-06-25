@@ -1,3 +1,0 @@
-customtkinter>=5.2.0
-pyserial>=3.5
-matplotlib>=3.7.0
