@@ -6,7 +6,7 @@ Panel sterowania PID Peltiera (Feed-Forward) z dwukierunkowa komunikacja JSON.
 Firmware: ItsyBitsy M0 + Cytron MDD10A + 2x MAX31856
 """
 
-import sys, os, time, csv, json, threading, queue
+import sys, os, time, csv, json, threading, queue, socket
 from datetime import datetime
 from pathlib import Path
 
@@ -152,6 +152,99 @@ class SliderField:
         self.scale.config(state=st); self.entry.config(state=st)
 
 # ════════════════════════════════════════════════════════
+#  KEITHLEY 2611B - klient TSP przez raw socket (port 5025)
+# ════════════════════════════════════════════════════════
+class KeithleyClient:
+    """Komunikacja z Keithley 2611B przez TSP (Lua) na porcie 5025 (scpi-raw).
+    Domyslny jezyk komend serii 2600B to TSP, nie SCPI."""
+
+    PORT = 5025
+    TIMEOUT = 2.0
+
+    def __init__(self):
+        self.sock = None
+        self.connected = False
+        self.ip = ""
+        self.idn = ""
+
+    def connect(self, ip):
+        self.ip = ip
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.TIMEOUT)
+        s.connect((ip, self.PORT))
+        s.settimeout(self.TIMEOUT)
+        self.sock = s
+        self.connected = True
+        try:
+            self.idn = self._query("*IDN?")
+        except Exception:
+            self.idn = ""
+        return self.idn
+
+    def disconnect(self):
+        self.connected = False
+        if self.sock:
+            try: self.sock.close()
+            except: pass
+            self.sock = None
+
+    def _send(self, cmd):
+        if not self.sock:
+            raise ConnectionError("Keithley not connected")
+        self.sock.sendall((cmd + "\n").encode("ascii"))
+
+    def _recv_line(self):
+        buf = b""
+        while True:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+        return buf.decode("ascii", errors="replace").strip()
+
+    def _query(self, cmd):
+        self._send(cmd)
+        return self._recv_line()
+
+    def _exec(self, cmd):
+        """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania)."""
+        self._send(cmd)
+
+    def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1):
+        """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance)."""
+        ch = f"smu{channel}"
+        self._exec(f"{ch}.reset()")
+        self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
+        self._exec(f"{ch}.source.levelv = {voltage:.6f}")
+        self._exec(f"{ch}.source.limiti = {ilimit:.6f}")
+        self._exec(f"{ch}.measure.nplc = 0.1")
+        self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_ON")
+
+    def output_on(self, channel="a"):
+        self._exec(f"smu{channel}.source.output = smu{channel}.OUTPUT_ON")
+
+    def output_off(self, channel="a"):
+        self._exec(f"smu{channel}.source.output = smu{channel}.OUTPUT_OFF")
+
+    def set_voltage(self, channel="a", voltage=0.0):
+        self._exec(f"smu{channel}.source.levelv = {voltage:.6f}")
+
+    def measure_iv(self, channel="a"):
+        """Zwraca (prad_A, napiecie_V) z jednego zapytania (szybsze niz dwa osobne)."""
+        resp = self._query(f"print(smu{channel}.measure.i(), smu{channel}.measure.v())")
+        parts = resp.replace(",", " ").split()
+        i_val = float(parts[0])
+        v_val = float(parts[1]) if len(parts) > 1 else float('nan')
+        return i_val, v_val
+
+    def measure_i(self, channel="a"):
+        resp = self._query(f"print(smu{channel}.measure.i())")
+        return float(resp)
+
+
+# ════════════════════════════════════════════════════════
 #  APLIKACJA GLOWNA
 # ════════════════════════════════════════════════════════
 class PeltierControl:
@@ -174,6 +267,26 @@ class PeltierControl:
         self.spt = []; self.spa = []; self.pwm = []; self.fanv = []
         self.t0 = None
         self.data_queue = queue.Queue()
+
+        self.raw_maxrows = 2000
+        self.raw_rows = []
+        self.raw_paused = False
+        self.raw_autoscroll = True
+
+        # Keithley 2611B (SMU) - pomiar pradu przez LAN/TSP, synchronizowany z PID
+        self.keithley = KeithleyClient()
+        self.keithley_connected = False
+        self.keithley_running = False
+        self.keithley_thread = None
+        self.keithley_lock = threading.Lock()
+        self.keithley_last_i = None
+        self.keithley_last_v = None
+        self.keithley_last_ts = None
+        self.keithley_ip = ""
+        self.keithley_voltage = 1.0
+        self.keithley_ilimit = 0.1
+        self.keithley_period_s = 0.1
+        self.keithley_queue = queue.Queue()
 
         self.reach_start_t = None
         self.reach_start_temp = None
@@ -304,6 +417,7 @@ class PeltierControl:
             'pid_on': pid_on,
             'heat': pwm_raw >= 0,
             'kp': kp, 'ki': ki, 'kd': kd,
+            'state': state,
         }
         self.data_queue.put(d)
 
@@ -390,10 +504,12 @@ class PeltierControl:
         nb.pack(fill='both', expand=True)
         t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
         t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
+        t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='RAW DATA')
         t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
         t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
         self.build_live(t1)
         self.build_advanced(t2)
+        self.build_raw(t5)
         self.build_arch(t3)
         self.build_conn(t4)
 
@@ -434,6 +550,7 @@ class PeltierControl:
         self.cards['sp']    = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
         self.cards['rate']  = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
         self.cards['pwm']   = self._stat_card(cards, "PWM", "%", C['green'])
+        self.cards['kcur']  = self._stat_card(cards, "I KEITHLEY", "A", C['orange'])
 
         ctrl = tk.Frame(topbar, bg=C['bg'])
         ctrl.pack(side='right', padx=(8, 0))
@@ -714,14 +831,17 @@ class PeltierControl:
         time.sleep(0.05)
         self.send("START")
         self._update_run_button(True)
+        self.keithley_start_measurement()
 
     def do_stop(self):
         self.send("STOP")
         self._update_run_button(False)
+        self.keithley_stop_measurement()
 
     def do_estop(self):
         self.send("STOP")
         self._update_run_button(False)
+        self.keithley_stop_measurement()
 
     def toggle_fan(self):
         if not self.connected:
@@ -755,6 +875,158 @@ class PeltierControl:
             self.send("RESET")
 
     # ─── ZAKLADKA CONNECTION ─────────────────────────────
+    # ─── ZAKLADKA RAW DATA ───────────────────────────────
+    def build_raw(self, parent):
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=14, pady=14)
+
+        hd = tk.Frame(wrap, bg=C['bg'])
+        hd.pack(fill='x', pady=(0, 10))
+        tk.Label(hd, text="RAW THERMOCOUPLE DATA", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(12), 'bold')).pack(side='left')
+        tk.Label(hd, text="  surowy strumien T1/T2 z urzadzenia, 10 Hz",
+                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
+
+        self.btn_raw_pause = tk.Button(hd, text="⏸ PAUSE", command=self._toggle_raw_pause,
+                                       bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(9), 'bold'),
+                                       relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
+                                       highlightthickness=1, highlightbackground=C['yellow'],
+                                       activebackground=C['panel3'])
+        self.btn_raw_pause.pack(side='right', padx=(6, 0))
+        mk_btn_outline(hd, "⤓ EXPORT CSV", self.export_raw_csv, C['green']).pack(side='right', padx=(6, 0))
+        mk_btn_outline(hd, "WYCZYSC", self.clear_raw, C['dim']).pack(side='right', padx=(6, 0))
+
+        self.raw_count_lbl = tk.Label(hd, text="0 probek", bg=C['bg'], fg=C['dim'],
+                                      font=(FONT, fsz(9)))
+        self.raw_count_lbl.pack(side='right', padx=(6, 12))
+
+        # Tabela (Treeview)
+        table_wrap = tk.Frame(wrap, bg=C['panel'])
+        table_wrap.pack(fill='both', expand=True)
+        tk.Frame(table_wrap, bg=C['blue'], height=3).pack(fill='x')
+
+        cols = ('idx', 'czas_fw', 'pc_time', 't1', 't2', 'sp', 'spa', 'pct', 'fan', 'k_i', 'k_v', 'state')
+        headers = {
+            'idx': '#', 'czas_fw': 'czas FW [s]', 'pc_time': 'czas PC',
+            't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP cel [C]',
+            'spa': 'SP akt [C]', 'pct': 'Peltier %', 'fan': 'Fan %',
+            'k_i': 'I Keithley [A]', 'k_v': 'V Keithley [V]', 'state': 'stan'
+        }
+        widths = {
+            'idx': 50, 'czas_fw': 90, 'pc_time': 110, 't1': 80, 't2': 80,
+            'sp': 90, 'spa': 90, 'pct': 80, 'fan': 70,
+            'k_i': 110, 'k_v': 100, 'state': 70
+        }
+
+        style = ttk.Style()
+        style.configure('Raw.Treeview', background=C['bg2'], fieldbackground=C['bg2'],
+                        foreground=C['text'], font=(FONT, fsz(9)), rowheight=22, borderwidth=0)
+        style.configure('Raw.Treeview.Heading', background=C['panel'], foreground=C['dim'],
+                        font=(FONT, fsz(9), 'bold'), borderwidth=0)
+        style.map('Raw.Treeview', background=[('selected', C['panel3'])])
+
+        tree_frame = tk.Frame(table_wrap, bg=C['panel'])
+        tree_frame.pack(fill='both', expand=True, padx=8, pady=8)
+
+        ysb = ttk.Scrollbar(tree_frame, orient='vertical')
+        ysb.pack(side='right', fill='y')
+
+        self.raw_tree = ttk.Treeview(tree_frame, columns=cols, show='headings',
+                                     style='Raw.Treeview', yscrollcommand=ysb.set)
+        for c in cols:
+            self.raw_tree.heading(c, text=headers.get(c, c))
+            self.raw_tree.column(c, width=widths.get(c, 80), anchor='center')
+        self.raw_tree.pack(side='left', fill='both', expand=True)
+        ysb.config(command=self.raw_tree.yview)
+
+        # Wykrywaj reczne przewijanie - wylacz autoscroll
+        def on_scroll(*a):
+            self.raw_autoscroll = (self.raw_tree.yview()[1] >= 0.999)
+        self.raw_tree.bind('<MouseWheel>', lambda e: setattr(self, 'raw_autoscroll', False))
+        self.raw_tree.bind('<Button-4>', lambda e: setattr(self, 'raw_autoscroll', False))
+        self.raw_tree.bind('<Button-5>', lambda e: setattr(self, 'raw_autoscroll', False))
+
+        info = tk.Label(wrap, text="Tabela pokazuje ostatnie probki (max 2000). Pelny zapis surowych danych od START do STOP jest w zakladce ARCHIVE.",
+                        bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)))
+        info.pack(anchor='w', pady=(8, 0))
+
+    def _toggle_raw_pause(self):
+        self.raw_paused = not self.raw_paused
+        if self.raw_paused:
+            self.btn_raw_pause.config(text="▶ RESUME", fg=C['green'], highlightbackground=C['green'])
+        else:
+            self.btn_raw_pause.config(text="⏸ PAUSE", fg=C['yellow'], highlightbackground=C['yellow'])
+
+    def clear_raw(self):
+        self.raw_rows = []
+        if hasattr(self, 'raw_tree'):
+            for item in self.raw_tree.get_children():
+                self.raw_tree.delete(item)
+        if hasattr(self, 'raw_count_lbl'):
+            self.raw_count_lbl.config(text="0 probek")
+
+    def _raw_append(self, row):
+        # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v)
+        self.raw_rows.append(row)
+        if len(self.raw_rows) > self.raw_maxrows:
+            self.raw_rows = self.raw_rows[-self.raw_maxrows:]
+            if hasattr(self, 'raw_tree'):
+                children = self.raw_tree.get_children()
+                if len(children) > self.raw_maxrows:
+                    for item in children[:len(children)-self.raw_maxrows]:
+                        self.raw_tree.delete(item)
+
+        if self.raw_paused or not hasattr(self, 'raw_tree'):
+            return
+        idx = len(self.raw_rows)
+        czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
+        t1s = f"{t1:.3f}" if t1 is not None else "—"
+        t2s = f"{t2:.3f}" if t2 is not None else "—"
+        kis = f"{k_i:.6e}" if k_i is not None else "—"
+        kvs = f"{k_v:.4f}" if k_v is not None else "—"
+        self.raw_tree.insert('', 'end', values=(
+            idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
+            f"{sp:.2f}", f"{spa:.2f}", f"{pct:.1f}", f"{fan:.1f}", kis, kvs, state
+        ))
+        if self.raw_autoscroll:
+            children = self.raw_tree.get_children()
+            if children:
+                self.raw_tree.see(children[-1])
+        self.raw_count_lbl.config(text=f"{len(self.raw_rows)} probek")
+
+    def export_raw_csv(self):
+        if not self.raw_rows:
+            messagebox.showinfo("Brak danych", "Brak danych do eksportu.")
+            return
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(
+            title="Eksportuj surowe dane", defaultextension=".csv",
+            initialfile=f"raw_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            filetypes=[("CSV", "*.csv")])
+        if not dest:
+            return
+        try:
+            with open(dest, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(['czas_firmware_s', 'timestamp_pc', 'temperatura1_C',
+                           'temperatura2_C', 'setpoint_cel_C', 'setpoint_aktywny_C',
+                           'peltier_pct', 'fan_pct', 'keithley_prad_A',
+                           'keithley_napiecie_V', 'stan'])
+                for row in self.raw_rows:
+                    czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
+                    w.writerow([
+                        f"{czas_fw:.3f}", pc_time,
+                        f"{t1:.3f}" if t1 is not None else "",
+                        f"{t2:.3f}" if t2 is not None else "",
+                        f"{sp:.3f}", f"{spa:.3f}", f"{pct:.2f}", f"{fan:.2f}",
+                        f"{k_i:.9e}" if k_i is not None else "",
+                        f"{k_v:.6f}" if k_v is not None else "",
+                        state
+                    ])
+            messagebox.showinfo("Zapisano", f"Wyeksportowano {len(self.raw_rows)} probek do:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Blad eksportu", str(e))
+
     def build_conn(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
         wrap.pack(fill='both', expand=True, padx=24, pady=24)
@@ -788,6 +1060,63 @@ class PeltierControl:
         mk_btn(br, "CONNECT", self.conn_from_tab, C['green']).pack(side='left', padx=(0, 8))
         mk_btn_outline(br, "DISCONNECT", self.disconnect, C['red']).pack(side='left')
 
+        # ── KEITHLEY 2611B (LAN/TSP) ──
+        kcard = tk.Frame(wrap, bg=C['panel'])
+        kcard.pack(fill='x', pady=(0, 16))
+        tk.Frame(kcard, bg=C['orange'], height=3).pack(fill='x')
+        kinner = tk.Frame(kcard, bg=C['panel'])
+        kinner.pack(fill='x', padx=20, pady=16)
+
+        khd = tk.Frame(kinner, bg=C['panel'])
+        khd.pack(fill='x', pady=(0, 12))
+        tk.Label(khd, text="KEITHLEY 2611B (LAN)", bg=C['panel'], fg=C['text'],
+                 font=(FONT, fsz(12), 'bold')).pack(side='left')
+        self.keithley_status_lbl = tk.Label(khd, text="● not connected", bg=C['panel'],
+                                            fg=C['dim2'], font=(FONT, fsz(9)))
+        self.keithley_status_lbl.pack(side='right')
+
+        krow1 = tk.Frame(kinner, bg=C['panel'])
+        krow1.pack(fill='x', pady=4)
+        tk.Label(krow1, text="IP address", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9)), width=14, anchor='w').pack(side='left')
+        self.keithley_ip_entry = tk.Entry(krow1, bg=C['bg2'], fg=C['text'],
+                                          font=(FONT, fsz(10)), relief='flat', bd=0,
+                                          insertbackground=C['orange'],
+                                          highlightthickness=1, highlightbackground=C['border'])
+        self.keithley_ip_entry.pack(side='left', fill='x', expand=True, ipady=4)
+        self.keithley_ip_entry.insert(0, "192.168.1.50")
+
+        krow2 = tk.Frame(kinner, bg=C['panel'])
+        krow2.pack(fill='x', pady=4)
+        tk.Label(krow2, text="Napiecie [V]", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9)), width=14, anchor='w').pack(side='left')
+        self.keithley_v_entry = tk.Entry(krow2, bg=C['bg2'], fg=C['text'],
+                                         font=(FONT, fsz(10)), relief='flat', bd=0,
+                                         insertbackground=C['orange'], width=10,
+                                         highlightthickness=1, highlightbackground=C['border'])
+        self.keithley_v_entry.pack(side='left', ipady=4, padx=(0, 16))
+        self.keithley_v_entry.insert(0, "1.0")
+
+        tk.Label(krow2, text="Limit pradu [A]", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(side='left', padx=(0, 6))
+        self.keithley_i_entry = tk.Entry(krow2, bg=C['bg2'], fg=C['text'],
+                                         font=(FONT, fsz(10)), relief='flat', bd=0,
+                                         insertbackground=C['orange'], width=10,
+                                         highlightthickness=1, highlightbackground=C['border'])
+        self.keithley_i_entry.pack(side='left', ipady=4)
+        self.keithley_i_entry.insert(0, "0.1")
+
+        kbr = tk.Frame(kinner, bg=C['panel'])
+        kbr.pack(fill='x', pady=(10, 0))
+        mk_btn(kbr, "TEST CONNECTION", self.keithley_test_connect, C['orange']).pack(
+            side='left', padx=(0, 8))
+        mk_btn_outline(kbr, "DISCONNECT", self.keithley_disconnect, C['red']).pack(side='left')
+
+        tk.Label(kinner, text="Pomiar pradu startuje/zatrzymuje sie razem z PID (START/STOP w CONTROL).\n"
+                 "Domyslny protokol 2600B to TSP (Lua) przez port 5025.",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left').pack(anchor='w', pady=(10, 0))
+
         info = tk.Frame(wrap, bg=C['panel'])
         info.pack(fill='x')
         tk.Frame(info, bg=C['dim2'], height=3).pack(fill='x')
@@ -818,6 +1147,117 @@ class PeltierControl:
         s = self.conn_list.curselection()
         if s and self._ports:
             self.connect(self._ports[s[0]].device)
+
+    # ─── KEITHLEY 2611B ──────────────────────────────────
+    def _read_keithley_settings(self):
+        try:
+            ip = self.keithley_ip_entry.get().strip()
+            v = float(self.keithley_v_entry.get().replace(',', '.'))
+            ilim = float(self.keithley_i_entry.get().replace(',', '.'))
+            return ip, v, ilim
+        except ValueError:
+            return None, None, None
+
+    def keithley_test_connect(self):
+        ip, v, ilim = self._read_keithley_settings()
+        if not ip:
+            messagebox.showwarning("Brak IP", "Wpisz adres IP Keithleya.")
+            return
+        self.keithley_status_lbl.config(text="● laczenie...", fg=C['yellow'])
+        self.root.update_idletasks()
+
+        def worker():
+            try:
+                idn = self.keithley.connect(ip)
+                self.keithley_connected = True
+                self.keithley_ip = ip
+                self.root.after(0, lambda: self.keithley_status_lbl.config(
+                    text=f"● polaczono: {idn[:40]}", fg=C['green']))
+            except Exception as e:
+                self.keithley_connected = False
+                self.root.after(0, lambda: self.keithley_status_lbl.config(
+                    text=f"● blad: {e}", fg=C['red']))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def keithley_disconnect(self):
+        self.keithley_running = False
+        self.keithley.disconnect()
+        self.keithley_connected = False
+        self.keithley_status_lbl.config(text="● not connected", fg=C['dim2'])
+
+    def keithley_start_measurement(self):
+        """Wywolywane razem z do_start() PID - konfiguruje SMU, wlacza output, startuje watek pomiarowy."""
+        ip, v, ilim = self._read_keithley_settings()
+        if not ip:
+            return  # brak konfiguracji Keithleya - kontynuuj bez niego
+        self.keithley_voltage = v if v is not None else 1.0
+        self.keithley_ilimit = ilim if ilim is not None else 0.1
+
+        def worker():
+            try:
+                if not self.keithley_connected:
+                    idn = self.keithley.connect(ip)
+                    self.keithley_connected = True
+                    self.keithley_ip = ip
+                    self.root.after(0, lambda: self.keithley_status_lbl.config(
+                        text=f"● polaczono: {idn[:40]}", fg=C['green']))
+                self.keithley.setup_source_v_measure_i(
+                    "a", self.keithley_voltage, self.keithley_ilimit)
+                self.keithley.output_on("a")
+                self.keithley_running = True
+                self.root.after(0, lambda: self.keithley_status_lbl.config(
+                    text=f"● MIERZY  {self.keithley_voltage:.2f}V / lim {self.keithley_ilimit:.3f}A",
+                    fg=C['green']))
+                threading.Thread(target=self._keithley_poll_loop, daemon=True).start()
+            except Exception as e:
+                self.keithley_running = False
+                self.root.after(0, lambda: self.keithley_status_lbl.config(
+                    text=f"● blad startu: {e}", fg=C['red']))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def keithley_stop_measurement(self):
+        """Wywolywane razem z do_stop() PID - wylacza output, zatrzymuje watek."""
+        self.keithley_running = False
+        if self.keithley_connected:
+            def worker():
+                try:
+                    self.keithley.output_off("a")
+                except Exception:
+                    pass
+                self.root.after(0, lambda: self.keithley_status_lbl.config(
+                    text="● polaczono (output OFF)", fg=C['dim']))
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _keithley_poll_loop(self):
+        """Watek probkujacy prad/napiecie z Keithleya co keithley_period_s."""
+        while self.keithley_running and self.keithley_connected:
+            t_start = time.time()
+            try:
+                with self.keithley_lock:
+                    i_val, v_val = self.keithley.measure_iv("a")
+                ts_ms = time.time() * 1000.0
+                self.keithley_last_i = i_val
+                self.keithley_last_v = v_val
+                self.keithley_last_ts = ts_ms
+                self.keithley_queue.put((ts_ms, i_val, v_val))
+            except Exception as e:
+                self.root.after(0, lambda e=e: self.keithley_status_lbl.config(
+                    text=f"● blad pomiaru: {e}", fg=C['red']))
+                time.sleep(0.5)
+                continue
+            elapsed = time.time() - t_start
+            sleep_t = max(0.0, self.keithley_period_s - elapsed)
+            time.sleep(sleep_t)
+
+    def _keithley_latest(self, max_age_s=0.5):
+        """Zwraca (i, v) ostatniego pomiaru jesli swiezy, inaczej (None, None)."""
+        if self.keithley_last_ts is None:
+            return None, None
+        age = (time.time() * 1000.0 - self.keithley_last_ts) / 1000.0
+        if age > max_age_s:
+            return None, None
+        return self.keithley_last_i, self.keithley_last_v
+
 
     # ─── ZAKLADKA ARCHIVE ────────────────────────────────
     def build_arch(self, parent):
@@ -948,12 +1388,12 @@ class PeltierControl:
             t,t1,t2,sp,pwm = [],[],[],[],[]
             for r in rows:
                 try:
-                    t.append(float(r.get('czas_s',0)))
+                    t.append(float(r.get('czas_od_startu_s',0)))
                     v1 = r.get('temperatura1_C','')
                     t1.append(float(v1) if v1 else None)
                     v2 = r.get('temperatura2_C','')
                     t2.append(float(v2) if v2 else None)
-                    sp.append(float(r.get('setpoint_C',0)))
+                    sp.append(float(r.get('setpoint_cel_C',0)))
                     pwm.append(float(r.get('peltier_pct',0)))
                 except: continue
             return (t,t1,t2,sp,pwm) if t else None
@@ -1060,7 +1500,15 @@ class PeltierControl:
                     self.cyc_stop("done")
 
                 if self.cyc_on:
-                    self.cyc_log(rel, t1, t2, sp, pct, fn)
+                    k_i, k_v = self._keithley_latest()
+                    self.cyc_log(rel, t1, t2, sp, pct, fn,
+                                 spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
+                                 fw_ts=tsr, state=d.get('state'),
+                                 keithley_i=k_i, keithley_v=k_v)
+
+                pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                k_i, k_v = self._keithley_latest()
+                self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v))
 
                 if pid_on and self.last_setpoint_target is not None:
                     if abs(sp - self.last_setpoint_target) > 0.5:
@@ -1087,6 +1535,13 @@ class PeltierControl:
                     text=f"{t2:.2f}" if t2 is not None else "--")
                 self.cards['sp']['val'].config(text=f"{sp:.1f}")
                 self.cards['pwm']['val'].config(text=f"{pct:.0f}")
+                k_i_disp, _ = self._keithley_latest()
+                if k_i_disp is not None:
+                    self.cards['kcur']['val'].config(text=f"{k_i_disp*1000:.3f}m")
+                elif self.keithley_running:
+                    self.cards['kcur']['val'].config(text="...")
+                else:
+                    self.cards['kcur']['val'].config(text="--")
 
                 avg_rate = 0.0
                 if (self.reach_start_t is not None and self.reach_start_temp is not None
@@ -1181,18 +1636,39 @@ class PeltierControl:
         self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
-        self.cyc_wr.writerow(['czas_s','temperatura1_C','temperatura2_C',
-                              'setpoint_C','peltier_pct','fan_pct'])
+        self.cyc_wr.writerow([
+            'timestamp_pc', 'czas_firmware_s', 'czas_od_startu_s',
+            'temperatura1_C', 'temperatura2_C',
+            'setpoint_aktywny_C', 'setpoint_cel_C',
+            'peltier_pct', 'fan_pct',
+            'Kp', 'Ki', 'Kd', 'stan',
+            'keithley_prad_A', 'keithley_napiecie_V',
+        ])
         self.cyc_rows = 0
         print(f"CYC START T={temp0}")
 
-    def cyc_log(self, t, t1, t2, sp, pct, fn):
+    def cyc_log(self, t, t1, t2, sp, pct, fn, spa=None, kp=None, ki=None, kd=None,
+                fw_ts=None, state=None, keithley_i=None, keithley_v=None):
         if self.cyc_wr:
             try:
-                t1s = f"{t1:.2f}" if t1 is not None else ""
-                t2s = f"{t2:.2f}" if t2 is not None else ""
-                self.cyc_wr.writerow([f"{t:.2f}", t1s, t2s,
-                                     f"{sp:.2f}", f"{pct:.1f}", f"{fn:.1f}"])
+                t1s = f"{t1:.3f}" if t1 is not None else ""
+                t2s = f"{t2:.3f}" if t2 is not None else ""
+                spas = f"{spa:.3f}" if spa is not None else ""
+                kps = f"{kp:.4f}" if kp is not None else ""
+                kis = f"{ki:.5f}" if ki is not None else ""
+                kds = f"{kd:.4f}" if kd is not None else ""
+                fwts = f"{fw_ts:.3f}" if fw_ts is not None else ""
+                kis_a = f"{keithley_i:.9e}" if keithley_i is not None else ""
+                kvs = f"{keithley_v:.6f}" if keithley_v is not None else ""
+                pc_ts = datetime.now().isoformat(timespec="milliseconds")
+                self.cyc_wr.writerow([
+                    pc_ts, fwts, f"{t:.3f}",
+                    t1s, t2s,
+                    spas, f"{sp:.3f}",
+                    f"{pct:.2f}", f"{fn:.2f}",
+                    kps, kis, kds, state or "",
+                    kis_a, kvs,
+                ])
                 self.cyc_file.flush(); self.cyc_rows += 1
             except: pass
 
@@ -1317,6 +1793,8 @@ def main():
     app = PeltierControl(root)
 
     def on_close():
+        app.keithley_running = False
+        app.keithley_disconnect()
         app.disconnect()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
