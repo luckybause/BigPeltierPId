@@ -1,463 +1,1276 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Peltier PID Controller - Aplikacja PC
-Wymagania: pip install customtkinter pyserial matplotlib
+PeltierControl - BRUTALIST
+Panel sterowania PID Peltiera (Feed-Forward) z dwukierunkowa komunikacja JSON.
+Firmware: ItsyBitsy M0 + Cytron MDD10A + 2x MAX31856
 """
 
-import tkinter as tk
-import customtkinter as ctk
-import serial
-import serial.tools.list_ports
-import threading
-import json
-import csv
-import time
-import queue
+import sys, os, time, csv, json, threading, queue
 from datetime import datetime
-from collections import deque
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import matplotlib.animation as animation
+from pathlib import Path
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+try:
+    import serial, serial.tools.list_ports
+except ImportError:
+    print("pip install pyserial"); input(); sys.exit(1)
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+except ImportError:
+    print("brak tkinter"); input(); sys.exit(1)
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+except ImportError as e:
+    print(f"pip install matplotlib\n{e}"); input(); sys.exit(1)
 
-HIST_LEN = 600
-CHART_BG  = "#1a1a2e"
-C_T1   = "#e94560"
-C_T2L  = "#4fc3f7"
-C_SP   = "#f5a623"
-C_PELT = "#7ed321"
-C_FAN  = "#9b59b6"
+# ════════════════════════════════════════════════════════
+#  MOTYW BRUTALIST
+# ════════════════════════════════════════════════════════
+C = {
+    'bg':      '#3a3d42', 'bg2': '#2b2d31', 'panel': '#33363b',
+    'panel2':  '#2b2d31', 'panel3': '#42454a',
+    'border':  '#4a4d52', 'border2': '#5a5d63',
+    'text':    '#f0f0f0', 'dim': '#b0b3b8', 'dim2': '#6a6d72',
+    'blue':    '#4d9fff', 'orange': '#e8a33d', 'yellow': '#e8c63d',
+    'green':   '#5fc77f', 'red': '#d4452e', 'cyan': '#4db8d4',
+    'purple':  '#a87dd4', 'grid': '#42454a',
+}
 
+FONT = 'Consolas'
+FS = 1.0
+def fsz(n): return max(6, int(round(n * FS)))
 
-class PeltierApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title("Peltier PID Controller")
-        self.geometry("1280x800")
-        self.minsize(1000, 680)
+def _lighten(hex_color, amount=0.15):
+    h = hex_color.lstrip('#')
+    r = min(255, int(int(h[0:2],16) + (255-int(h[0:2],16))*amount))
+    g = min(255, int(int(h[2:4],16) + (255-int(h[2:4],16))*amount))
+    b = min(255, int(int(h[4:6],16) + (255-int(h[4:6],16))*amount))
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
+    bg = bg or C['green']
+    b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                  font=(FONT, fsz(10), 'bold'), padx=16, pady=8,
+                  relief='flat', cursor='hand2', bd=0,
+                  activebackground=_lighten(bg, 0.15), activeforeground=fg, **kw)
+    def on_enter(e):
+        if b['state'] != 'disabled': b.config(bg=_lighten(bg, 0.15))
+    def on_leave(e):
+        if b['state'] != 'disabled': b.config(bg=bg)
+    b.bind('<Enter>', on_enter); b.bind('<Leave>', on_leave)
+    return b
+
+def mk_btn_outline(parent, text, cmd, color, **kw):
+    return tk.Button(parent, text=text, command=cmd, bg=C['bg2'], fg=color,
+                  font=(FONT, fsz(10), 'bold'), padx=14, pady=7,
+                  relief='flat', cursor='hand2', bd=0,
+                  highlightthickness=2, highlightbackground=color,
+                  highlightcolor=color,
+                  activebackground=C['panel3'], activeforeground=color, **kw)
+
+# ════════════════════════════════════════════════════════
+#  SLIDER + POLE LICZBOWE
+# ════════════════════════════════════════════════════════
+class SliderField:
+    def __init__(self, parent, label, vmin, vmax, vinit, color,
+                 unit='', decimals=1, on_change=None, width=170):
+        self.vmin=vmin; self.vmax=vmax; self.color=color
+        self.decimals=decimals; self.on_change=on_change
+        self._last_sent=None; self._after_id=None
+
+        self.frame = tk.Frame(parent, bg=C['bg2'])
+        self.frame.pack(fill='x', pady=(0, 14))
+
+        top = tk.Frame(self.frame, bg=C['bg2'])
+        top.pack(fill='x')
+        tk.Label(top, text=label, bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9)), anchor='w').pack(side='left')
+        if unit:
+            tk.Label(top, text=unit, bg=C['bg2'], fg=C['dim2'],
+                     font=(FONT, fsz(8)), anchor='e').pack(side='right')
+
+        row = tk.Frame(self.frame, bg=C['bg2'])
+        row.pack(fill='x', pady=(4, 0))
+
+        self.entry = tk.Entry(row, width=7, bg=C['panel'], fg=color,
+                              font=(FONT, fsz(12), 'bold'), justify='center',
+                              relief='flat', bd=0,
+                              highlightthickness=1, highlightbackground=color,
+                              insertbackground=color)
+        self.entry.pack(side='right', ipady=4, padx=(8, 0))
+        self.entry.bind('<Return>', self._on_entry)
+        self.entry.bind('<FocusOut>', self._on_entry)
+
+        self.var = tk.DoubleVar(value=vinit)
+        self.scale = tk.Scale(row, from_=vmin, to=vmax, resolution=10**(-decimals),
+                             orient='horizontal', variable=self.var,
+                             showvalue=False, bg=C['bg2'], fg=color,
+                             troughcolor=C['panel'], highlightthickness=0,
+                             bd=0, sliderrelief='flat', sliderlength=18,
+                             activebackground=color, length=width,
+                             command=self._on_slide)
+        self.scale.pack(side='right', fill='x', expand=True)
+        self._set_entry(vinit)
+
+    def _set_entry(self, v):
+        self.entry.delete(0, 'end')
+        self.entry.insert(0, f"{v:.{self.decimals}f}")
+
+    def _on_slide(self, val):
+        v = float(val); self._set_entry(v); self._debounced(v)
+
+    def _on_entry(self, evt=None):
+        try:
+            v = float(self.entry.get().replace(',', '.'))
+            v = max(self.vmin, min(self.vmax, v))
+            self.var.set(v); self._set_entry(v); self._debounced(v)
+        except ValueError:
+            self._set_entry(self.var.get())
+
+    def _debounced(self, v):
+        if self._after_id: self.frame.after_cancel(self._after_id)
+        self._after_id = self.frame.after(150, lambda: self._emit(v))
+
+    def _emit(self, v):
+        if self.on_change and v != self._last_sent:
+            self._last_sent = v
+            self.on_change(v)
+
+    def get(self): return self.var.get()
+
+    def set(self, v, silent=True):
+        v = max(self.vmin, min(self.vmax, v))
+        if silent: self._last_sent = v
+        self.var.set(v); self._set_entry(v)
+
+    def set_enabled(self, en):
+        st = 'normal' if en else 'disabled'
+        self.scale.config(state=st); self.entry.config(state=st)
+
+# ════════════════════════════════════════════════════════
+#  APLIKACJA GLOWNA
+# ════════════════════════════════════════════════════════
+class PeltierControl:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PeltierControl - BRUTALIST")
+        self.root.configure(bg=C['bg'])
+        self.root.geometry("1280x800")
+        self.root.minsize(1100, 720)
 
         self.ser = None
+        self.port_name = None
+        self.baud = 115200
         self.running = False
+        self.connected = False
         self._lock = threading.Lock()
+
+        self.maxlen = 3000
+        self.t = []; self.temp1 = []; self.temp2 = []
+        self.spt = []; self.spa = []; self.pwm = []; self.fanv = []
+        self.t0 = None
         self.data_queue = queue.Queue()
-        self.log_file = None
-        self.log_writer = None
-        self.logging_active = False
 
-        self.ts_hist  = deque(maxlen=HIST_LEN)
-        self.t1_hist  = deque(maxlen=HIST_LEN)
-        self.t2_hist  = deque(maxlen=HIST_LEN)
-        self.sp_hist  = deque(maxlen=HIST_LEN)
-        self.pw_hist  = deque(maxlen=HIST_LEN)
-        self.fn_hist  = deque(maxlen=HIST_LEN)
-        self.t_start  = time.time()
+        self.reach_start_t = None
+        self.reach_start_temp = None
+        self.reach_target = None
+        self.reach_done = False
+        self.reach_time = None
+        self.reach_avg_rate = None
+        self.reach_dir = None
+        self.last_setpoint_target = None
 
+        self.chart_paused = False
+        self.chart_window = 0
+
+        self.log_dir = Path.home() / "PeltierLogi"
+        self.log_dir.mkdir(exist_ok=True)
+        self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
+        self.cyc_t0 = None; self.cyc_fn = None; self.cyc_rows = 0
+
+        self._cfg_synced = False
+        self.is_running = False
+        self.fan_on = False
+        self._cmd_buf = ""
+        self._pulse_state = 0
+
+        self._build_styles()
         self._build_ui()
-        self._build_chart()
-        self._refresh_ports()
+        self._pulse()
+        self.tick()
+        self.root.after(800, self._auto_connect)
 
-        self.ani = animation.FuncAnimation(
-            self.fig, self._update_chart, interval=500, cache_frame_data=False
-        )
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(150, self._poll_queue)
+    # ─── AUTO-CONNECT ────────────────────────────────────
+    def _auto_connect(self):
+        if self.connected: return
+        try: ports = list(serial.tools.list_ports.comports())
+        except: return
+        if not ports: return
+        def score(p):
+            d = (p.description or '').lower()
+            s = 0
+            for kw in ['itsybitsy', 'adafruit', 'usb serial', 'usb-serial']:
+                if kw in d: s += 10
+            if hasattr(p, 'vid') and p.vid == 0x239A: s += 20
+            return s
+        best = max(ports, key=score)
+        if score(best) > 0 or len(ports) == 1:
+            self.connect(best.device)
 
-    # ─── UI ───────────────────────────────────────────────────────────────────
-    def _build_ui(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        panel = ctk.CTkScrollableFrame(self, width=295, corner_radius=0)
-        panel.grid(row=0, column=0, sticky="nsew")
-        self._build_panel(panel)
-        self.chart_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=CHART_BG)
-        self.chart_frame.grid(row=0, column=1, sticky="nsew")
-        self.chart_frame.grid_rowconfigure(0, weight=1)
-        self.chart_frame.grid_columnconfigure(0, weight=1)
-        self.status_var = tk.StringVar(value="Rozlaczono")
-        ctk.CTkLabel(self, textvariable=self.status_var, anchor="w",
-                     fg_color="#0a0a0a", text_color="#666666", height=22).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=1)
+    def _build_styles(self):
+        st = ttk.Style()
+        try: st.theme_use('clam')
+        except: pass
+        st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
+        st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim'],
+                     padding=[20, 10], font=(FONT, fsz(10), 'bold'), borderwidth=0)
+        st.map('TNotebook.Tab',
+               background=[('selected', C['bg'])],
+               foreground=[('selected', C['text'])])
 
-    def _section(self, p, text):
-        ctk.CTkLabel(p, text=text.upper(), font=("Courier", 10, "bold"),
-                     text_color="#444466").pack(anchor="w", padx=12, pady=(12, 2))
-        ctk.CTkFrame(p, height=1, fg_color="#333355").pack(fill="x", padx=8, pady=(0, 5))
+    # ─── SERIAL ──────────────────────────────────────────
+    def send(self, cmd):
+        with self._lock: ser = self.ser
+        if ser and ser.is_open:
+            try: ser.write((cmd + '\n').encode())
+            except Exception as e: print(f"send err: {e}")
 
-    def _build_panel(self, p):
-        ctk.CTkLabel(p, text="Peltier PID", font=("Helvetica", 17, "bold")).pack(pady=(14, 2))
-        ctk.CTkLabel(p, text="ItsyBitsy M0 + Cytron MDD10A", font=("Helvetica", 10),
-                     text_color="#666688").pack(pady=(0, 6))
-
-        # ── Port ──
-        self._section(p, "Polaczenie")
-        self.port_var = tk.StringVar()
-        self.port_menu = ctk.CTkOptionMenu(p, variable=self.port_var, values=[], width=260)
-        self.port_menu.pack(padx=12, pady=3)
-        row = ctk.CTkFrame(p, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=3)
-        ctk.CTkButton(row, text="Odswiez porty", width=120,
-                      command=self._refresh_ports).pack(side="left")
-        self.connect_btn = ctk.CTkButton(row, text="Polacz", width=120,
-                                          command=self._toggle_connect,
-                                          fg_color="#1a5c33")
-        self.connect_btn.pack(side="right")
-
-        # ── Temperatury ──
-        self._section(p, "Temperatury")
-        tf = ctk.CTkFrame(p, fg_color="#0e0e20", corner_radius=8)
-        tf.pack(fill="x", padx=12, pady=3)
-        self.t1_var = tk.StringVar(value="---")
-        self.t2_var = tk.StringVar(value="---")
-        ctk.CTkLabel(tf, text="T1 (CS9) regulacja",
-                     text_color=C_T1, font=("Courier", 10)).grid(
-            row=0, column=0, padx=10, pady=5, sticky="w")
-        ctk.CTkLabel(tf, textvariable=self.t1_var,
-                     font=("Courier", 22, "bold"), text_color=C_T1).grid(
-            row=0, column=1, padx=10)
-        ctk.CTkLabel(tf, text="T2 (CS10) pomiar",
-                     text_color=C_T2L, font=("Courier", 10)).grid(
-            row=1, column=0, padx=10, pady=5, sticky="w")
-        ctk.CTkLabel(tf, textvariable=self.t2_var,
-                     font=("Courier", 22, "bold"), text_color=C_T2L).grid(
-            row=1, column=1, padx=10)
-
-        # ── PID ──
-        self._section(p, "Nastawy PID")
-        self._entry_row(p, "Setpoint [C]",  "25.0", "sp_entry")
-        self._entry_row(p, "Kp",            "10.0", "kp_entry")
-        self._entry_row(p, "Ki",            "0.3",  "ki_entry")
-        self._entry_row(p, "Kd",            "0.8",  "kd_entry")
-
-        self.pid_var  = tk.BooleanVar(value=False)
-        self.heat_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(p, text="Wlacz PID", variable=self.pid_var,
-                        command=self._on_pid_toggle).pack(anchor="w", padx=16, pady=3)
-        ctk.CTkCheckBox(p, text="Tryb GRZANIA (odznacz = chlodzenie)",
-                        variable=self.heat_var,
-                        command=self._send_settings).pack(anchor="w", padx=16, pady=2)
-
-        ctk.CTkButton(p, text="Wyslij nastawy PID",
-                      command=self._send_settings).pack(fill="x", padx=12, pady=5)
-        ctk.CTkButton(p, text="STOP (wylacz Peltier)", fg_color="#6a1010",
-                      command=self._send_stop).pack(fill="x", padx=12, pady=2)
-
-        # ── Wentylator ──
-        self._section(p, "Wentylator")
-        self.fan_auto_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(p, text="Automatyczny", variable=self.fan_auto_var,
-                        command=self._send_settings).pack(anchor="w", padx=16, pady=3)
-        ctk.CTkLabel(p, text="Reczna moc [%]", anchor="w").pack(fill="x", padx=12)
-        self.fan_slider = ctk.CTkSlider(p, from_=0, to=100, number_of_steps=100,
-                                         command=self._on_fan_slide)
-        self.fan_slider.set(0)
-        self.fan_slider.pack(fill="x", padx=12, pady=3)
-        self.fan_pct_lbl = tk.StringVar(value="0 %")
-        ctk.CTkLabel(p, textvariable=self.fan_pct_lbl,
-                     font=("Courier", 12)).pack(pady=1)
-
-        # ── Wyjscia ──
-        self._section(p, "Wyjscia aktualne")
-        of = ctk.CTkFrame(p, fg_color="#0e0e20", corner_radius=8)
-        of.pack(fill="x", padx=12, pady=3)
-        self.pelt_var   = tk.StringVar(value="---")
-        self.fanout_var = tk.StringVar(value="---")
-        ctk.CTkLabel(of, text="Peltier",    text_color=C_PELT).grid(
-            row=0, column=0, padx=10, pady=5)
-        ctk.CTkLabel(of, textvariable=self.pelt_var,
-                     font=("Courier", 15, "bold"), text_color=C_PELT).grid(
-            row=0, column=1, padx=10)
-        ctk.CTkLabel(of, text="Wentylator", text_color=C_FAN).grid(
-            row=1, column=0, padx=10, pady=5)
-        ctk.CTkLabel(of, textvariable=self.fanout_var,
-                     font=("Courier", 15, "bold"), text_color=C_FAN).grid(
-            row=1, column=1, padx=10)
-
-        # ── Zapis ──
-        self._section(p, "Zapis CSV")
-        self.log_btn = ctk.CTkButton(p, text="Rozpocznij zapis",
-                                      fg_color="#1a3a5a",
-                                      command=self._toggle_logging)
-        self.log_btn.pack(fill="x", padx=12, pady=5)
-        self.log_lbl = tk.StringVar(value="")
-        ctk.CTkLabel(p, textvariable=self.log_lbl, font=("Courier", 8),
-                     text_color="#445566", wraplength=260).pack(padx=12)
-
-    def _entry_row(self, parent, label, default, attr):
-        ctk.CTkLabel(parent, text=label, anchor="w").pack(fill="x", padx=12, pady=(3, 0))
-        e = ctk.CTkEntry(parent)
-        e.insert(0, default)
-        e.pack(fill="x", padx=12, pady=2)
-        setattr(self, attr, e)
-
-    # ─── WYKRES ───────────────────────────────────────────────────────────────
-    def _build_chart(self):
-        self.fig = Figure(figsize=(6, 4), facecolor=CHART_BG)
-        self.fig.subplots_adjust(left=0.07, right=0.94, top=0.92,
-                                  bottom=0.09, hspace=0.35)
-
-        self.ax_t = self.fig.add_subplot(2, 1, 1, facecolor="#080818")
-        self.ax_t.set_title("Temperatura [C]", color="#aaaaaa", fontsize=10)
-        self.ax_t.tick_params(colors="#555555")
-        for sp in self.ax_t.spines.values(): sp.set_edgecolor("#222244")
-
-        self.ax_p = self.fig.add_subplot(2, 1, 2, facecolor="#080818")
-        self.ax_p.set_title("Moc wyjsc [%]", color="#aaaaaa", fontsize=10)
-        self.ax_p.set_ylim(0, 105)
-        self.ax_p.tick_params(colors="#555555")
-        for sp in self.ax_p.spines.values(): sp.set_edgecolor("#222244")
-
-        self.ln_t1, = self.ax_t.plot([], [], color=C_T1,  lw=2, label="T1")
-        self.ln_t2, = self.ax_t.plot([], [], color=C_T2L, lw=1.5, ls="--", label="T2")
-        self.ln_sp, = self.ax_t.plot([], [], color=C_SP,  lw=1,   ls=":",  label="SP")
-        self.ax_t.legend(loc="upper left", facecolor="#111122",
-                          labelcolor="#cccccc", fontsize=8)
-
-        self.ln_pw, = self.ax_p.plot([], [], color=C_PELT, lw=2,   label="Peltier")
-        self.ln_fn, = self.ax_p.plot([], [], color=C_FAN,  lw=1.5, ls="--", label="Wentylator")
-        self.ax_p.legend(loc="upper left", facecolor="#111122",
-                          labelcolor="#cccccc", fontsize=8)
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_frame)
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-    def _update_chart(self, _):
-        if not self.ts_hist: return
-        xs = list(self.ts_hist)
-        def s(lst): return [v if v is not None else float("nan") for v in lst]
-        self.ln_t1.set_data(xs, s(self.t1_hist))
-        self.ln_t2.set_data(xs, s(self.t2_hist))
-        self.ln_sp.set_data(xs, list(self.sp_hist))
-        self.ln_pw.set_data(xs, list(self.pw_hist))
-        self.ln_fn.set_data(xs, list(self.fn_hist))
-        self.ax_t.relim(); self.ax_t.autoscale_view()
-        self.ax_p.relim(); self.ax_p.autoscale_view(scaley=False)
-        self.canvas.draw_idle()
-
-    # ─── SERIAL ───────────────────────────────────────────────────────────────
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        if not ports:
-            self.port_menu.configure(values=["(brak portow)"])
-            self.status_var.set("Brak portow COM - podlacz ItsyBitsy")
-            return
-        self.port_menu.configure(values=ports)
-        self.port_var.set(ports[0])
-        self.status_var.set(f"Znaleziono {len(ports)} port(ow)")
-
-    def _toggle_connect(self):
-        if self.running: self._disconnect()
-        else:            self._connect()
-
-    def _connect(self):
-        port = self.port_var.get()
-        if not port or port.startswith("("):
-            self.status_var.set("Wybierz prawidlowy port COM")
-            return
+    def connect(self, port):
         try:
             with self._lock:
-                self.ser = serial.Serial(
-                    port=port,
-                    baudrate=115200,
-                    timeout=2,
-                    write_timeout=2
-                )
+                self.ser = serial.Serial(port, self.baud, timeout=0.5, write_timeout=2)
+            self.port_name = port
+            self.clear_buf()
+            self._cfg_synced = False
+            self.set_status(True, f"{port} - 115200")
             self.running = True
-            t = threading.Thread(target=self._read_loop, daemon=True)
-            t.start()
-            self.connect_btn.configure(text="Rozlacz", fg_color="#6a1a1a")
-            self.status_var.set(f"Polaczono: {port}  |  115200 baud")
-        except serial.SerialException as e:
-            self.status_var.set(f"Blad polaczenia: {e}")
+            threading.Thread(target=self.reader, daemon=True).start()
+            self.root.after(1200, lambda: self.send("GET"))
+        except Exception as e:
+            messagebox.showerror("Error", f"{port}:\n{e}")
+            self.set_status(False, "")
 
-    def _disconnect(self):
+    def disconnect(self):
         self.running = False
+        if self.cyc_on: self.cyc_stop("Rozlaczono")
         with self._lock:
             if self.ser:
                 try: self.ser.close()
                 except: pass
                 self.ser = None
-        self.connect_btn.configure(text="Polacz", fg_color="#1a5c33")
-        self.status_var.set("Rozlaczono")
+        self.set_status(False, "")
 
-    def _read_loop(self):
-        """Watek czytajacy dane z Serial. Buforuje i parsuje JSON."""
+    def clear_buf(self):
+        for a in [self.t, self.temp1, self.temp2, self.spt, self.spa, self.pwm, self.fanv]:
+            a.clear()
+        self.t0 = None
+
+    def reader(self):
+        with self._lock: ser = self.ser
+        if ser and ser.is_open:
+            try: ser.reset_input_buffer()
+            except: pass
         buf = ""
         while self.running:
             try:
-                with self._lock:
-                    ser = self.ser
-                if ser is None or not ser.is_open:
-                    break
-                # Czytaj dostepne bajty (nieblokujaco)
+                with self._lock: ser = self.ser
+                if not ser or not ser.is_open: break
                 n = ser.in_waiting
                 if n > 0:
-                    chunk = ser.read(n).decode("utf-8", errors="replace")
+                    chunk = ser.read(n).decode('utf-8', errors='replace')
                     buf += chunk
-                    # Przetwarzaj pelne linie
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
+                    while '\n' in buf:
+                        line, buf = buf.split('\n', 1)
                         line = line.strip()
-                        if line.startswith("{"):
-                            try:
-                                data = json.loads(line)
-                                self.data_queue.put(data)
-                            except json.JSONDecodeError:
-                                pass
+                        if line.startswith('{'):
+                            try: self.data_queue.put(json.loads(line))
+                            except: pass
                 else:
                     time.sleep(0.02)
             except serial.SerialException:
-                if self.running:
-                    self.after(0, self._on_serial_error)
+                self.running = False
+                self.root.after(0, lambda: self.set_status(False, "Utracono polaczenie"))
                 break
-            except Exception:
-                time.sleep(0.05)
+            except Exception as e:
+                if self.running: print(f"reader err: {e}")
+                time.sleep(0.2)
 
-    def _on_serial_error(self):
-        self._disconnect()
-        self.status_var.set("Utracono polaczenie - kliknij Polacz ponownie")
+    # ─── UI ──────────────────────────────────────────────
+    def _build_ui(self):
+        top = tk.Frame(self.root, bg=C['bg2'], height=44)
+        top.pack(fill='x'); top.pack_propagate(False)
+        tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
+        tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
+                 font=(FONT, fsz(13), 'bold')).pack(side='left', padx=(8, 0))
+        tk.Label(top, text="ItsyBitsy M0 + Cytron MDD10A", bg=C['bg2'], fg=C['dim2'],
+                 font=(FONT, fsz(9))).pack(side='left', padx=8)
 
-    def _poll_queue(self):
-        try:
-            while True:
-                data = self.data_queue.get_nowait()
-                self._handle_data(data)
-        except queue.Empty:
-            pass
-        self.after(150, self._poll_queue)
+        sf = tk.Frame(top, bg=C['bg2'])
+        sf.pack(side='right', padx=16)
+        self.s_dot = tk.Canvas(sf, width=14, height=14, bg=C['bg2'], highlightthickness=0)
+        self.s_dot.pack(side='left', padx=(0, 8))
+        self._draw_dot(C['dim2'], glow=False)
+        self.s_lbl = tk.Label(sf, text="DISCONNECTED", bg=C['bg2'], fg=C['dim'],
+                              font=(FONT, fsz(10)))
+        self.s_lbl.pack(side='left')
 
-    def _handle_data(self, d):
-        dtype = d.get("type", "data")
-        if dtype == "status":
-            self.status_var.set(f"Status: {d.get('msg','')}")
-            return
-        if dtype == "cfg":
-            # Synchronizuj UI z nastawami z urzadzenia
-            self._sync_cfg(d)
-            return
-        if dtype != "data":
-            return
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill='both', expand=True)
+        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
+        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
+        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
+        t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
+        self.build_live(t1)
+        self.build_advanced(t2)
+        self.build_arch(t3)
+        self.build_conn(t4)
 
-        t1  = d.get("t1")
-        t2  = d.get("t2")
-        sp  = d.get("sp",  0)
-        pct = d.get("pct", 0)
-        fn  = d.get("fan", 0)
-        pid = d.get("pid_on", False)
+    def _draw_dot(self, color, glow=True):
+        self.s_dot.delete('all')
+        if glow:
+            self.s_dot.create_oval(0, 0, 14, 14, fill='', outline=color, width=1)
+        self.s_dot.create_rectangle(3, 3, 11, 11, fill=color, outline='')
 
-        self.t1_var.set(f"{t1:.1f} C" if t1 is not None else "BLAD")
-        self.t2_var.set(f"{t2:.1f} C" if t2 is not None else "---")
-        self.pelt_var.set(f"{pct:.0f} %")
-        self.fanout_var.set(f"{fn:.0f} %")
+    def _pulse(self):
+        if self.connected:
+            self._pulse_state = (self._pulse_state + 1) % 20
+            phase = abs(self._pulse_state - 10) / 10.0
+            self._draw_dot(_lighten(C['green'], phase * 0.4))
+        self.root.after(80, self._pulse)
 
-        ts = time.time() - self.t_start
-        self.ts_hist.append(ts)
-        self.t1_hist.append(t1)
-        self.t2_hist.append(t2)
-        self.sp_hist.append(sp)
-        self.pw_hist.append(pct)
-        self.fn_hist.append(fn)
-
-        if self.logging_active and self.log_writer:
-            self.log_writer.writerow([
-                datetime.now().isoformat(timespec="milliseconds"),
-                t1, t2, sp, pct, fn, pid, d.get("heat"), d.get("kp"), d.get("ki"), d.get("kd")
-            ])
-            self.log_file.flush()
-
-    def _sync_cfg(self, d):
-        """Synchronizuj pola UI z nastawami odczytanymi z urzadzenia."""
-        try:
-            self.sp_entry.delete(0, "end"); self.sp_entry.insert(0, str(d.get("sp", 25)))
-            self.kp_entry.delete(0, "end"); self.kp_entry.insert(0, str(d.get("kp", 10)))
-            self.ki_entry.delete(0, "end"); self.ki_entry.insert(0, str(d.get("ki", 0.3)))
-            self.kd_entry.delete(0, "end"); self.kd_entry.insert(0, str(d.get("kd", 0.8)))
-            self.pid_var.set(bool(d.get("pid_on", False)))
-            self.heat_var.set(bool(d.get("heat", True)))
-            self.fan_auto_var.set(bool(d.get("fan_auto", True)))
-            self.fan_slider.set(float(d.get("fan_man", 0)))
-        except Exception:
-            pass
-
-    # ─── WYSYLANIE KOMEND ─────────────────────────────────────────────────────
-    def _send(self, cmd: str):
-        """Wyslij komende do urzadzenia. cmd bez znaku nowej linii."""
-        with self._lock:
-            ser = self.ser
-        if ser is None or not ser.is_open:
-            self.status_var.set("Nie polaczono - najpierw kliknij Polacz")
-            return
-        try:
-            ser.write((cmd + "\n").encode("utf-8"))
-        except serial.SerialException as e:
-            self.status_var.set(f"Blad wysylania: {e}")
-
-    def _send_settings(self):
-        try:
-            sp = float(self.sp_entry.get())
-            kp = float(self.kp_entry.get())
-            ki = float(self.ki_entry.get())
-            kd = float(self.kd_entry.get())
-        except ValueError:
-            self.status_var.set("Blad: sprawdz wartosci numeryczne")
-            return
-        self._send(f"SP:{sp}")
-        self._send(f"KP:{kp}")
-        self._send(f"KI:{ki}")
-        self._send(f"KD:{kd}")
-        self._send(f"HEAT:{1 if self.heat_var.get() else 0}")
-        self._send(f"FANAUTO:{1 if self.fan_auto_var.get() else 0}")
-        self._send(f"FAN:{self.fan_slider.get()}")
-
-    def _on_pid_toggle(self):
-        if self.pid_var.get():
-            self._send_settings()
-            self._send("START")
+    def set_status(self, connected, msg):
+        self.connected = connected
+        if connected:
+            self._draw_dot(C['green'])
+            self.s_lbl.config(text=msg or "CONNECTED", fg=C['green'])
         else:
-            self._send("STOP")
+            self._draw_dot(C['dim2'], glow=False)
+            self.s_lbl.config(text=msg or "DISCONNECTED", fg=C['dim'])
+        if hasattr(self, 'btn_run'):
+            self._set_panel_enabled(connected)
 
-    def _send_stop(self):
-        self.pid_var.set(False)
-        self._send("STOP")
+    # ─── EKRAN LIVE ──────────────────────────────────────
+    def build_live(self, parent):
+        topbar = tk.Frame(parent, bg=C['bg'])
+        topbar.pack(fill='x', padx=16, pady=(10, 6))
 
-    def _on_fan_slide(self, val):
-        self.fan_pct_lbl.set(f"{int(float(val))} %")
-        if not self.fan_auto_var.get():
-            self._send(f"FAN:{int(float(val))}")
+        cards = tk.Frame(topbar, bg=C['bg'])
+        cards.pack(side='left', fill='x', expand=True)
+        self.cards = {}
+        self.cards['temp']  = self._stat_card(cards, "TEMP T1", "°C", C['blue'])
+        self.cards['temp2'] = self._stat_card(cards, "TEMP T2", "°C", C['cyan'])
+        self.cards['sp']    = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
+        self.cards['rate']  = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
+        self.cards['pwm']   = self._stat_card(cards, "PWM", "%", C['green'])
 
-    # ─── LOGOWANIE ────────────────────────────────────────────────────────────
-    def _toggle_logging(self):
-        if self.logging_active:
-            self.logging_active = False
-            if self.log_file:
-                self.log_file.close()
-                self.log_file = self.log_writer = None
-            self.log_btn.configure(text="Rozpocznij zapis", fg_color="#1a3a5a")
-            self.log_lbl.set("")
+        ctrl = tk.Frame(topbar, bg=C['bg'])
+        ctrl.pack(side='right', padx=(8, 0))
+        self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
+                                 bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(12), 'bold'),
+                                 relief='flat', cursor='hand2', bd=0, padx=16, pady=12,
+                                 activebackground=_lighten(C['green'], 0.15))
+        self.btn_run.pack(side='left', padx=(0, 4), fill='y')
+        self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
+                                   bg=C['red'], fg='#fff', font=(FONT, fsz(14), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
+                                   activebackground=_lighten(C['red'], 0.15))
+        self.btn_estop.pack(side='left', fill='y')
+
+        main = tk.Frame(parent, bg=C['bg'])
+        main.pack(fill='both', expand=True, padx=16, pady=(0, 12))
+
+        # PRAWO - panel sterowania (PAKOWANY PIERWSZY zeby zachowac szerokosc)
+        self._build_panel(main)
+        # LEWO - wykres
+        self._build_chart(main)
+
+    def _stat_card(self, parent, title, unit, color):
+        card = tk.Frame(parent, bg=C['panel'])
+        card.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        tk.Frame(card, bg=color, height=3).pack(fill='x')
+        inner = tk.Frame(card, bg=C['panel'])
+        inner.pack(fill='both', expand=True, padx=7, pady=5)
+        tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(7)), anchor='w').pack(anchor='w')
+        vrow = tk.Frame(inner, bg=C['panel'])
+        vrow.pack(anchor='w', pady=(1, 0))
+        val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
+                       font=(FONT, fsz(16), 'bold'))
+        val.pack(side='left')
+        unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
+                            font=(FONT, fsz(7)))
+        unit_lbl.pack(side='left', pady=(4, 0))
+        return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl}
+
+    def _build_chart(self, parent):
+        wrap = tk.Frame(parent, bg=C['panel'])
+        wrap.pack(side='left', fill='both', expand=True, padx=(0, 12))
+        tk.Frame(wrap, bg=C['border2'], height=3).pack(fill='x')
+
+        hd = tk.Frame(wrap, bg=C['panel'])
+        hd.pack(fill='x', padx=14, pady=(10, 4))
+        tk.Label(hd, text="LIVE CHART", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+
+        self.reach_lbl = tk.Label(hd, text="", bg=C['panel'], fg=C['green'],
+                                  font=(FONT, fsz(9), 'bold'))
+        self.reach_lbl.pack(side='right')
+
+        self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=100)
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.2,
+                                   left=0.07, right=0.97, top=0.97, bottom=0.08)
+        self.ax1 = self.fig.add_subplot(gs[0])
+        self.ax2 = self.fig.add_subplot(gs[1], sharex=self.ax1)
+        for ax in [self.ax1, self.ax2]:
+            ax.set_facecolor(C['panel2'])
+
+        self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
+        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
+
+        toolbar_row = tk.Frame(wrap, bg=C['panel'])
+        toolbar_row.pack(fill='x', padx=8, pady=(0, 8))
+
+        self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
+                                   bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(9), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
+                                   highlightthickness=1, highlightbackground=C['yellow'],
+                                   activebackground=C['panel3'])
+        self.btn_pause.pack(side='left', padx=(0, 6))
+
+        tk.Label(toolbar_row, text="WINDOW:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left', padx=(8, 4))
+        for label, secs in [("ALL", 0), ("5m", 300), ("2m", 120), ("1m", 60)]:
+            b = tk.Button(toolbar_row, text=label,
+                         command=lambda s=secs: self.set_chart_window(s),
+                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(8)),
+                         relief='flat', cursor='hand2', bd=0, padx=10, pady=5,
+                         activebackground=C['panel3'])
+            b.pack(side='left', padx=2)
+
+        tb_frame = tk.Frame(toolbar_row, bg=C['panel'])
+        tb_frame.pack(side='right')
+        try:
+            self.mpl_toolbar = NavigationToolbar2Tk(self.cv, tb_frame, pack_toolbar=False)
+            self.mpl_toolbar.config(bg=C['panel'])
+            self.mpl_toolbar.update()
+            self.mpl_toolbar.pack(side='right')
+        except Exception as e:
+            print(f"toolbar err: {e}")
+
+    def toggle_pause(self):
+        self.chart_paused = not self.chart_paused
+        if self.chart_paused:
+            self.btn_pause.config(text="▶ RESUME", fg=C['green'], highlightbackground=C['green'])
         else:
-            fname = f"peltier_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            self.log_file = open(fname, "w", newline="", encoding="utf-8")
-            self.log_writer = csv.writer(self.log_file)
-            self.log_writer.writerow([
-                "timestamp","T1_C","T2_C","setpoint_C",
-                "peltier_pct","fan_pct","pid_on","heat_mode",
-                "Kp","Ki","Kd"
-            ])
-            self.logging_active = True
-            self.log_btn.configure(text="Zatrzymaj zapis", fg_color="#6a1a1a")
-            self.log_lbl.set(fname)
+            self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'], highlightbackground=C['yellow'])
 
-    # ─── ZAMKNIECIE ───────────────────────────────────────────────────────────
-    def _on_close(self):
-        self._send("STOP")
-        self._disconnect()
-        if self.logging_active:
-            self._toggle_logging()
-        self.destroy()
+    def set_chart_window(self, secs):
+        self.chart_window = secs
 
+    def _build_panel(self, parent):
+        panel = tk.Frame(parent, bg=C['bg2'], width=312)
+        panel.pack(side='right', fill='y')
+        panel.pack_propagate(False)
+        tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
+
+        scroll_wrap = tk.Frame(panel, bg=C['bg2'])
+        scroll_wrap.pack(side='left', fill='both', expand=True)
+        pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0, width=290)
+        psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
+        pcanvas.configure(yscrollcommand=psb.set)
+        psb.pack(side='right', fill='y')
+        pcanvas.pack(side='left', fill='both', expand=True)
+
+        inner = tk.Frame(pcanvas, bg=C['bg2'])
+        inner_id = pcanvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: pcanvas.configure(scrollregion=pcanvas.bbox('all')))
+        pcanvas.bind('<Configure>', lambda e: pcanvas.itemconfig(inner_id, width=e.width))
+        pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>',
+                     lambda ev: pcanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        pcanvas.bind('<Leave>', lambda e: pcanvas.unbind_all('<MouseWheel>'))
+
+        inner = tk.Frame(inner, bg=C['bg2'])
+        inner.pack(fill='both', expand=True, padx=16, pady=14)
+
+        tk.Label(inner, text="CONTROL", bg=C['bg2'], fg=C['text'],
+                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(8, 12))
+
+        self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
+                                 C['orange'], "°C", 1,
+                                 on_change=lambda v: self.send(f"SP:{v:.1f}"))
+        self.sl_ru = SliderField(inner, "HEAT/COOL RATE", 0.5, 80, 2.0,
+                                 C['yellow'], "°C/min", 1,
+                                 on_change=lambda v: self.send(f"RU:{v:.1f}"))
+
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+
+        fan_hd = tk.Frame(inner, bg=C['bg2'])
+        fan_hd.pack(fill='x', pady=(0, 4))
+        tk.Label(fan_hd, text="FANS", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        self.btn_fan = tk.Button(fan_hd, text="○ OFF", command=self.toggle_fan,
+                                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
+                                 relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
+                                 highlightthickness=1, highlightbackground=C['dim'],
+                                 activebackground=C['panel3'])
+        self.btn_fan.pack(side='right')
+        self.sl_fan = SliderField(inner, "FAN SPEED", 0, 100, 100,
+                                  C['blue'], "%", 0,
+                                  on_change=lambda v: self.set_fan_speed(v))
+
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+
+        # Tryb grzania/chlodzenia
+        hf = tk.Frame(inner, bg=C['bg2'])
+        hf.pack(fill='x', pady=(0, 10))
+        tk.Label(hf, text="TRYB", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        self.heat_var = True
+        self.btn_heat = tk.Button(hf, text="▲ HEAT", command=self._toggle_heat,
+                                  bg=C['red'], fg='#fff', font=(FONT, fsz(9), 'bold'),
+                                  relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
+                                  activebackground=_lighten(C['red'], 0.15))
+        self.btn_heat.pack(side='right')
+
+        tk.Label(inner, text="▶ START uses panel values",
+                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
+        tk.Label(inner, text="PID + Feed-Forward tuning → ADVANCED tab",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
+
+        self._set_panel_enabled(False)
+
+    def _toggle_heat(self):
+        self.heat_var = not self.heat_var
+        self.btn_heat.config(
+            text="▲ HEAT" if self.heat_var else "▼ COOL",
+            bg=C['red'] if self.heat_var else C['cyan'])
+        self.send(f"HEAT:{1 if self.heat_var else 0}")
+
+    def build_advanced(self, parent):
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=20, pady=16)
+
+        acanvas = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
+        asb = tk.Scrollbar(wrap, orient='vertical', command=acanvas.yview)
+        acanvas.configure(yscrollcommand=asb.set)
+        asb.pack(side='right', fill='y')
+        acanvas.pack(side='left', fill='both', expand=True)
+        col = tk.Frame(acanvas, bg=C['bg'])
+        cid = acanvas.create_window((0, 0), window=col, anchor='nw')
+        col.bind('<Configure>', lambda e: acanvas.configure(scrollregion=acanvas.bbox('all')))
+        acanvas.bind('<Configure>', lambda e: acanvas.itemconfig(cid, width=e.width))
+        acanvas.bind('<Enter>', lambda e: acanvas.bind_all('<MouseWheel>',
+                     lambda ev: acanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        acanvas.bind('<Leave>', lambda e: acanvas.unbind_all('<MouseWheel>'))
+
+        inner = tk.Frame(col, bg=C['bg'])
+        inner.pack(fill='x', padx=4, pady=4)
+        inner.configure(width=560)
+
+        tk.Label(inner, text="ADVANCED — PID + FEED-FORWARD", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Manual gains tuning",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+
+        sec1 = self._adv_section(inner, "PID TUNING", C['cyan'])
+        self.sl_kp = SliderField(sec1, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
+                                 on_change=lambda v: self.send(f"KP:{v:.1f}"))
+        self.sl_ki = SliderField(sec1, "Ki", 0, 1.5, 0.3, C['cyan'], "", 2,
+                                 on_change=lambda v: self.send(f"KI:{v:.2f}"))
+        self.sl_kd = SliderField(sec1, "Kd", 0, 80, 0.8, C['cyan'], "", 2,
+                                 on_change=lambda v: self.send(f"KD:{v:.2f}"))
+
+        sec2 = self._adv_section(inner, "FEED-FORWARD", C['yellow'])
+        tk.Label(sec2, text="HOLD = moc bazowa na utrzymanie temp\nRAMP = dodatkowa moc na dynamike rampy",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left').pack(anchor='w', pady=(0, 8))
+        self.sl_kffh = SliderField(sec2, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/10°C", 2,
+                                   on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
+        self.sl_kffr = SliderField(sec2, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
+                                   on_change=lambda v: self.send(f"KFFR:{v:.2f}"))
+
+        sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
+        self.sl_off = SliderField(sec3, "CAL OFFSET", -20, 20, 0.0,
+                                  C['purple'], "°C", 1,
+                                  on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
+
+        sec4 = self._adv_section(inner, "RESET", C['red'])
+        mk_btn_outline(sec4, "↺ RESET PID GAINS", self.do_reset, C['red']).pack(fill='x')
+
+    def _adv_section(self, parent, title, color):
+        tk.Frame(parent, bg=color, height=2).pack(fill='x', pady=(12, 0))
+        tk.Label(parent, text=title, bg=C['bg'], fg=color,
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 6))
+        box = tk.Frame(parent, bg=C['bg2'])
+        box.pack(fill='x')
+        inner = tk.Frame(box, bg=C['bg2'])
+        inner.pack(fill='x', padx=12, pady=10)
+        return inner
+
+    def _set_panel_enabled(self, en):
+        for sl in ['sl_sp', 'sl_ru', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_kffh', 'sl_kffr', 'sl_off', 'sl_fan']:
+            if hasattr(self, sl): getattr(self, sl).set_enabled(True)
+        for b in ['btn_run', 'btn_estop', 'btn_fan']:
+            if hasattr(self, b): getattr(self, b).config(state='normal')
+
+    # ─── AKCJE ───────────────────────────────────────────
+    def toggle_run(self):
+        if self.is_running: self.do_stop()
+        else: self.do_start()
+
+    def _update_run_button(self, running):
+        self.is_running = running
+        if running:
+            self.btn_run.config(text="■ STOP", bg=C['red'], fg='#fff',
+                               activebackground=_lighten(C['red'], 0.15))
+        else:
+            self.btn_run.config(text="▶ START", bg=C['green'], fg='#1a1c1f',
+                               activebackground=_lighten(C['green'], 0.15))
+
+    def do_start(self):
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        self.reach_start_t = None
+        self.reach_start_temp = None
+        self.reach_target = self.sl_sp.get()
+        self.reach_done = False
+        self.reach_time = None
+        self.reach_avg_rate = None
+        self.reach_dir = None
+        self.last_setpoint_target = None
+        if hasattr(self, 'reach_lbl'):
+            self.reach_lbl.config(text="→ starting...", fg=C['dim'])
+        self.send(f"SP:{self.sl_sp.get():.1f}")
+        self.send(f"RU:{self.sl_ru.get():.1f}")
+        self.send(f"KP:{self.sl_kp.get():.1f}")
+        self.send(f"KI:{self.sl_ki.get():.2f}")
+        self.send(f"KD:{self.sl_kd.get():.2f}")
+        self.send(f"KFFH:{self.sl_kffh.get():.2f}")
+        self.send(f"KFFR:{self.sl_kffr.get():.2f}")
+        self.send(f"HEAT:{1 if self.heat_var else 0}")
+        self.send(f"OFFSET:{self.sl_off.get():.1f}")
+        time.sleep(0.05)
+        self.send("START")
+        self._update_run_button(True)
+
+    def do_stop(self):
+        self.send("STOP")
+        self._update_run_button(False)
+
+    def do_estop(self):
+        self.send("STOP")
+        self._update_run_button(False)
+
+    def toggle_fan(self):
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        self.fan_on = not self.fan_on
+        if self.fan_on:
+            spd = int(self.sl_fan.get())
+            if spd == 0: spd = 100; self.sl_fan.set(100, silent=True)
+            self.send(f"FANAUTO:0")
+            self.send(f"FAN:{spd}")
+            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+        else:
+            self.send("FANOFF")
+            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+
+    def set_fan_speed(self, v):
+        spd = int(v)
+        self.send(f"FANAUTO:0")
+        self.send(f"FAN:{spd}")
+        if spd > 0:
+            self.fan_on = True
+            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+        else:
+            self.fan_on = False
+            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+
+    def do_reset(self):
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        if messagebox.askyesno("Reset PID gains", "Restore default Kp/Ki/Kd/FF?"):
+            self.send("RESET")
+
+    # ─── ZAKLADKA CONNECTION ─────────────────────────────
+    def build_conn(self, parent):
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=24, pady=24)
+
+        card = tk.Frame(wrap, bg=C['panel'])
+        card.pack(fill='x', pady=(0, 16))
+        tk.Frame(card, bg=C['blue'], height=3).pack(fill='x')
+        inner = tk.Frame(card, bg=C['panel'])
+        inner.pack(fill='x', padx=20, pady=16)
+
+        tk.Label(inner, text="SERIAL CONNECTION", bg=C['panel'], fg=C['text'],
+                 font=(FONT, fsz(12), 'bold')).pack(anchor='w', pady=(0, 12))
+        tk.Label(inner, text="Available ports:", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(10))).pack(anchor='w')
+
+        lf = tk.Frame(inner, bg=C['panel'])
+        lf.pack(fill='x', pady=8)
+        sb = tk.Scrollbar(lf)
+        sb.pack(side='right', fill='y')
+        self.conn_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
+                                    font=(FONT, fsz(10)), height=6,
+                                    selectbackground=C['blue'], borderwidth=0,
+                                    highlightthickness=1, highlightbackground=C['border'],
+                                    yscrollcommand=sb.set, activestyle='none')
+        self.conn_list.pack(side='left', fill='both', expand=True)
+        sb.config(command=self.conn_list.yview)
+
+        br = tk.Frame(inner, bg=C['panel'])
+        br.pack(fill='x', pady=(8, 0))
+        mk_btn(br, "REFRESH", self.refresh_ports, C['cyan']).pack(side='left', padx=(0, 8))
+        mk_btn(br, "CONNECT", self.conn_from_tab, C['green']).pack(side='left', padx=(0, 8))
+        mk_btn_outline(br, "DISCONNECT", self.disconnect, C['red']).pack(side='left')
+
+        info = tk.Frame(wrap, bg=C['panel'])
+        info.pack(fill='x')
+        tk.Frame(info, bg=C['dim2'], height=3).pack(fill='x')
+        ii = tk.Frame(info, bg=C['panel'])
+        ii.pack(fill='x', padx=20, pady=16)
+        tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
+                 font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
+        for line in [
+            "1. Wgraj firmware PeltierPID.ino na ItsyBitsy M0 (Arduino IDE)",
+            "2. Polacz przez USB, wybierz port COM, kliknij CONNECT",
+            "3. Suwaki synchronizuja sie automatycznie po polaczeniu",
+            "4. Ustaw TARGET i RATE, kliknij START",
+            "5. Wykres na zywo + zapis CSV w ~/PeltierLogi",
+        ]:
+            tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
+                     font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
+
+        self.refresh_ports()
+
+    def refresh_ports(self):
+        self.conn_list.delete(0, 'end')
+        self._ports = list(serial.tools.list_ports.comports())
+        for p in self._ports:
+            self.conn_list.insert('end', f"  {p.device}   {p.description or '?'}")
+        if self._ports: self.conn_list.selection_set(0)
+
+    def conn_from_tab(self):
+        s = self.conn_list.curselection()
+        if s and self._ports:
+            self.connect(self._ports[s[0]].device)
+
+    # ─── ZAKLADKA ARCHIVE ────────────────────────────────
+    def build_arch(self, parent):
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=16, pady=16)
+
+        hd = tk.Frame(wrap, bg=C['bg'])
+        hd.pack(fill='x', pady=(0, 12))
+        tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(12), 'bold')).pack(side='left')
+        mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
+
+        body = tk.Frame(wrap, bg=C['bg'])
+        body.pack(fill='both', expand=True)
+
+        lf = tk.Frame(body, bg=C['panel'], width=340)
+        lf.pack(side='left', fill='y', padx=(0, 12))
+        lf.pack_propagate(False)
+        tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
+        lhd = tk.Frame(lf, bg=C['panel'])
+        lhd.pack(fill='x', padx=12, pady=8)
+        tk.Label(lhd, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        mk_btn_outline(lhd, "CLEAR", self._arch_clear_sel, C['dim']).pack(side='right')
+
+        list_wrap = tk.Frame(lf, bg=C['bg2'])
+        list_wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        asb = tk.Scrollbar(list_wrap)
+        asb.pack(side='right', fill='y')
+        self.arch_canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
+                                    yscrollcommand=asb.set)
+        self.arch_canvas.pack(side='left', fill='both', expand=True)
+        asb.config(command=self.arch_canvas.yview)
+        self.arch_items = tk.Frame(self.arch_canvas, bg=C['bg2'])
+        self._arch_win = self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
+        self.arch_items.bind('<Configure>',
+            lambda e: self.arch_canvas.config(scrollregion=self.arch_canvas.bbox('all')))
+        self.arch_canvas.bind('<Configure>',
+            lambda e: self.arch_canvas.itemconfig(self._arch_win, width=e.width))
+        self.arch_canvas.bind('<Enter>', lambda e: self.arch_canvas.bind_all(
+            '<MouseWheel>', lambda ev: self.arch_canvas.yview_scroll(int(-ev.delta/120), 'units')))
+        self.arch_canvas.bind('<Leave>', lambda e: self.arch_canvas.unbind_all('<MouseWheel>'))
+
+        self.arch_vars = {}
+
+        cf = tk.Frame(body, bg=C['panel'])
+        cf.pack(side='left', fill='both', expand=True)
+        tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
+        self.fig_a = Figure(figsize=(8, 6), facecolor=C['panel'], dpi=100)
+        self.ax_a = self.fig_a.add_subplot(111)
+        self.ax_a.set_facecolor(C['panel2'])
+        self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
+        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
+        self.cv_a.draw()
+
+        tbf = tk.Frame(cf, bg='#3a3f44')
+        tbf.pack(fill='x', padx=8, pady=(4, 0))
+        try:
+            self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
+            self.mpl_toolbar_a.config(bg='#3a3f44')
+            self.mpl_toolbar_a.update()
+            self.mpl_toolbar_a.pack(side='left', fill='x')
+        except Exception as e:
+            print(f"arch toolbar err: {e}")
+
+        atb = tk.Frame(cf, bg=C['panel'])
+        atb.pack(fill='x', padx=8, pady=(2, 8))
+        mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
+        mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(side='right', padx=(4, 0))
+
+        self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
+                            C['cyan'], C['purple'], C['yellow'], '#ff8fab']
+        self.refresh_arch()
+        self._redraw_arch()
+
+    def _cycle_display_name(self, path):
+        from pathlib import Path as _P
+        s = _P(path).stem
+        if s.startswith('cykl_'): s = s[5:]
+        elif s.startswith('c_'): s = s[2:]
+        return s.replace('_', ' ')
+
+    def refresh_arch(self):
+        for w in self.arch_items.winfo_children(): w.destroy()
+        self.arch_vars = {}
+        files = sorted([f for f in self.log_dir.glob("*.csv")
+                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
+                        and not f.name.startswith("_tmp")],
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+        if not files:
+            tk.Label(self.arch_items, text="No saved cycles yet.",
+                     bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9))).pack(
+                     anchor='w', padx=12, pady=12)
+            return
+        for i, f in enumerate(files):
+            col = self._arch_colors[i % len(self._arch_colors)]
+            row = tk.Frame(self.arch_items, bg=C['bg2'])
+            row.pack(fill='x', pady=1)
+            var = tk.BooleanVar(value=False)
+            self.arch_vars[str(f)] = var
+            delb = tk.Button(row, text="✕", command=lambda p=f: self._delete_cycle(p),
+                            bg=C['bg2'], fg=C['red'], font=(FONT, fsz(10), 'bold'),
+                            relief='flat', cursor='hand2', bd=0, padx=8,
+                            activebackground=C['red'], activeforeground='#fff')
+            delb.pack(side='right', padx=(2, 4))
+            tk.Frame(row, bg=col, width=8).pack(side='left', fill='y')
+            name = self._cycle_display_name(f)
+            disp = name if len(name) <= 24 else name[:22]+"…"
+            tk.Checkbutton(row, text=disp, variable=var, command=self._redraw_arch,
+                           bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
+                           activebackground=C['bg2'], activeforeground=col,
+                           font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                           anchor='w').pack(side='left', fill='x', expand=True)
+
+    def _delete_cycle(self, path):
+        if messagebox.askyesno("Delete", f"Delete: {path.name}?"):
+            try: path.unlink(); self.refresh_arch(); self._redraw_arch()
+            except Exception as e: messagebox.showerror("Error", str(e))
+
+    def _arch_clear_sel(self):
+        for v in self.arch_vars.values(): v.set(False)
+        self._redraw_arch()
+
+    def _load_cycle(self, path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                rows = list(csv.DictReader(f))
+            t,t1,t2,sp,pwm = [],[],[],[],[]
+            for r in rows:
+                try:
+                    t.append(float(r.get('czas_s',0)))
+                    v1 = r.get('temperatura1_C','')
+                    t1.append(float(v1) if v1 else None)
+                    v2 = r.get('temperatura2_C','')
+                    t2.append(float(v2) if v2 else None)
+                    sp.append(float(r.get('setpoint_C',0)))
+                    pwm.append(float(r.get('peltier_pct',0)))
+                except: continue
+            return (t,t1,t2,sp,pwm) if t else None
+        except: return None
+
+    def _redraw_arch(self):
+        sel = [(p,v) for p,v in self.arch_vars.items() if v.get()]
+        self.ax_a.clear(); self.ax_a.set_facecolor(C['panel2'])
+        if not sel:
+            self.ax_a.text(0.5,0.5,"Tick a cycle to display",
+                           ha='center',va='center',color=C['dim2'],
+                           fontsize=11,transform=self.ax_a.transAxes)
+            self.cv_a.draw(); return
+        files = sorted([f for f in self.log_dir.glob("*.csv")
+                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
+                        and not f.name.startswith("_tmp")], reverse=True)
+        forder = {str(f):i for i,f in enumerate(files)}
+        for path,_ in sel:
+            d = self._load_cycle(path)
+            if not d: continue
+            t,t1,t2,sp,pwm = d
+            ci = forder.get(path,0)%len(self._arch_colors)
+            col = self._arch_colors[ci]
+            t0 = t[0]; tx=[x-t0 for x in t]
+            nm = self._cycle_display_name(path)
+            self.ax_a.plot(tx, sp, color=C['orange'], lw=1, ls='--', alpha=0.5)
+            self.ax_a.plot(tx, t1, color=col, lw=2, label=nm[:20])
+        self.ax_a.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel('temperatura [°C]', color=C['dim'], fontsize=9)
+        self.ax_a.tick_params(colors=C['dim'], labelsize=8)
+        self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
+                         labelcolor=C['dim'], fontsize=8)
+        self.ax_a.grid(True, alpha=0.3, color=C['grid'])
+        for sp2 in self.ax_a.spines.values(): sp2.set_color(C['border'])
+        self.fig_a.tight_layout()
+        self.cv_a.draw()
+
+    def save_arch_chart(self):
+        if not any(v.get() for v in self.arch_vars.values()):
+            messagebox.showinfo("No selection", "Tick a cycle first."); return
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(title="Save chart",
+               defaultextension=".png", initialfile="wykres.png",
+               filetypes=[("PNG","*.png")])
+        if dest:
+            self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'], bbox_inches='tight')
+            messagebox.showinfo("Saved", f"{dest}")
+
+    def open_log_folder(self):
+        import subprocess
+        p = str(self.log_dir)
+        if sys.platform=='win32': os.startfile(p)
+        elif sys.platform=='darwin': subprocess.run(['open',p])
+        else: subprocess.run(['xdg-open',p])
+
+    # ─── TICK ────────────────────────────────────────────
+    def tick(self):
+        try:
+            rows = []
+            while not self.data_queue.empty():
+                rows.append(self.data_queue.get_nowait())
+
+            for d in rows:
+                dtype = d.get('type','data')
+                if dtype == 'cfg':
+                    self.root.after(0, lambda d=d: self._apply_cfg(d)); continue
+                if dtype == 'status':
+                    msg = d.get('msg','')
+                    if msg == 'ON': self._update_run_button(True)
+                    elif msg in ('STOP','RESET'): self._update_run_button(False)
+                    continue
+                if dtype != 'data': continue
+
+                t1  = d.get('t1')
+                t2  = d.get('t2')
+                sp  = d.get('sp', 0)
+                spa = d.get('spa', sp)
+                pct = d.get('pct', 0)
+                fn  = d.get('fan', 0)
+                tsr = d.get('ts', 0) / 1000.0
+
+                if self.t0 is None: self.t0 = tsr
+                rel = tsr - self.t0
+
+                self.t.append(rel); self.temp1.append(t1); self.temp2.append(t2)
+                self.spt.append(sp); self.spa.append(spa)
+                self.pwm.append(pct); self.fanv.append(fn)
+
+                if len(self.t) > self.maxlen:
+                    for a in [self.t,self.temp1,self.temp2,self.spt,self.spa,self.pwm,self.fanv]:
+                        del a[0]
+
+                pid_on = d.get('pid_on', False)
+                if pid_on and not self.cyc_on:
+                    self._cyc_start(t1 or 0)
+                    self.reach_start_t = rel
+                    self.reach_start_temp = t1
+                    self.reach_target = sp
+                    self.reach_done = False
+                    self.reach_time = None
+                    self.reach_avg_rate = None
+                    self.last_setpoint_target = sp
+                elif not pid_on and self.cyc_on:
+                    self.cyc_stop("done")
+
+                if self.cyc_on:
+                    self.cyc_log(rel, t1, t2, sp, pct, fn)
+
+                if pid_on and self.last_setpoint_target is not None:
+                    if abs(sp - self.last_setpoint_target) > 0.5:
+                        self.reach_start_t = rel
+                        self.reach_start_temp = t1
+                        self.reach_target = sp
+                        self.reach_done = False
+                        self.last_setpoint_target = sp
+
+                if (pid_on and not self.reach_done and self.reach_target is not None
+                        and self.reach_start_t is not None and t1 is not None):
+                    if abs(t1 - self.reach_target) <= 0.5:
+                        self.reach_done = True
+                        self.reach_time = rel - self.reach_start_t
+                        delta = self.reach_target - (self.reach_start_temp or t1)
+                        dT = abs(delta)
+                        if self.reach_time > 0:
+                            self.reach_avg_rate = dT / (self.reach_time/60.0)
+                        self.reach_dir = "HEAT" if delta > 0 else "COOL"
+
+                self.cards['temp']['val'].config(
+                    text=f"{t1:.2f}" if t1 is not None else "ERR")
+                self.cards['temp2']['val'].config(
+                    text=f"{t2:.2f}" if t2 is not None else "--")
+                self.cards['sp']['val'].config(text=f"{sp:.1f}")
+                self.cards['pwm']['val'].config(text=f"{pct:.0f}")
+
+                avg_rate = 0.0
+                if (self.reach_start_t is not None and self.reach_start_temp is not None
+                        and t1 is not None and pid_on):
+                    elapsed = rel - self.reach_start_t
+                    if elapsed > 2:
+                        avg_rate = (t1 - self.reach_start_temp) / (elapsed/60.0)
+                if self.reach_done and self.reach_avg_rate is not None:
+                    sign = 1 if self.reach_dir == 'HEAT' else -1
+                    avg_rate = sign * self.reach_avg_rate
+                self.cards['rate']['val'].config(text=f"{avg_rate:+.1f}")
+
+                diff = sp - (t1 or sp)
+                arrow = "▲HEAT" if diff>0.3 else ("▼COOL" if diff<-0.3 else "●HOLD")
+                acol = C['red'] if diff>0.3 else (C['cyan'] if diff<-0.3 else C['dim2'])
+                self.cards['pwm']['unit_lbl'].config(text=" % "+arrow, fg=acol)
+
+                if self.reach_done and self.reach_time is not None:
+                    m=int(self.reach_time//60); s=int(self.reach_time%60)
+                    tstr=f"{m}m {s}s" if m>0 else f"{s}s"
+                    rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
+                    dcol = C['red'] if self.reach_dir=='HEAT' else C['cyan']
+                    self.reach_lbl.config(text=f"✓ {self.reach_dir} REACHED {tstr} · avg {rate_str}°C/min", fg=dcol)
+                elif pid_on and self.reach_start_t is not None and not self.reach_done:
+                    elapsed = rel - self.reach_start_t
+                    m=int(elapsed//60); s=int(elapsed%60)
+                    tstr=f"{m}m {s}s" if m>0 else f"{s}s"
+                    self.reach_lbl.config(text=f"→ reaching {self.reach_target:.1f}°C · {tstr}", fg=C['yellow'])
+                elif not pid_on:
+                    self.reach_lbl.config(text="")
+
+            if self.t and not self.chart_paused:
+                self._draw_chart()
+
+        except Exception as e:
+            print(f"tick err: {e}")
+        self.root.after(250, self.tick)
+
+    def _apply_cfg(self, d):
+        try:
+            if not self._cfg_synced:
+                if 'sp' in d and hasattr(self,'sl_sp'): self.sl_sp.set(float(d['sp']))
+                if 'ru' in d and hasattr(self,'sl_ru'): self.sl_ru.set(float(d['ru']))
+                if 'kp' in d and hasattr(self,'sl_kp'): self.sl_kp.set(float(d['kp']))
+                if 'ki' in d and hasattr(self,'sl_ki'): self.sl_ki.set(float(d['ki']))
+                if 'kd' in d and hasattr(self,'sl_kd'): self.sl_kd.set(float(d['kd']))
+                if 'kffh' in d and hasattr(self,'sl_kffh'): self.sl_kffh.set(float(d['kffh']))
+                if 'kffr' in d and hasattr(self,'sl_kffr'): self.sl_kffr.set(float(d['kffr']))
+                if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
+                if 'heat' in d:
+                    self.heat_var = bool(d['heat'])
+                    self.btn_heat.config(text="▲ HEAT" if self.heat_var else "▼ COOL",
+                                         bg=C['red'] if self.heat_var else C['cyan'])
+                self._cfg_synced = True
+        except Exception as e: print(f"cfg err: {e}")
+
+    def _draw_chart(self):
+        t=self.t; t1=self.temp1; t2=self.temp2; sp=self.spt; spa=self.spa; pw=self.pwm
+        if self.chart_window > 0 and len(t)>1:
+            cutoff = t[-1]-self.chart_window
+            i0 = next((i for i in range(len(t)) if t[i]>=cutoff), 0)
+            t=t[i0:]; t1=t1[i0:]; t2=t2[i0:]; sp=sp[i0:]; spa=spa[i0:]; pw=pw[i0:]
+
+        def safe(lst): return [v if v is not None else float('nan') for v in lst]
+
+        self.ax1.clear(); self.ax1.set_facecolor(C['panel2'])
+        self.ax1.plot(t, sp, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
+        self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
+        self.ax1.plot(t, safe(t1), color=C['blue'], lw=2.2, label='T1')
+        self.ax1.plot(t, safe(t2), color=C['purple'], lw=1.3, ls='--', label='T2', alpha=0.6)
+        self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
+        self.ax1.tick_params(colors=C['dim'], labelsize=8, length=0)
+        self.ax1.grid(True, axis='y', alpha=0.35, color=C['grid'])
+        for s in ['top','right']: self.ax1.spines[s].set_visible(False)
+        for s in ['left','bottom']: self.ax1.spines[s].set_color(C['border'])
+        self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
+                        labelcolor=C['dim'], fontsize=8, loc='upper right')
+
+        self.ax2.clear(); self.ax2.set_facecolor(C['panel2'])
+        self.ax2.fill_between(t, 0, pw, color=C['green'], alpha=0.3)
+        self.ax2.plot(t, pw, color=C['green'], lw=1.5)
+        self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
+        self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
+        self.ax2.set_ylim(-5, 105)
+        self.ax2.tick_params(colors=C['dim'], labelsize=8, length=0)
+        self.ax2.grid(True, axis='y', alpha=0.35, color=C['grid'])
+        for s in ['top','right']: self.ax2.spines[s].set_visible(False)
+        for s in ['left','bottom']: self.ax2.spines[s].set_color(C['border'])
+
+        self.cv.draw_idle()
+
+    # ─── CSV CYKLU ───────────────────────────────────────
+    def _cyc_start(self, temp0):
+        self.cyc_on = True; self.cyc_t0 = time.time()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
+        self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
+        self.cyc_wr = csv.writer(self.cyc_file)
+        self.cyc_wr.writerow(['czas_s','temperatura1_C','temperatura2_C',
+                              'setpoint_C','peltier_pct','fan_pct'])
+        self.cyc_rows = 0
+        print(f"CYC START T={temp0}")
+
+    def cyc_log(self, t, t1, t2, sp, pct, fn):
+        if self.cyc_wr:
+            try:
+                t1s = f"{t1:.2f}" if t1 is not None else ""
+                t2s = f"{t2:.2f}" if t2 is not None else ""
+                self.cyc_wr.writerow([f"{t:.2f}", t1s, t2s,
+                                     f"{sp:.2f}", f"{pct:.1f}", f"{fn:.1f}"])
+                self.cyc_file.flush(); self.cyc_rows += 1
+            except: pass
+
+    def cyc_stop(self, reason=""):
+        if self.cyc_file:
+            try: self.cyc_file.close()
+            except: pass
+        had = self.cyc_on and self.cyc_rows > 0
+        tmp = self.cyc_fn
+        self.cyc_on=False; self.cyc_file=None; self.cyc_wr=None
+        print(f"CYC STOP: {reason} ({self.cyc_rows} probek)")
+        if had and tmp and tmp.exists():
+            self.root.after(0, lambda: self._ask_save_name(tmp))
+        elif tmp and tmp.exists():
+            try: tmp.unlink()
+            except: pass
+
+    def _ask_save_name(self, tmp_path):
+        SaveCycleDialog(self.root, self, tmp_path)
+
+    def save_cycle_as(self, tmp_path, name):
+        import re as _re
+        safe = _re.sub(r'[^\w\-\s]', '', name.strip())
+        safe = _re.sub(r'\s+', '_', safe) or "cykl"
+        dest = self.log_dir / f"c_{safe}.csv"
+        if dest.exists():
+            ts = datetime.now().strftime("%m%d_%H%M")
+            dest = self.log_dir / f"c_{safe}_{ts}.csv"
+        try:
+            tmp_path.rename(dest)
+            print(f"Zapisano: {dest.name}")
+        except Exception as e: print(f"err: {e}")
+        if hasattr(self, 'refresh_arch'):
+            try: self.refresh_arch()
+            except: pass
+
+    def discard_cycle(self, tmp_path):
+        try:
+            if tmp_path.exists(): tmp_path.unlink()
+        except: pass
+
+
+# ════════════════════════════════════════════════════════
+#  DIALOG ZAPISU CYKLU
+# ════════════════════════════════════════════════════════
+class SaveCycleDialog:
+    def __init__(self, parent, app, tmp_path):
+        self.app = app; self.tmp_path = tmp_path
+        self.win = tk.Toplevel(parent)
+        self.win.title("Save cycle")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("440x230")
+        self.win.transient(parent)
+        self.win.grab_set()
+
+        tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=24, pady=20)
+
+        tk.Label(inner, text="SAVE CYCLE TO ARCHIVE", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
+        rows = getattr(app, 'cyc_rows', 0)
+        tk.Label(inner, text=f"Recorded {rows} samples",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(4, 16))
+
+        tk.Label(inner, text="Cycle name:", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10))).pack(anchor='w')
+        self.entry = tk.Entry(inner, bg=C['bg2'], fg=C['text'],
+                              font=(FONT, fsz(12)), relief='flat', bd=0,
+                              insertbackground=C['green'],
+                              highlightthickness=2, highlightbackground=C['green'])
+        self.entry.pack(fill='x', ipady=6, pady=(4, 16))
+        default = datetime.now().strftime("test_%H%M")
+        self.entry.insert(0, default)
+        self.entry.select_range(0, 'end')
+        self.entry.focus()
+        self.entry.bind('<Return>', lambda e: self.save())
+
+        bf = tk.Frame(inner, bg=C['bg'])
+        bf.pack(fill='x')
+        mk_btn(bf, "SAVE", self.save, C['green']).pack(side='left', fill='x', expand=True, padx=(0, 4))
+        mk_btn_outline(bf, "DISCARD", self.discard, C['red']).pack(side='left', fill='x', expand=True, padx=(4, 0))
+        self.win.protocol("WM_DELETE_WINDOW", self.save)
+
+    def save(self):
+        name = self.entry.get().strip()
+        if not name: name = datetime.now().strftime("cykl_%H%M")
+        self.app.save_cycle_as(self.tmp_path, name)
+        self.win.destroy()
+
+    def discard(self):
+        if messagebox.askyesno("Discard?", "Discard this cycle?"):
+            self.app.discard_cycle(self.tmp_path)
+            self.win.destroy()
+
+
+# ════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════
+def _enable_dpi_awareness():
+    if sys.platform != 'win32': return 1.0
+    try:
+        import ctypes
+        try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except: ctypes.windll.user32.SetProcessDPIAware()
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi / 96.0
+    except: return 1.0
+
+def main():
+    scale = _enable_dpi_awareness()
+    global FS
+    FS = scale if scale and scale > 1.05 else 1.0
+
+    root = tk.Tk()
+    try:
+        if scale and scale > 1.05: root.tk.call('tk', 'scaling', scale)
+    except: pass
+
+    app = PeltierControl(root)
+
+    def on_close():
+        app.disconnect()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
 
 if __name__ == "__main__":
-    app = PeltierApp()
-    app.mainloop()
+    main()
