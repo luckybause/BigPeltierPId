@@ -984,9 +984,12 @@ class PeltierControl:
         t2s = f"{t2:.3f}" if t2 is not None else "—"
         kis = f"{k_i:.6e}" if k_i is not None else "—"
         kvs = f"{k_v:.4f}" if k_v is not None else "—"
+        # W trybie MAN firmware wysyla T1 zamiast spA (brak aktywnej rampy) -
+        # pokazujemy myslnik zeby nie mylic uzytkownika ze rampa dziala
+        spas = "—" if state == "MAN" else f"{spa:.2f}"
         self.raw_tree.insert('', 'end', values=(
             idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
-            f"{sp:.2f}", f"{spa:.2f}", f"{pct:.1f}", f"{fan:.1f}", kis, kvs, state
+            f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", kis, kvs, state
         ))
         if self.raw_autoscroll:
             children = self.raw_tree.get_children()
@@ -1014,11 +1017,12 @@ class PeltierControl:
                            'keithley_napiecie_V', 'stan'])
                 for row in self.raw_rows:
                     czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
+                    spas = "" if state == "MAN" else f"{spa:.3f}"
                     w.writerow([
                         f"{czas_fw:.3f}", pc_time,
                         f"{t1:.3f}" if t1 is not None else "",
                         f"{t2:.3f}" if t2 is not None else "",
-                        f"{sp:.3f}", f"{spa:.3f}", f"{pct:.2f}", f"{fan:.2f}",
+                        f"{sp:.3f}", spas, f"{pct:.2f}", f"{fan:.2f}",
                         f"{k_i:.9e}" if k_i is not None else "",
                         f"{k_v:.6f}" if k_v is not None else "",
                         state
@@ -1325,8 +1329,10 @@ class PeltierControl:
 
         atb = tk.Frame(cf, bg=C['panel'])
         atb.pack(fill='x', padx=8, pady=(2, 8))
-        mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
         mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(side='right', padx=(4, 0))
+        mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
+        mk_btn(atb, "⤓ POBIERZ CSV (zaznaczony cykl)", self.export_selected_cycle_csv, C['green']).pack(
+            side='right', padx=(4, 0))
 
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
@@ -1441,6 +1447,43 @@ class PeltierControl:
         if dest:
             self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'], bbox_inches='tight')
             messagebox.showinfo("Saved", f"{dest}")
+
+    def export_selected_cycle_csv(self):
+        """Kopiuje surowy plik CSV zaznaczonego cyklu (lub cykli) do wskazanej
+        lokalizacji. Plik juz zawiera komplet danych raw: T1, T2, setpointy,
+        PID, Keithley - dokladnie to co zostalo zapisane od START do STOP."""
+        import shutil
+        from pathlib import Path as _P
+        selected = [_P(p) for p, v in self.arch_vars.items() if v.get()]
+        if not selected:
+            messagebox.showinfo("Brak zaznaczenia", "Zaznacz cykl (checkbox) na liscie po lewej.")
+            return
+        from tkinter import filedialog
+        if len(selected) == 1:
+            src = selected[0]
+            dest = filedialog.asksaveasfilename(
+                title="Zapisz raw dane cyklu", defaultextension=".csv",
+                initialfile=src.name,
+                filetypes=[("CSV", "*.csv")])
+            if not dest:
+                return
+            try:
+                shutil.copy(src, dest)
+                messagebox.showinfo("Zapisano", f"Raw dane cyklu zapisane do:\n{dest}")
+            except Exception as e:
+                messagebox.showerror("Blad", str(e))
+        else:
+            dest_dir = filedialog.askdirectory(title="Wybierz folder docelowy dla CSV")
+            if not dest_dir:
+                return
+            ok = 0
+            for src in selected:
+                try:
+                    shutil.copy(src, _P(dest_dir) / src.name)
+                    ok += 1
+                except Exception:
+                    pass
+            messagebox.showinfo("Zapisano", f"Skopiowano {ok}/{len(selected)} plikow do:\n{dest_dir}")
 
     def open_log_folder(self):
         import subprocess
