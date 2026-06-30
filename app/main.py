@@ -269,6 +269,68 @@ class PeltierControl:
             a.clear()
         self.t0 = None
 
+    def _parse_csv_line(self, line):
+        # Format firmware: czas_s,temp_C,setpoint_akt,setpoint_cel,PWM,Kp,Ki,Kd,stan,temp2_C
+        p = line.split(',')
+        if len(p) < 9:
+            return
+        try:
+            ts = float(p[0])
+            temp = float(p[1])
+            sa = float(p[2])
+            st = float(p[3])
+            pwm_raw = float(p[4])
+            kp = float(p[5]); ki = float(p[6]); kd = float(p[7])
+            state = p[8].strip()
+        except (ValueError, IndexError):
+            return
+        temp2v = None
+        if len(p) >= 10:
+            try:
+                v2 = float(p[9])
+                temp2v = v2 if v2 != 0 else None
+            except ValueError:
+                pass
+        pid_on = state.startswith('AUTO') or state.startswith('ST') or state.startswith('CAL') or state.startswith('FREEZE')
+        d = {
+            'type': 'data',
+            'ts': ts * 1000.0,
+            't1': temp,
+            't2': temp2v,
+            'sp': st,
+            'spa': sa,
+            'pct': abs(pwm_raw) / 255.0 * 100.0,
+            'fan': self.sl_fan.get() if (self.fan_on and hasattr(self, 'sl_fan')) else 0.0,
+            'pid_on': pid_on,
+            'heat': pwm_raw >= 0,
+            'kp': kp, 'ki': ki, 'kd': kd,
+        }
+        self.data_queue.put(d)
+
+    def _parse_cfg_line(self, cfg):
+        # Format: SP=25.50,RU=2.00,RD=2.00,TMAX=110.0,KP=10.000,KI=0.3000,KD=0.800,...
+        d = {}
+        for part in cfg.split(','):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                d[k.strip()] = v.strip()
+        out = {'type': 'cfg'}
+        try:
+            if 'SP' in d:   out['sp'] = float(d['SP'])
+            if 'RU' in d:   out['ru'] = float(d['RU'])
+            if 'KP' in d:   out['kp'] = float(d['KP'])
+            if 'KI' in d:   out['ki'] = float(d['KI'])
+            if 'KD' in d:   out['kd'] = float(d['KD'])
+            if 'KFFH' in d: out['kffh'] = float(d['KFFH'])
+            if 'KFFR' in d: out['kffr'] = float(d['KFFR'])
+            if 'OFFSET' in d: out['offset'] = float(d['OFFSET'])
+            if 'FAN' in d:
+                fv = float(d['FAN'])
+                self.fan_on = fv > 0
+        except ValueError:
+            pass
+        self.data_queue.put(out)
+
     def reader(self):
         with self._lock: ser = self.ser
         if ser and ser.is_open:
@@ -286,9 +348,15 @@ class PeltierControl:
                     while '\n' in buf:
                         line, buf = buf.split('\n', 1)
                         line = line.strip()
+                        if not line:
+                            continue
                         if line.startswith('{'):
                             try: self.data_queue.put(json.loads(line))
                             except: pass
+                        elif line.startswith('CFG:'):
+                            self._parse_cfg_line(line[4:])
+                        elif line[0].isdigit() or (line[0]=='-' and len(line)>1 and line[1].isdigit()):
+                            self._parse_csv_line(line)
                 else:
                     time.sleep(0.02)
             except serial.SerialException:
@@ -526,16 +594,11 @@ class PeltierControl:
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
         # Tryb grzania/chlodzenia
-        hf = tk.Frame(inner, bg=C['bg2'])
-        hf.pack(fill='x', pady=(0, 10))
-        tk.Label(hf, text="TRYB", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
-        self.heat_var = True
-        self.btn_heat = tk.Button(hf, text="▲ HEAT", command=self._toggle_heat,
-                                  bg=C['red'], fg='#fff', font=(FONT, fsz(9), 'bold'),
-                                  relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
-                                  activebackground=_lighten(C['red'], 0.15))
-        self.btn_heat.pack(side='right')
+        auto_lbl = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
+                            highlightbackground=C['green'])
+        auto_lbl.pack(fill='x', pady=(0, 10))
+        tk.Label(auto_lbl, text="AUTO: kierunek wg setpointu", bg=C['bg2'],
+                 fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
         tk.Label(inner, text="▶ START uses panel values",
                  bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
@@ -543,13 +606,6 @@ class PeltierControl:
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
 
         self._set_panel_enabled(False)
-
-    def _toggle_heat(self):
-        self.heat_var = not self.heat_var
-        self.btn_heat.config(
-            text="▲ HEAT" if self.heat_var else "▼ COOL",
-            bg=C['red'] if self.heat_var else C['cyan'])
-        self.send(f"HEAT:{1 if self.heat_var else 0}")
 
     def build_advanced(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
@@ -648,12 +704,12 @@ class PeltierControl:
             self.reach_lbl.config(text="→ starting...", fg=C['dim'])
         self.send(f"SP:{self.sl_sp.get():.1f}")
         self.send(f"RU:{self.sl_ru.get():.1f}")
+        self.send(f"RD:{self.sl_ru.get():.1f}")
         self.send(f"KP:{self.sl_kp.get():.1f}")
         self.send(f"KI:{self.sl_ki.get():.2f}")
         self.send(f"KD:{self.sl_kd.get():.2f}")
         self.send(f"KFFH:{self.sl_kffh.get():.2f}")
         self.send(f"KFFR:{self.sl_kffr.get():.2f}")
-        self.send(f"HEAT:{1 if self.heat_var else 0}")
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
         time.sleep(0.05)
         self.send("START")
@@ -675,7 +731,6 @@ class PeltierControl:
         if self.fan_on:
             spd = int(self.sl_fan.get())
             if spd == 0: spd = 100; self.sl_fan.set(100, silent=True)
-            self.send(f"FANAUTO:0")
             self.send(f"FAN:{spd}")
             self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
         else:
@@ -684,7 +739,6 @@ class PeltierControl:
 
     def set_fan_speed(self, v):
         spd = int(v)
-        self.send(f"FANAUTO:0")
         self.send(f"FAN:{spd}")
         if spd > 0:
             self.fan_on = True
@@ -1082,10 +1136,6 @@ class PeltierControl:
                 if 'kffh' in d and hasattr(self,'sl_kffh'): self.sl_kffh.set(float(d['kffh']))
                 if 'kffr' in d and hasattr(self,'sl_kffr'): self.sl_kffr.set(float(d['kffr']))
                 if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
-                if 'heat' in d:
-                    self.heat_var = bool(d['heat'])
-                    self.btn_heat.config(text="▲ HEAT" if self.heat_var else "▼ COOL",
-                                         bg=C['red'] if self.heat_var else C['cyan'])
                 self._cfg_synced = True
         except Exception as e: print(f"cfg err: {e}")
 
