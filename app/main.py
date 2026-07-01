@@ -155,62 +155,54 @@ class SliderField:
 #  KEITHLEY 2611B - klient TSP przez raw socket (port 5025)
 # ════════════════════════════════════════════════════════
 class KeithleyClient:
-    """Komunikacja z Keithley 2611B przez TSP (Lua) na porcie 5025 (scpi-raw).
-    Domyslny jezyk komend serii 2600B to TSP, nie SCPI."""
+    """Komunikacja z Keithley 2611B przez PyVISA (VXI-11), tak jak w sprawdzonej
+    bibliotece OE-FET/keithley2600. Uzywa TSP (Lua) do sterowania SMU.
+    Wymaga: pip install pyvisa pyvisa-py"""
 
-    PORT = 5025
-    TIMEOUT = 2.0
+    TIMEOUT_MS = 5000
 
     def __init__(self):
-        self.sock = None
+        self.rm = None
+        self.inst = None
         self.connected = False
         self.ip = ""
         self.idn = ""
 
     def connect(self, ip):
+        import pyvisa
         self.ip = ip
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self.TIMEOUT)
-        s.connect((ip, self.PORT))
-        s.settimeout(self.TIMEOUT)
-        self.sock = s
+        if self.rm is None:
+            # PyVISA-py backend - czysty Python, nie wymaga instalacji NI-VISA
+            self.rm = pyvisa.ResourceManager('@py')
+        resource = f"TCPIP0::{ip}::INSTR"
+        self.inst = self.rm.open_resource(resource)
+        self.inst.timeout = self.TIMEOUT_MS
+        self.inst.write_termination = '\n'
+        self.inst.read_termination = '\n'
         self.connected = True
         try:
-            self.idn = self._query("*IDN?")
+            self.idn = self.inst.query("*IDN?").strip()
         except Exception:
-            self.idn = ""
+            self.idn = f"Keithley @ {ip}"
         return self.idn
 
     def disconnect(self):
         self.connected = False
-        if self.sock:
-            try: self.sock.close()
+        if self.inst:
+            try: self.inst.close()
             except: pass
-            self.sock = None
-
-    def _send(self, cmd):
-        if not self.sock:
-            raise ConnectionError("Keithley not connected")
-        self.sock.sendall((cmd + "\n").encode("ascii"))
-
-    def _recv_line(self):
-        buf = b""
-        while True:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-            if b"\n" in buf:
-                break
-        return buf.decode("ascii", errors="replace").strip()
-
-    def _query(self, cmd):
-        self._send(cmd)
-        return self._recv_line()
+            self.inst = None
 
     def _exec(self, cmd):
         """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania)."""
-        self._send(cmd)
+        if not self.inst:
+            raise ConnectionError("Keithley not connected")
+        self.inst.write(cmd)
+
+    def _query(self, cmd):
+        if not self.inst:
+            raise ConnectionError("Keithley not connected")
+        return self.inst.query(cmd).strip()
 
     def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1):
         """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance)."""
