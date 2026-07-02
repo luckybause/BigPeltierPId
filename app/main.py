@@ -155,100 +155,102 @@ class SliderField:
 #  KEITHLEY 2611B - klient TSP przez raw socket (port 5025)
 # ════════════════════════════════════════════════════════
 class KeithleyClient:
-    """Komunikacja z Keithley 2611B przez TSP (Lua) na porcie 5025 (raw socket).
-    Zgodnie z oficjalnym Reference Manual 2600B: raw socket jest zalecana,
-    szybsza alternatywa dla VXI-11; instrument konczy odpowiedzi znakiem \\n.
-    2600B trzyma jedna aktywna sesje - zawieszona (nieczysto zamknieta) sesja
-    blokuje nowe polaczenia. Manual przewiduje na to "Dead Socket Termination"
-    (port 5030): polaczenie z nim ubija zawieszona sesje bez restartu urzadzenia."""
+    """Komunikacja z Keithley 2611B przez USB (protokol TMC488) uzywajac PyVISA.
+    Recznie zweryfikowane: stabilne, wielokrotne komendy na tym samym polaczeniu
+    dzialaja bez zrywania - w przeciwienstwie do Ethernetu przez tani adapter
+    USB-Ethernet, ktory mial problemy sprzetowe (fizyczne odlaczanie/podlaczanie).
+    Wymaga: pip install pyvisa pyvisa-py pyusb libusb-package
+    Oraz zainstalowanego sterownika WinUSB dla urzadzenia (przez Zadig), bo Windows
+    domyslnie nie ma sterownika dla USBTMC device na Keithleyu."""
 
-    PORT = 5025
-    DEAD_SOCKET_PORT = 5030
-    TIMEOUT = 5.0
+    TIMEOUT_MS = 5000
 
     def __init__(self):
-        self.sock = None
+        self.rm = None
+        self.inst = None
         self.connected = False
-        self.ip = ""
         self.idn = ""
+        self.resource_str = ""
+        self._ensure_libusb_on_path()
 
-    def _kill_dead_sessions(self):
-        """Ubij ewentualne zawieszone sesje przez Dead Socket Termination port.
-        Zgodnie z manualem 2600B - czysci nieczysto zamkniete polaczenia."""
+    @staticmethod
+    def _ensure_libusb_on_path():
+        """Dodaje folder z libusb-1.0.dll (z pakietu libusb_package) do PATH,
+        bo pyusb/pyvisa-py go tam nie znajdzie automatycznie."""
         try:
-            ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ds.settimeout(2.0)
-            ds.connect((self.ip, self.DEAD_SOCKET_PORT))
-            ds.close()
-            time.sleep(0.3)  # daj instrumentowi chwile na zwolnienie sesji
+            import libusb_package
+            lib_dir = os.path.dirname(libusb_package.__file__)
+            if lib_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + lib_dir
         except Exception:
-            pass  # dead socket port niedostepny - kontynuuj normalnie
+            pass  # jesli libusb_package niedostepny, pyvisa-py sprobuje domyslnych sciezek
 
-    def _open_socket(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self.TIMEOUT)
-        s.connect((self.ip, self.PORT))
-        return s
+    def find_usb_resource(self):
+        """Znajdz pierwszy dostepny zasob USB (Keithley) przez PyVISA."""
+        import pyvisa
+        if self.rm is None:
+            self.rm = pyvisa.ResourceManager('@py')
+        resources = self.rm.list_resources()
+        usb_resources = [r for r in resources if r.startswith('USB')]
+        if not usb_resources:
+            raise ConnectionError(
+                "Nie znaleziono urzadzenia USB. Sprawdz czy Keithley jest podlaczony "
+                "kablem USB i czy sterownik WinUSB jest zainstalowany (Zadig)."
+            )
+        return usb_resources[0]
 
-    def connect(self, ip):
-        self.ip = ip
-        self._kill_dead_sessions()   # wyczysc zawieszone sesje PRZED polaczeniem
-        self.sock = self._open_socket()
+    def connect(self, ip=None):
+        """Parametr 'ip' zachowany dla zgodnosci z reszta aplikacji (nieuzywany -
+        USB nie wymaga adresu, znajduje urzadzenie automatycznie)."""
+        import pyvisa
+        if self.rm is None:
+            self.rm = pyvisa.ResourceManager('@py')
+        self.resource_str = self.find_usb_resource()
+        self.inst = self.rm.open_resource(self.resource_str)
+        self.inst.timeout = self.TIMEOUT_MS
         self.connected = True
         try:
-            self.idn = self._query_raw("*IDN?")
+            self.idn = self.inst.query("*IDN?").strip()
         except Exception:
-            self.idn = f"Keithley @ {ip}"
+            self.idn = "Keithley (USB)"
         return self.idn
 
     def disconnect(self):
         self.connected = False
-        if self.sock:
-            try: self.sock.close()
-            except: pass
-            self.sock = None
-
-    def _send_raw(self, cmd):
-        self.sock.sendall((cmd + "\n").encode("ascii"))
-
-    def _recv_line_raw(self):
-        buf = b""
-        while True:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-            if b"\n" in buf:
-                break
-        return buf.decode("ascii", errors="replace").strip()
-
-    def _query_raw(self, cmd):
-        self._send_raw(cmd)
-        return self._recv_line_raw()
-
-    def _query(self, cmd):
-        """Wysyla zapytanie i czyta odpowiedz. Jesli polaczenie padlo (zawieszona
-        sesja po stronie instrumentu), czysci dead socket i probuje raz jeszcze."""
-        if not self.sock:
-            raise ConnectionError("Keithley not connected")
-        try:
-            return self._query_raw(cmd)
-        except (OSError, ConnectionError):
-            self._kill_dead_sessions()
-            self.sock = self._open_socket()
-            return self._query_raw(cmd)
+        if self.inst:
+            try: self.inst.close()
+            except Exception: pass
+            self.inst = None
 
     def _exec(self, cmd):
-        """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania).
-        Auto-reconnect z czyszczeniem dead socket jak w _query."""
-        if not self.sock:
+        """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania)."""
+        if not self.inst:
             raise ConnectionError("Keithley not connected")
         try:
-            self._send_raw(cmd)
-        except (OSError, ConnectionError):
-            self._kill_dead_sessions()
-            self.sock = self._open_socket()
-            self._send_raw(cmd)
+            self.inst.write(cmd)
+        except Exception:
+            self._reconnect()
+            self.inst.write(cmd)
+
+    def _query(self, cmd):
+        if not self.inst:
+            raise ConnectionError("Keithley not connected")
+        try:
+            return self.inst.query(cmd).strip()
+        except Exception:
+            self._reconnect()
+            return self.inst.query(cmd).strip()
+
+    def _reconnect(self):
+        """Auto-reconnect jesli polaczenie USB padnie w trakcie pracy."""
+        try:
+            if self.inst:
+                self.inst.close()
+        except Exception:
+            pass
+        self.resource_str = self.find_usb_resource()
+        self.inst = self.rm.open_resource(self.resource_str)
+        self.inst.timeout = self.TIMEOUT_MS
 
     def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1):
         """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance)."""
@@ -1021,7 +1023,7 @@ class PeltierControl:
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
         kis = f"{k_i:.6e}" if k_i is not None else "—"
-        kvs = f"{k_v:.4f}" if k_v is not None else "—"
+        kvs = f"{k_v:.6e}" if k_v is not None else "—"
         # W trybie MAN firmware wysyla T1 zamiast spA (brak aktywnej rampy) -
         # pokazujemy myslnik zeby nie mylic uzytkownika ze rampa dziala
         spas = "—" if state == "MAN" else f"{spa:.2f}"
@@ -1062,7 +1064,7 @@ class PeltierControl:
                         f"{t2:.3f}" if t2 is not None else "",
                         f"{sp:.3f}", spas, f"{pct:.2f}", f"{fan:.2f}",
                         f"{k_i:.9e}" if k_i is not None else "",
-                        f"{k_v:.6f}" if k_v is not None else "",
+                        f"{k_v:.6e}" if k_v is not None else "",
                         state
                     ])
             messagebox.showinfo("Zapisano", f"Wyeksportowano {len(self.raw_rows)} probek do:\n{dest}")
@@ -1111,22 +1113,11 @@ class PeltierControl:
 
         khd = tk.Frame(kinner, bg=C['panel'])
         khd.pack(fill='x', pady=(0, 12))
-        tk.Label(khd, text="KEITHLEY 2611B (LAN)", bg=C['panel'], fg=C['text'],
+        tk.Label(khd, text="KEITHLEY 2611B (USB)", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
         self.keithley_status_lbl = tk.Label(khd, text="● not connected", bg=C['panel'],
                                             fg=C['dim2'], font=(FONT, fsz(9)))
         self.keithley_status_lbl.pack(side='right')
-
-        krow1 = tk.Frame(kinner, bg=C['panel'])
-        krow1.pack(fill='x', pady=4)
-        tk.Label(krow1, text="IP address", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9)), width=14, anchor='w').pack(side='left')
-        self.keithley_ip_entry = tk.Entry(krow1, bg=C['bg2'], fg=C['text'],
-                                          font=(FONT, fsz(10)), relief='flat', bd=0,
-                                          insertbackground=C['orange'],
-                                          highlightthickness=1, highlightbackground=C['border'])
-        self.keithley_ip_entry.pack(side='left', fill='x', expand=True, ipady=4)
-        self.keithley_ip_entry.insert(0, "192.168.1.50")
 
         krow2 = tk.Frame(kinner, bg=C['panel'])
         krow2.pack(fill='x', pady=4)
@@ -1155,7 +1146,7 @@ class PeltierControl:
         mk_btn_outline(kbr, "DISCONNECT", self.keithley_disconnect, C['red']).pack(side='left')
 
         tk.Label(kinner, text="Pomiar pradu startuje/zatrzymuje sie razem z PID (START/STOP w CONTROL).\n"
-                 "Domyslny protokol 2600B to TSP (Lua) przez port 5025.",
+                 "Polaczenie przez USB (protokol TMC488) - wymaga sterownika WinUSB (Zadig).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left').pack(anchor='w', pady=(10, 0))
 
@@ -1193,26 +1184,20 @@ class PeltierControl:
     # ─── KEITHLEY 2611B ──────────────────────────────────
     def _read_keithley_settings(self):
         try:
-            ip = self.keithley_ip_entry.get().strip()
             v = float(self.keithley_v_entry.get().replace(',', '.'))
             ilim = float(self.keithley_i_entry.get().replace(',', '.'))
-            return ip, v, ilim
+            return v, ilim
         except ValueError:
-            return None, None, None
+            return None, None
 
     def keithley_test_connect(self):
-        ip, v, ilim = self._read_keithley_settings()
-        if not ip:
-            messagebox.showwarning("Brak IP", "Wpisz adres IP Keithleya.")
-            return
-        self.keithley_status_lbl.config(text="● laczenie...", fg=C['yellow'])
+        self.keithley_status_lbl.config(text="● szukam urzadzenia USB...", fg=C['yellow'])
         self.root.update_idletasks()
 
         def worker():
             try:
-                idn = self.keithley.connect(ip)
+                idn = self.keithley.connect()
                 self.keithley_connected = True
-                self.keithley_ip = ip
                 self.root.after(0, lambda: self.keithley_status_lbl.config(
                     text=f"● polaczono: {idn[:40]}", fg=C['green']))
             except Exception as e:
@@ -1229,18 +1214,19 @@ class PeltierControl:
 
     def keithley_start_measurement(self):
         """Wywolywane razem z do_start() PID - konfiguruje SMU, wlacza output, startuje watek pomiarowy."""
-        ip, v, ilim = self._read_keithley_settings()
-        if not ip:
-            return  # brak konfiguracji Keithleya - kontynuuj bez niego
-        self.keithley_voltage = v if v is not None else 1.0
+        v, ilim = self._read_keithley_settings()
+        if v is None:
+            self.keithley_status_lbl.config(
+                text="● zle ustawienia V/I - pomiar Keithleya wylaczony", fg=C['dim2'])
+            return  # brak poprawnej konfiguracji - kontynuuj bez Keithleya
+        self.keithley_voltage = v
         self.keithley_ilimit = ilim if ilim is not None else 0.1
 
         def worker():
             try:
                 if not self.keithley_connected:
-                    idn = self.keithley.connect(ip)
+                    idn = self.keithley.connect()
                     self.keithley_connected = True
-                    self.keithley_ip = ip
                     self.root.after(0, lambda: self.keithley_status_lbl.config(
                         text=f"● polaczono: {idn[:40]}", fg=C['green']))
                 self.keithley.setup_source_v_measure_i(
@@ -1272,6 +1258,7 @@ class PeltierControl:
 
     def _keithley_poll_loop(self):
         """Watek probkujacy prad/napiecie z Keithleya co keithley_period_s."""
+        consecutive_errors = 0
         while self.keithley_running and self.keithley_connected:
             t_start = time.time()
             try:
@@ -1282,10 +1269,16 @@ class PeltierControl:
                 self.keithley_last_v = v_val
                 self.keithley_last_ts = ts_ms
                 self.keithley_queue.put((ts_ms, i_val, v_val))
+                consecutive_errors = 0
             except Exception as e:
+                consecutive_errors += 1
                 self.root.after(0, lambda e=e: self.keithley_status_lbl.config(
                     text=f"● blad pomiaru: {e}", fg=C['red']))
-                time.sleep(0.5)
+                # Backoff rosnie z liczba kolejnych bledow - zapobiega zalewaniu
+                # adaptera USB-Ethernet ciaglymi probami reconnect (co powodowalo
+                # fizyczne odlaczanie/podlaczanie adaptera w Windows)
+                backoff = min(0.5 * consecutive_errors, 5.0)
+                time.sleep(backoff)
                 continue
             elapsed = time.time() - t_start
             sleep_t = max(0.0, self.keithley_period_s - elapsed)
@@ -1580,15 +1573,18 @@ class PeltierControl:
                 elif not pid_on and self.cyc_on:
                     self.cyc_stop("done")
 
+                # Jedno wywolanie na probke - ta sama wartosc uzyta wszedzie
+                # (log cyklu, RAW DATA, karta na zywo), zeby wykluczyc jakakolwiek
+                # niespojnosc miedzy oddzielnymi odczytami w tej samej iteracji.
+                k_i, k_v = self._keithley_latest()
+
                 if self.cyc_on:
-                    k_i, k_v = self._keithley_latest()
                     self.cyc_log(rel, t1, t2, sp, pct, fn,
                                  spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
                                  fw_ts=tsr, state=d.get('state'),
                                  keithley_i=k_i, keithley_v=k_v)
 
                 pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                k_i, k_v = self._keithley_latest()
                 self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v))
 
                 if pid_on and self.last_setpoint_target is not None:
@@ -1616,9 +1612,8 @@ class PeltierControl:
                     text=f"{t2:.2f}" if t2 is not None else "--")
                 self.cards['sp']['val'].config(text=f"{sp:.1f}")
                 self.cards['pwm']['val'].config(text=f"{pct:.0f}")
-                k_i_disp, _ = self._keithley_latest()
-                if k_i_disp is not None:
-                    self.cards['kcur']['val'].config(text=f"{k_i_disp*1000:.3f}m")
+                if k_i is not None:
+                    self.cards['kcur']['val'].config(text=f"{k_i*1000:.3f}m")
                 elif self.keithley_running:
                     self.cards['kcur']['val'].config(text="...")
                 else:
@@ -1740,7 +1735,7 @@ class PeltierControl:
                 kds = f"{kd:.4f}" if kd is not None else ""
                 fwts = f"{fw_ts:.3f}" if fw_ts is not None else ""
                 kis_a = f"{keithley_i:.9e}" if keithley_i is not None else ""
-                kvs = f"{keithley_v:.6f}" if keithley_v is not None else ""
+                kvs = f"{keithley_v:.9e}" if keithley_v is not None else ""
                 pc_ts = datetime.now().isoformat(timespec="milliseconds")
                 self.cyc_wr.writerow([
                     pc_ts, fwts, f"{t:.3f}",
