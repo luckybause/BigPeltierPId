@@ -26,7 +26,7 @@ jobs:
 
       - name: Zbuduj EXE
         run: |
-          pyinstaller --onefile --windowed --name PeltierPID app/main.py
+          pyinstaller --onefile --windowed --name PeltierPID --collect-all pyvisa_py --collect-all libusb_package --collect-all usb app/main.py
 
       - name: Wgraj EXE do Release
         uses: softprops/action-gh-release@v2
