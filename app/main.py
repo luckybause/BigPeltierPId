@@ -155,54 +155,100 @@ class SliderField:
 #  KEITHLEY 2611B - klient TSP przez raw socket (port 5025)
 # ════════════════════════════════════════════════════════
 class KeithleyClient:
-    """Komunikacja z Keithley 2611B przez PyVISA (VXI-11), tak jak w sprawdzonej
-    bibliotece OE-FET/keithley2600. Uzywa TSP (Lua) do sterowania SMU.
-    Wymaga: pip install pyvisa pyvisa-py"""
+    """Komunikacja z Keithley 2611B przez TSP (Lua) na porcie 5025 (raw socket).
+    Zgodnie z oficjalnym Reference Manual 2600B: raw socket jest zalecana,
+    szybsza alternatywa dla VXI-11; instrument konczy odpowiedzi znakiem \\n.
+    2600B trzyma jedna aktywna sesje - zawieszona (nieczysto zamknieta) sesja
+    blokuje nowe polaczenia. Manual przewiduje na to "Dead Socket Termination"
+    (port 5030): polaczenie z nim ubija zawieszona sesje bez restartu urzadzenia."""
 
-    TIMEOUT_MS = 5000
+    PORT = 5025
+    DEAD_SOCKET_PORT = 5030
+    TIMEOUT = 5.0
 
     def __init__(self):
-        self.rm = None
-        self.inst = None
+        self.sock = None
         self.connected = False
         self.ip = ""
         self.idn = ""
 
+    def _kill_dead_sessions(self):
+        """Ubij ewentualne zawieszone sesje przez Dead Socket Termination port.
+        Zgodnie z manualem 2600B - czysci nieczysto zamkniete polaczenia."""
+        try:
+            ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ds.settimeout(2.0)
+            ds.connect((self.ip, self.DEAD_SOCKET_PORT))
+            ds.close()
+            time.sleep(0.3)  # daj instrumentowi chwile na zwolnienie sesji
+        except Exception:
+            pass  # dead socket port niedostepny - kontynuuj normalnie
+
+    def _open_socket(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.TIMEOUT)
+        s.connect((self.ip, self.PORT))
+        return s
+
     def connect(self, ip):
-        import pyvisa
         self.ip = ip
-        if self.rm is None:
-            # PyVISA-py backend - czysty Python, nie wymaga instalacji NI-VISA
-            self.rm = pyvisa.ResourceManager('@py')
-        resource = f"TCPIP0::{ip}::INSTR"
-        self.inst = self.rm.open_resource(resource)
-        self.inst.timeout = self.TIMEOUT_MS
-        self.inst.write_termination = '\n'
-        self.inst.read_termination = '\n'
+        self._kill_dead_sessions()   # wyczysc zawieszone sesje PRZED polaczeniem
+        self.sock = self._open_socket()
         self.connected = True
         try:
-            self.idn = self.inst.query("*IDN?").strip()
+            self.idn = self._query_raw("*IDN?")
         except Exception:
             self.idn = f"Keithley @ {ip}"
         return self.idn
 
     def disconnect(self):
         self.connected = False
-        if self.inst:
-            try: self.inst.close()
+        if self.sock:
+            try: self.sock.close()
             except: pass
-            self.inst = None
+            self.sock = None
 
-    def _exec(self, cmd):
-        """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania)."""
-        if not self.inst:
-            raise ConnectionError("Keithley not connected")
-        self.inst.write(cmd)
+    def _send_raw(self, cmd):
+        self.sock.sendall((cmd + "\n").encode("ascii"))
+
+    def _recv_line_raw(self):
+        buf = b""
+        while True:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+        return buf.decode("ascii", errors="replace").strip()
+
+    def _query_raw(self, cmd):
+        self._send_raw(cmd)
+        return self._recv_line_raw()
 
     def _query(self, cmd):
-        if not self.inst:
+        """Wysyla zapytanie i czyta odpowiedz. Jesli polaczenie padlo (zawieszona
+        sesja po stronie instrumentu), czysci dead socket i probuje raz jeszcze."""
+        if not self.sock:
             raise ConnectionError("Keithley not connected")
-        return self.inst.query(cmd).strip()
+        try:
+            return self._query_raw(cmd)
+        except (OSError, ConnectionError):
+            self._kill_dead_sessions()
+            self.sock = self._open_socket()
+            return self._query_raw(cmd)
+
+    def _exec(self, cmd):
+        """Wykonaj komende TSP bez oczekiwania odpowiedzi (np. przypisania).
+        Auto-reconnect z czyszczeniem dead socket jak w _query."""
+        if not self.sock:
+            raise ConnectionError("Keithley not connected")
+        try:
+            self._send_raw(cmd)
+        except (OSError, ConnectionError):
+            self._kill_dead_sessions()
+            self.sock = self._open_socket()
+            self._send_raw(cmd)
 
     def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1):
         """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance)."""
