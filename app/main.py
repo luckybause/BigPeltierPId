@@ -378,6 +378,10 @@ class PeltierControl:
         self.sweep_queue = queue.Queue()
         self.sweep_points = []  # lista (v_set_lub_i_set, i_meas, v_meas)
         self.sweep_mode = "V"   # "V" = source V/measure I, "I" = source I/measure V
+        self.sweep_saved_settings = {
+            "V": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "0.0001"},
+            "I": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "1.0"},
+        }
         self.sweep_total = 0
         self.sweep_done = 0
         self.sweep_loop_count = 0
@@ -1134,8 +1138,8 @@ class PeltierControl:
         czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
-        kis = f"{k_i:.6e}" if k_i is not None else "—"
-        kvs = f"{k_v:.6e}" if k_v is not None else "—"
+        kis = f"{k_i:.9f}" if k_i is not None else "—"
+        kvs = f"{k_v:.9f}" if k_v is not None else "—"
         # W trybie MAN firmware wysyla T1 zamiast spA (brak aktywnej rampy) -
         # pokazujemy myslnik zeby nie mylic uzytkownika ze rampa dziala
         spas = "—" if state == "MAN" else f"{spa:.2f}"
@@ -1237,10 +1241,10 @@ class PeltierControl:
 
         tk.Label(linner, text="PARAMETRY", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(anchor='w', pady=(12, 2))
-        self.sweep_start_entry = _field("START", "0.0", "V")
-        self.sweep_stop_entry  = _field("STOP", "5.0", "V")
-        self.sweep_step_entry  = _field("KROK", "0.1", "V")
-        self.sweep_limit_entry = _field("LIMIT", "0.1", "A")
+        self.sweep_start_entry = _field("START", "0.000001", "V")
+        self.sweep_stop_entry  = _field("STOP", "0.00005", "V")
+        self.sweep_step_entry  = _field("KROKI", "50", "")
+        self.sweep_limit_entry = _field("LIMIT", "0.0001", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
 
 
@@ -1335,31 +1339,42 @@ class PeltierControl:
             self._loop_pause_row.pack_forget()
 
     def _set_sweep_mode(self, mode):
+        if mode == self.sweep_mode:
+            return
+        # Zapisz biezace wartosci pod STARY tryb, zanim przelaczymy
+        old = self.sweep_mode
+        self.sweep_saved_settings[old] = {
+            'start': self.sweep_start_entry.get(),
+            'stop': self.sweep_stop_entry.get(),
+            'steps': self.sweep_step_entry.get(),
+            'limit': self.sweep_limit_entry.get(),
+        }
         self.sweep_mode = mode
+        saved = self.sweep_saved_settings[mode]
+
         if mode == "V":
             self.btn_mode_v.config(bg=C['orange'], fg='#1a1c1f')
             self.btn_mode_i.config(bg=C['bg2'], fg=C['dim'])
             self.sweep_start_entry.unit_lbl.config(text="V")
             self.sweep_stop_entry.unit_lbl.config(text="V")
-            self.sweep_step_entry.unit_lbl.config(text="V")
             self.sweep_limit_entry.unit_lbl.config(text="A")
             self.sweep_ax.set_xlabel("Napiecie zadane [V]", color=C['dim'], fontsize=8)
             self.sweep_ax.set_ylabel("Prad zmierzony [A]", color=C['dim'], fontsize=8)
-            for entry, val in [(self.sweep_start_entry, "0.0"), (self.sweep_stop_entry, "5.0"),
-                               (self.sweep_step_entry, "0.1"), (self.sweep_limit_entry, "0.1")]:
-                entry.delete(0, 'end'); entry.insert(0, val)
         else:
             self.btn_mode_i.config(bg=C['orange'], fg='#1a1c1f')
             self.btn_mode_v.config(bg=C['bg2'], fg=C['dim'])
             self.sweep_start_entry.unit_lbl.config(text="A")
             self.sweep_stop_entry.unit_lbl.config(text="A")
-            self.sweep_step_entry.unit_lbl.config(text="A")
             self.sweep_limit_entry.unit_lbl.config(text="V")
             self.sweep_ax.set_xlabel("Prad zadany [A]", color=C['dim'], fontsize=8)
             self.sweep_ax.set_ylabel("Napiecie zmierzone [V]", color=C['dim'], fontsize=8)
-            for entry, val in [(self.sweep_start_entry, "0.0"), (self.sweep_stop_entry, "0.01"),
-                               (self.sweep_step_entry, "0.001"), (self.sweep_limit_entry, "5.0")]:
-                entry.delete(0, 'end'); entry.insert(0, val)
+
+        # Przywroc zapamietane wartosci dla tego trybu (kazdy tryb ma wlasne,
+        # niezalezne ustawienia - przelaczanie nie kasuje juz wpisanych danych)
+        for entry, key in [(self.sweep_start_entry, 'start'), (self.sweep_stop_entry, 'stop'),
+                           (self.sweep_step_entry, 'steps'), (self.sweep_limit_entry, 'limit')]:
+            entry.delete(0, 'end'); entry.insert(0, saved[key])
+
         self.sweep_cv.draw_idle()
 
     def clear_sweep(self):
@@ -1382,14 +1397,14 @@ class PeltierControl:
         try:
             v0 = float(self.sweep_start_entry.get().replace(',', '.'))
             v1 = float(self.sweep_stop_entry.get().replace(',', '.'))
-            step = abs(float(self.sweep_step_entry.get().replace(',', '.')))
+            n_steps = int(round(float(self.sweep_step_entry.get().replace(',', '.'))))
             limit = float(self.sweep_limit_entry.get().replace(',', '.'))
             settle_ms = float(self.sweep_settle_entry.get().replace(',', '.'))
         except ValueError:
             messagebox.showerror("Blad", "Sprawdz wartosci liczbowe pol sweep.")
             return
-        if step <= 0:
-            messagebox.showerror("Blad", "Krok musi byc > 0.")
+        if n_steps < 2:
+            messagebox.showerror("Blad", "Liczba krokow musi byc co najmniej 2.")
             return
 
         loop = self.sweep_loop_var.get()
@@ -1434,8 +1449,8 @@ class PeltierControl:
                     self.root.after(0, lambda: self.keithley_status_lbl.config(
                         text=f"● polaczono: {idn[:40]}", fg=C['green']))
 
-                # zbuduj liste punktow
-                n = int(round(abs(v1 - v0) / step)) + 1
+                # zbuduj liste punktow - n_steps to LICZBA punktow, nie wielkosc kroku
+                n = n_steps
                 fwd = [v0 + (v1 - v0) * i / (n - 1) for i in range(n)] if n > 1 else [v0]
                 points = fwd + list(reversed(fwd)) if bidir else fwd
                 unit = "V" if mode == "V" else "A"
@@ -1553,8 +1568,8 @@ class PeltierControl:
 
             if last_pt is not None:
                 _, i_meas, v_meas = last_pt
-                self.sweep_cards['v']['val'].config(text=f"{v_meas:.4f}")
-                self.sweep_cards['i']['val'].config(text=f"{i_meas*1000:.4f}m")
+                self.sweep_cards['v']['val'].config(text=f"{v_meas:.9f}")
+                self.sweep_cards['i']['val'].config(text=f"{i_meas:.9f}")
 
         looping = getattr(self, 'sweep_loop_var', None) is not None and self.sweep_loop_var.get()
         loop_prefix = f"P{self.sweep_loop_count} " if looping else ""
@@ -2155,7 +2170,7 @@ class PeltierControl:
                 self.cards['sp']['val'].config(text=f"{sp:.1f}")
                 self.cards['pwm']['val'].config(text=f"{pct:.0f}")
                 if k_i is not None:
-                    self.cards['kcur']['val'].config(text=f"{k_i*1000:.3f}m")
+                    self.cards['kcur']['val'].config(text=f"{k_i:.9f}")
                 elif self.keithley_running:
                     self.cards['kcur']['val'].config(text="...")
                 else:
