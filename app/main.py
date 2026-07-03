@@ -1061,16 +1061,16 @@ class PeltierControl:
         table_wrap.pack(fill='both', expand=True)
         tk.Frame(table_wrap, bg=C['blue'], height=3).pack(fill='x')
 
-        cols = ('idx', 'czas_fw', 'pc_time', 't1', 't2', 'sp', 'spa', 'pct', 'fan', 'k_i', 'k_v', 'state')
+        cols = ('idx', 'czas_fw', 'pc_time', 't1', 't2', 'sp', 'spa', 'pct', 'fan', 'dir', 'k_i', 'k_v', 'state')
         headers = {
             'idx': '#', 'czas_fw': 'czas FW [s]', 'pc_time': 'czas PC',
             't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP cel [C]',
-            'spa': 'SP akt [C]', 'pct': 'Peltier %', 'fan': 'Fan %',
+            'spa': 'SP akt [C]', 'pct': 'Peltier %', 'fan': 'Fan %', 'dir': 'Kierunek',
             'k_i': 'I Keithley [A]', 'k_v': 'V Keithley [V]', 'state': 'stan'
         }
         widths = {
             'idx': 50, 'czas_fw': 90, 'pc_time': 110, 't1': 80, 't2': 80,
-            'sp': 90, 'spa': 90, 'pct': 80, 'fan': 70,
+            'sp': 90, 'spa': 90, 'pct': 80, 'fan': 70, 'dir': 80,
             'k_i': 110, 'k_v': 100, 'state': 70
         }
 
@@ -1122,7 +1122,7 @@ class PeltierControl:
             self.raw_count_lbl.config(text="0 probek")
 
     def _raw_append(self, row):
-        # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v)
+        # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat)
         self.raw_rows.append(row)
         if len(self.raw_rows) > self.raw_maxrows:
             self.raw_rows = self.raw_rows[-self.raw_maxrows:]
@@ -1135,17 +1135,20 @@ class PeltierControl:
         if self.raw_paused or not hasattr(self, 'raw_tree'):
             return
         idx = len(self.raw_rows)
-        czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
+        czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
         kis = f"{k_i:.9f}" if k_i is not None else "—"
         kvs = f"{k_v:.9f}" if k_v is not None else "—"
+        dirs = "▲ HEAT" if heat else "▼ COOL"
+        if pct < 0.5:
+            dirs = "—"  # PWM prawie zero - kierunek bez znaczenia
         # W trybie MAN firmware wysyla T1 zamiast spA (brak aktywnej rampy) -
         # pokazujemy myslnik zeby nie mylic uzytkownika ze rampa dziala
         spas = "—" if state == "MAN" else f"{spa:.2f}"
         self.raw_tree.insert('', 'end', values=(
             idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
-            f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", kis, kvs, state
+            f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", dirs, kis, kvs, state
         ))
         if self.raw_autoscroll:
             children = self.raw_tree.get_children()
@@ -1169,16 +1172,17 @@ class PeltierControl:
                 w = csv.writer(f)
                 w.writerow(['czas_firmware_s', 'timestamp_pc', 'temperatura1_C',
                            'temperatura2_C', 'setpoint_cel_C', 'setpoint_aktywny_C',
-                           'peltier_pct', 'fan_pct', 'keithley_prad_A',
+                           'peltier_pct', 'fan_pct', 'kierunek', 'keithley_prad_A',
                            'keithley_napiecie_V', 'stan'])
                 for row in self.raw_rows:
-                    czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v = row
+                    czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
                     spas = "" if state == "MAN" else f"{spa:.3f}"
+                    dirs = "HEAT" if heat else "COOL"
                     w.writerow([
                         f"{czas_fw:.3f}", pc_time,
                         f"{t1:.3f}" if t1 is not None else "",
                         f"{t2:.3f}" if t2 is not None else "",
-                        f"{sp:.3f}", spas, f"{pct:.2f}", f"{fan:.2f}",
+                        f"{sp:.3f}", spas, f"{pct:.2f}", f"{fan:.2f}", dirs,
                         f"{k_i:.9e}" if k_i is not None else "",
                         f"{k_v:.6e}" if k_v is not None else "",
                         state
@@ -1241,6 +1245,18 @@ class PeltierControl:
 
         tk.Label(linner, text="PARAMETRY", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(anchor='w', pady=(12, 2))
+        tk.Label(linner,
+                 text="START/STOP - zakres wartosci zadanej (V lub A,\n"
+                      "zalezy od trybu powyzej). KROKI - ile punktow\n"
+                      "pomiarowych rozlozonych rownomiernie miedzy\n"
+                      "START a STOP. LIMIT - compliance (np. przy\n"
+                      "zrodle V to maks. dopuszczalny prad - chroni\n"
+                      "probke/kontakty). SETTLE TIME - ile ms czekac\n"
+                      "po kazdej zmianie wartosci zadanej, zanim\n"
+                      "instrument zmierzy wynik (czas na ustalenie\n"
+                      "sie sygnalu elektrycznego).",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 wraplength=250, justify='left').pack(anchor='w', pady=(0, 8))
         self.sweep_start_entry = _field("START", "0.000001", "V")
         self.sweep_stop_entry  = _field("STOP", "0.00005", "V")
         self.sweep_step_entry  = _field("KROKI", "50", "")
@@ -1485,6 +1501,14 @@ class PeltierControl:
                         self.sweep_done += 1
                         self.sweep_queue.put((p, i_meas, v_meas))
 
+                        # Nakarm te same "ostatnie znane" pola co stary tryb ciaglego
+                        # pomiaru - dzieki temu RAW DATA / ARCHIVE / karta na CONTROL
+                        # tez widza swieze dane Keithleya podczas sweepu, nie tylko
+                        # wykres w zakladce KEITHLEY.
+                        self.keithley_last_i = i_meas
+                        self.keithley_last_v = v_meas
+                        self.keithley_last_ts = time.time() * 1000.0
+
                         # Zapis pelnej precyzji na dysk NATYCHMIAST, z korelacja
                         # do aktualnej temperatury/czasu PID (odczyt atomowy, bezpieczny
                         # z tego watku - proste przypisania atrybutow sa thread-safe w CPythonie)
@@ -1669,33 +1693,15 @@ class PeltierControl:
                                             fg=C['dim2'], font=(FONT, fsz(9)))
         self.keithley_status_lbl.pack(side='right')
 
-        krow2 = tk.Frame(kinner, bg=C['panel'])
-        krow2.pack(fill='x', pady=4)
-        tk.Label(krow2, text="Napiecie [V]", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9)), width=14, anchor='w').pack(side='left')
-        self.keithley_v_entry = tk.Entry(krow2, bg=C['bg2'], fg=C['text'],
-                                         font=(FONT, fsz(10)), relief='flat', bd=0,
-                                         insertbackground=C['orange'], width=10,
-                                         highlightthickness=1, highlightbackground=C['border'])
-        self.keithley_v_entry.pack(side='left', ipady=4, padx=(0, 16))
-        self.keithley_v_entry.insert(0, "1.0")
-
-        tk.Label(krow2, text="Limit pradu [A]", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(side='left', padx=(0, 6))
-        self.keithley_i_entry = tk.Entry(krow2, bg=C['bg2'], fg=C['text'],
-                                         font=(FONT, fsz(10)), relief='flat', bd=0,
-                                         insertbackground=C['orange'], width=10,
-                                         highlightthickness=1, highlightbackground=C['border'])
-        self.keithley_i_entry.pack(side='left', ipady=4)
-        self.keithley_i_entry.insert(0, "0.1")
-
         kbr = tk.Frame(kinner, bg=C['panel'])
-        kbr.pack(fill='x', pady=(10, 0))
+        kbr.pack(fill='x', pady=(0, 0))
         mk_btn(kbr, "TEST CONNECTION", self.keithley_test_connect, C['orange']).pack(
             side='left', padx=(0, 8))
         mk_btn_outline(kbr, "DISCONNECT", self.keithley_disconnect, C['red']).pack(side='left')
 
-        tk.Label(kinner, text="Pomiar pradu startuje/zatrzymuje sie razem z PID (START/STOP w CONTROL).\n"
+        tk.Label(kinner, text="Ta zakladka sluzy TYLKO do sprawdzenia polaczenia USB z instrumentem.\n"
+                 "Napiecie/prad, zakres sweepu i limity ustawiasz w zakladce KEITHLEY.\n"
+                 "START na CONTROL uruchamia jednoczesnie PID i sweep skonfigurowany tam.\n"
                  "Polaczenie przez USB (protokol TMC488) - wymaga sterownika WinUSB (Zadig).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left').pack(anchor='w', pady=(10, 0))
@@ -1732,14 +1738,6 @@ class PeltierControl:
             self.connect(self._ports[s[0]].device)
 
     # ─── KEITHLEY 2611B ──────────────────────────────────
-    def _read_keithley_settings(self):
-        try:
-            v = float(self.keithley_v_entry.get().replace(',', '.'))
-            ilim = float(self.keithley_i_entry.get().replace(',', '.'))
-            return v, ilim
-        except ValueError:
-            return None, None
-
     def keithley_test_connect(self):
         self.keithley_status_lbl.config(text="● szukam urzadzenia USB...", fg=C['yellow'])
         self.root.update_idletasks()
@@ -1761,37 +1759,6 @@ class PeltierControl:
         self.keithley.disconnect()
         self.keithley_connected = False
         self.keithley_status_lbl.config(text="● not connected", fg=C['dim2'])
-
-    def keithley_start_measurement(self):
-        """Wywolywane razem z do_start() PID - konfiguruje SMU, wlacza output, startuje watek pomiarowy."""
-        v, ilim = self._read_keithley_settings()
-        if v is None:
-            self.keithley_status_lbl.config(
-                text="● zle ustawienia V/I - pomiar Keithleya wylaczony", fg=C['dim2'])
-            return  # brak poprawnej konfiguracji - kontynuuj bez Keithleya
-        self.keithley_voltage = v
-        self.keithley_ilimit = ilim if ilim is not None else 0.1
-
-        def worker():
-            try:
-                if not self.keithley_connected:
-                    idn = self.keithley.connect()
-                    self.keithley_connected = True
-                    self.root.after(0, lambda: self.keithley_status_lbl.config(
-                        text=f"● polaczono: {idn[:40]}", fg=C['green']))
-                self.keithley.setup_source_v_measure_i(
-                    "a", self.keithley_voltage, self.keithley_ilimit)
-                self.keithley.output_on("a")
-                self.keithley_running = True
-                self.root.after(0, lambda: self.keithley_status_lbl.config(
-                    text=f"● MIERZY  {self.keithley_voltage:.2f}V / lim {self.keithley_ilimit:.3f}A",
-                    fg=C['green']))
-                threading.Thread(target=self._keithley_poll_loop, daemon=True).start()
-            except Exception as e:
-                self.keithley_running = False
-                self.root.after(0, lambda: self.keithley_status_lbl.config(
-                    text=f"● blad startu: {e}", fg=C['red']))
-        threading.Thread(target=worker, daemon=True).start()
 
     def keithley_stop_measurement(self):
         """Wywolywane razem z do_stop() PID - wylacza output, zatrzymuje watek."""
@@ -2134,15 +2101,16 @@ class PeltierControl:
                 # (log cyklu, RAW DATA, karta na zywo), zeby wykluczyc jakakolwiek
                 # niespojnosc miedzy oddzielnymi odczytami w tej samej iteracji.
                 k_i, k_v = self._keithley_latest()
+                heat_dir = d.get('heat', True)
 
                 if self.cyc_on:
                     self.cyc_log(rel, t1, t2, sp, pct, fn,
                                  spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
                                  fw_ts=tsr, state=d.get('state'),
-                                 keithley_i=k_i, keithley_v=k_v)
+                                 keithley_i=k_i, keithley_v=k_v, heat=heat_dir)
 
                 pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v))
+                self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v, heat_dir))
 
                 if pid_on and self.last_setpoint_target is not None:
                     if abs(sp - self.last_setpoint_target) > 0.5:
@@ -2273,7 +2241,7 @@ class PeltierControl:
             'timestamp_pc', 'czas_firmware_s', 'czas_od_startu_s',
             'temperatura1_C', 'temperatura2_C',
             'setpoint_aktywny_C', 'setpoint_cel_C',
-            'peltier_pct', 'fan_pct',
+            'peltier_pct', 'fan_pct', 'kierunek',
             'Kp', 'Ki', 'Kd', 'stan',
             'keithley_prad_A', 'keithley_napiecie_V',
         ])
@@ -2281,7 +2249,7 @@ class PeltierControl:
         print(f"CYC START T={temp0}")
 
     def cyc_log(self, t, t1, t2, sp, pct, fn, spa=None, kp=None, ki=None, kd=None,
-                fw_ts=None, state=None, keithley_i=None, keithley_v=None):
+                fw_ts=None, state=None, keithley_i=None, keithley_v=None, heat=None):
         if self.cyc_wr:
             try:
                 t1s = f"{t1:.3f}" if t1 is not None else ""
@@ -2293,12 +2261,13 @@ class PeltierControl:
                 fwts = f"{fw_ts:.3f}" if fw_ts is not None else ""
                 kis_a = f"{keithley_i:.9e}" if keithley_i is not None else ""
                 kvs = f"{keithley_v:.9e}" if keithley_v is not None else ""
+                dirs = "" if heat is None else ("HEAT" if heat else "COOL")
                 pc_ts = datetime.now().isoformat(timespec="milliseconds")
                 self.cyc_wr.writerow([
                     pc_ts, fwts, f"{t:.3f}",
                     t1s, t2s,
                     spas, f"{sp:.3f}",
-                    f"{pct:.2f}", f"{fn:.2f}",
+                    f"{pct:.2f}", f"{fn:.2f}", dirs,
                     kps, kis, kds, state or "",
                     kis_a, kvs,
                 ])
