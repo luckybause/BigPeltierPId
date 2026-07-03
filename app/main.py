@@ -259,7 +259,8 @@ class KeithleyClient:
         self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
         self._exec(f"{ch}.source.levelv = {voltage:.6f}")
         self._exec(f"{ch}.source.limiti = {ilimit:.6f}")
-        self._exec(f"{ch}.measure.nplc = 0.1")
+        self._exec(f"{ch}.measure.nplc = 0.01")
+        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
         self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_ON")
 
     def setup_source_i_measure_v(self, channel="a", current=0.0, vlimit=1.0):
@@ -269,7 +270,8 @@ class KeithleyClient:
         self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCAMPS")
         self._exec(f"{ch}.source.leveli = {current:.6f}")
         self._exec(f"{ch}.source.limitv = {vlimit:.6f}")
-        self._exec(f"{ch}.measure.nplc = 0.1")
+        self._exec(f"{ch}.measure.nplc = 0.01")
+        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
         self._exec(f"{ch}.measure.autorangev = {ch}.AUTORANGE_ON")
 
     def output_on(self, channel="a"):
@@ -291,6 +293,35 @@ class KeithleyClient:
         i_val = float(parts[0])
         v_val = float(parts[1]) if len(parts) > 1 else float('nan')
         return i_val, v_val
+
+    def set_voltage_and_measure(self, channel="a", voltage=0.0, settle_s=0.0):
+        """Ustawia napiecie, czeka settle_s (delay() PO STRONIE INSTRUMENTU, wiec
+        czas ustalenia jest realny/niezmieniony), i mierzy I/V - wszystko w JEDNEJ
+        komendzie/jednym przejezdzie USB (zamiast osobnego write + sleep + query).
+        Polowa narzutu komunikacyjnego na kazdy punkt sweepu."""
+        ch = f"smu{channel}"
+        if settle_s > 0:
+            resp = self._query(
+                f"{ch}.source.levelv = {voltage:.6f}; delay({settle_s:.6f}); "
+                f"print({ch}.measure.i(), {ch}.measure.v())")
+        else:
+            resp = self._query(
+                f"{ch}.source.levelv = {voltage:.6f}; print({ch}.measure.i(), {ch}.measure.v())")
+        parts = resp.replace(",", " ").split()
+        return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
+
+    def set_current_and_measure(self, channel="a", current=0.0, settle_s=0.0):
+        """Jak set_voltage_and_measure, ale dla trybu zrodla pradu."""
+        ch = f"smu{channel}"
+        if settle_s > 0:
+            resp = self._query(
+                f"{ch}.source.leveli = {current:.6f}; delay({settle_s:.6f}); "
+                f"print({ch}.measure.i(), {ch}.measure.v())")
+        else:
+            resp = self._query(
+                f"{ch}.source.leveli = {current:.6f}; print({ch}.measure.i(), {ch}.measure.v())")
+        parts = resp.replace(",", " ").split()
+        return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
 
     def measure_i(self, channel="a"):
         resp = self._query(f"print(smu{channel}.measure.i())")
@@ -367,7 +398,7 @@ class PeltierControl:
         self.chart_paused = False
         self.chart_window = 0
 
-        self.log_dir = Path.home() / "PeltierLogi"
+        self.log_dir = Path.home() / "BigPeltierPidLogi"
         self.log_dir.mkdir(exist_ok=True)
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         self.cyc_t0 = None; self.cyc_fn = None; self.cyc_rows = 0
@@ -1169,7 +1200,7 @@ class PeltierControl:
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w', pady=(0, 4))
         tk.Label(linner, text="Krokowe przemiatanie napiecia lub pradu\nz pomiarem i wykresem I-V",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left').pack(anchor='w', pady=(0, 14))
+                 wraplength=250, justify='left').pack(anchor='w', pady=(0, 14))
 
         # Wybor trybu
         mode_row = tk.Frame(linner, bg=C['panel'])
@@ -1179,13 +1210,13 @@ class PeltierControl:
         self.sweep_mode_var = tk.StringVar(value="V")
         mrow = tk.Frame(mode_row, bg=C['panel'])
         mrow.pack(fill='x')
-        self.btn_mode_v = tk.Button(mrow, text="ZRODLO V → I", command=lambda: self._set_sweep_mode("V"),
+        self.btn_mode_v = tk.Button(mrow, text="ZRODLO V", command=lambda: self._set_sweep_mode("V"),
                                     bg=C['orange'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
-                                    relief='flat', cursor='hand2', bd=0, padx=8, pady=6)
+                                    relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_v.pack(side='left', fill='x', expand=True, padx=(0, 4))
-        self.btn_mode_i = tk.Button(mrow, text="ZRODLO I → V", command=lambda: self._set_sweep_mode("I"),
+        self.btn_mode_i = tk.Button(mrow, text="ZRODLO I", command=lambda: self._set_sweep_mode("I"),
                                     bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
-                                    relief='flat', cursor='hand2', bd=0, padx=8, pady=6)
+                                    relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_i.pack(side='left', fill='x', expand=True)
 
         def _field(label, default, unit=""):
@@ -1209,7 +1240,7 @@ class PeltierControl:
         self.sweep_start_entry = _field("START", "0.0", "V")
         self.sweep_stop_entry  = _field("STOP", "5.0", "V")
         self.sweep_step_entry  = _field("KROK", "0.1", "V")
-        self.sweep_limit_entry = _field("LIMIT (compl.)", "0.1", "A")
+        self.sweep_limit_entry = _field("LIMIT", "0.1", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
 
 
@@ -1220,7 +1251,8 @@ class PeltierControl:
         tk.Checkbutton(bidir_row, text="Sweep tam i z powrotem", variable=self.sweep_bidir_var,
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(anchor='w')
+                      activeforeground=C['text'], wraplength=240,
+                      justify='left').pack(anchor='w')
 
         # Petla - powtarzaj sweep w kolko, np. przez caly czas rampy PID
         self.sweep_loop_var = tk.BooleanVar(value=False)
@@ -1230,9 +1262,10 @@ class PeltierControl:
                       command=lambda: self._toggle_loop_pause_field(),
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(anchor='w')
+                      activeforeground=C['text'], wraplength=240,
+                      justify='left').pack(anchor='w')
 
-        self.sweep_loop_pause_entry = _field("Przerwa miedzy", "0", "ms")
+        self.sweep_loop_pause_entry = _field("PRZERWA", "0", "ms")
         self.sweep_loop_pause_entry.master.pack_forget()  # ukryte dopoki petla wylaczona
         self._loop_pause_row = self.sweep_loop_pause_entry.master
 
@@ -1429,12 +1462,11 @@ class PeltierControl:
                     for p in points:
                         if self.sweep_abort:
                             break
+                        settle_s = max(0.0, settle_ms / 1000.0)
                         if mode == "V":
-                            self.keithley.set_voltage("a", p)
+                            i_meas, v_meas = self.keithley.set_voltage_and_measure("a", p, settle_s)
                         else:
-                            self.keithley.set_current("a", p)
-                        time.sleep(max(0.0, settle_ms / 1000.0))
-                        i_meas, v_meas = self.keithley.measure_iv("a")
+                            i_meas, v_meas = self.keithley.set_current_and_measure("a", p, settle_s)
                         self.sweep_done += 1
                         self.sweep_queue.put((p, i_meas, v_meas))
 
@@ -1550,7 +1582,7 @@ class PeltierControl:
         if not self.sweep_points:
             messagebox.showinfo("Brak danych", "Brak punktow sweep do eksportu.\n\n"
                 "Uwaga: pelny, ciagly zapis WSZYSTKICH petli z korelacja czasowa/temperatura\n"
-                "jest juz automatycznie zapisywany w ~/PeltierLogi/ podczas kazdego sweepu.")
+                "jest juz automatycznie zapisywany w ~/BigPeltierPidLogi/ podczas kazdego sweepu.")
             return
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(
@@ -1570,7 +1602,7 @@ class PeltierControl:
                     w.writerow([f"{p:.9f}", f"{i_m:.12e}", f"{v_m:.9f}"])
             messagebox.showinfo("Zapisano",
                 f"Wyeksportowano {len(self.sweep_points)} punktow (biezaca petla) do:\n{dest}\n\n"
-                f"Pelny zapis wszystkich petli z korelacja czasowa jest w ~/PeltierLogi/")
+                f"Pelny zapis wszystkich petli z korelacja czasowa jest w ~/BigPeltierPidLogi/")
         except Exception as e:
             messagebox.showerror("Blad eksportu", str(e))
 
@@ -1665,7 +1697,7 @@ class PeltierControl:
             "2. Polacz przez USB, wybierz port COM, kliknij CONNECT",
             "3. Suwaki synchronizuja sie automatycznie po polaczeniu",
             "4. Ustaw TARGET i RATE, kliknij START",
-            "5. Wykres na zywo + zapis CSV w ~/PeltierLogi",
+            "5. Wykres na zywo + zapis CSV w ~/BigPeltierPidLogi",
         ]:
             tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
                      font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
