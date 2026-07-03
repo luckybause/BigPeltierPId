@@ -246,11 +246,11 @@ void wPwm(int o){
   analogWrite(PIN_PWM1, abs(o));
 }
 
-// Wentylator: jeden kierunek obrotow (DIR2 zawsze HIGH), PWM2 = predkosc
+// Wentylator: jeden kierunek obrotow (DIR2 zawsze LOW - napiecie na M2A, nie M2B), PWM2 = predkosc
 void fanApply(){
   int pwm = fanOn ? (int)(fanSpeed*2.55f) : 0;
   pwm = constrain(pwm,0,255);
-  digitalWrite(PIN_DIR2, HIGH);
+  digitalWrite(PIN_DIR2, LOW);
   analogWrite(PIN_PWM2, pwm);
 }
 void stpPel(){analogWrite(PIN_PWM1,0);digitalWrite(PIN_DIR1,LOW);lPwm=0;ssA=false;ssPwm=0;}
@@ -267,15 +267,11 @@ void updSS(){
   else{ssPwm=0;ssA=false;}wPwm(ssPwm);
 }
 
-#define TF 4
-float tfB[TF]={25,25,25,25};int tfI=0;
 float rdT(){
   uint8_t f=tc.readFault();if(f){tcE=true;return lT;}
   tcE=false;float raw=tc.readThermocoupleTemperature();
   if(isnan(raw)||raw<-50.0f||raw>200.0f){tcE=true;return lT;}
-  float prev=tfB[(tfI-1+TF)%TF];if(abs(raw-prev)>8) raw=prev;
-  tfB[tfI]=raw;tfI=(tfI+1)%TF;float s=0;for(int i=0;i<TF;i++) s+=tfB[i];
-  lT=s/TF+calOffset;return lT;
+  lT=raw+calOffset;return lT;
 }
 
 void updRamp(){
@@ -364,7 +360,15 @@ void runST(float temp){
 int compPID(float temp){
   float dt=PID_DT_MS/1000.0f,err=spA-temp;
 
-  bool rH=(spT>(spA-1.0f));
+  // Kierunek (grzanie/chlodzenie) na podstawie RZECZYWISTEGO bledu (spA-temp),
+  // nie porownania spT vs spA. STARY blad: spT>(spA-1.0) staje sie ZAWSZE
+  // prawdziwe gdy rampa dojdzie do celu (spA==spT), wiec system nagle "myslal"
+  // ze grzeje nawet gdy realna temp byla dziesiatki stopni ZA WYSOKO i trzeba
+  // bylo chlodzic - wyjscie bylo wtedy obcinane do 0 (tryb grzania = tylko
+  // PWM>=0) i caly PID zamrazal sie na PWM=0 na zawsze, mimo rosnacego bledu.
+  // Teraz kierunek zalezy od aktualnego bledu z histereza +-1C (unika czestego
+  // przelaczania dokladnie przy setpoincie).
+  bool rH = (err > 1.0f) ? true : (err < -1.0f ? false : htg);
   if(rH!=htg){
     ig=0;htg=rH;
     if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}
@@ -604,7 +608,7 @@ void setup(){
   for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};
 
   delay(200);float rt=tc.readThermocoupleTemperature();
-  if(!isnan(rt)&&rt>-50&&rt<150){lT=rt;for(int i=0;i<TF;i++) tfB[i]=rt;}
+  if(!isnan(rt)&&rt>-50&&rt<150){lT=rt;}
 
   ldF();  // wczytaj Flash (kalibracja + polaryzacja) jesli byla zapisana wczesniej
   if(!polSet){
