@@ -269,27 +269,48 @@ class KeithleyClient:
         self.inst = self.rm.open_resource(self.resource_str)
         self.inst.timeout = self.TIMEOUT_MS
 
-    def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1):
-        """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance)."""
+    def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1,
+                                  nplc=1.0, filter_count=1):
+        """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance).
+        nplc - czas integracji pomiaru w okresach sieci (wyzej = mniej szumu, wolniej).
+        filter_count - ile pomiarow usredniac sprzetowo w jeden odczyt (1 = wylaczone).
+        Dla malych sygnalow (pA-nA, np. prad piroelektryczny) NPLC=0.01 to za mala
+        integracja - odczyt to praktycznie sam szum ADC, ktory dodatkowo wywoluje
+        ciagle przelaczanie zakresu (autorange hunting) i daje pilokształtne skoki +/-."""
         ch = f"smu{channel}"
         self._exec(f"{ch}.reset()")
         self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
         self._exec(f"{ch}.source.levelv = {voltage:.6f}")
         self._exec(f"{ch}.source.limiti = {ilimit:.6f}")
-        self._exec(f"{ch}.measure.nplc = 0.01")
-        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
+        self._exec(f"{ch}.measure.nplc = {nplc:.4f}")
+        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_AUTO")
         self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_ON")
+        self._configure_filter(ch, filter_count)
 
-    def setup_source_i_measure_v(self, channel="a", current=0.0, vlimit=1.0):
-        """Konfiguruje SMU: zrodlo pradu, pomiar napiecia, dany limit napieciowy (compliance)."""
+    def setup_source_i_measure_v(self, channel="a", current=0.0, vlimit=1.0,
+                                  nplc=1.0, filter_count=1):
+        """Konfiguruje SMU: zrodlo pradu, pomiar napiecia, dany limit napieciowy (compliance).
+        nplc / filter_count - patrz setup_source_v_measure_i."""
         ch = f"smu{channel}"
         self._exec(f"{ch}.reset()")
         self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCAMPS")
         self._exec(f"{ch}.source.leveli = {current:.6f}")
         self._exec(f"{ch}.source.limitv = {vlimit:.6f}")
-        self._exec(f"{ch}.measure.nplc = 0.01")
-        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
+        self._exec(f"{ch}.measure.nplc = {nplc:.4f}")
+        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_AUTO")
         self._exec(f"{ch}.measure.autorangev = {ch}.AUTORANGE_ON")
+        self._configure_filter(ch, filter_count)
+
+    def _configure_filter(self, ch, filter_count):
+        """Wlacza sprzetowy filtr usredniajacy (repeating average) - kazdy odczyt
+        to srednia z filter_count pomiarow, zamiast pojedynczej zaszumionej probki.
+        filter_count<=1 wylacza filtr (najszybszy, ale najbardziej zaszumiony pomiar)."""
+        if filter_count and filter_count > 1:
+            self._exec(f"{ch}.measure.filter.type = {ch}.FILTER_REPEAT_AVG")
+            self._exec(f"{ch}.measure.filter.count = {int(filter_count)}")
+            self._exec(f"{ch}.measure.filter.enable = {ch}.FILTER_ON")
+        else:
+            self._exec(f"{ch}.measure.filter.enable = {ch}.FILTER_OFF")
 
     def output_on(self, channel="a"):
         self._exec(f"smu{channel}.source.output = smu{channel}.OUTPUT_ON")
@@ -1364,6 +1385,8 @@ class PeltierControl:
         linner = self.params_body
         self.sweep_limit_entry = _field("LIMIT", "0.0001", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
+        self.sweep_nplc_entry = _field("NPLC", "1.0", "")
+        self.sweep_avg_entry = _field("USREDNIANIE", "1", "x")
         linner = old_linner
 
         # Sweep dwukierunkowy (tam i z powrotem) - przydatne np. do histerezy
@@ -1572,7 +1595,7 @@ class PeltierControl:
                      "bo wartosc jest stala - mozna dac 0). INTERWAL -\n"
                      "odstep miedzy KOLEJNYMI probkami [ms] - TO steruje\n"
                      "czestotliwoscia zbierania danych (np. 100ms =\n"
-                     "10 probek/s).")
+                     "10 probek/s). NPLC/USREDNIANIE - patrz nizej.")
         else:
             self._single_value_frame.pack_forget()
             self._sweep_range_frame.pack(fill='x', before=self.sweep_limit_entry.master)
@@ -1590,7 +1613,8 @@ class PeltierControl:
                      "probke/kontakty). SETTLE TIME - ile ms czekac\n"
                      "po kazdej zmianie wartosci zadanej, zanim\n"
                      "instrument zmierzy wynik (czas na ustalenie\n"
-                     "sie sygnalu elektrycznego).")
+                     "sie sygnalu elektrycznego). NPLC/USREDNIANIE -\n"
+                     "patrz nizej: kontroluja szum pomiaru pradu/napiecia.")
 
     def _toggle_loop_pause_field(self):
         if self.sweep_loop_var.get():
@@ -1667,6 +1691,10 @@ class PeltierControl:
                 n_steps = int(round(float(self.sweep_step_entry.get().replace(',', '.'))))
             limit = float(self.sweep_limit_entry.get().replace(',', '.'))
             settle_ms = float(self.sweep_settle_entry.get().replace(',', '.'))
+            nplc = float(self.sweep_nplc_entry.get().replace(',', '.'))
+            avg_count = int(round(float(self.sweep_avg_entry.get().replace(',', '.'))))
+            if nplc <= 0: nplc = 1.0
+            if avg_count < 1: avg_count = 1
         except ValueError:
             messagebox.showerror("Blad", "Sprawdz wartosci liczbowe pol sweep.")
             return
@@ -1729,9 +1757,9 @@ class PeltierControl:
                 unit = "V" if mode == "V" else "A"
 
                 if mode == "V":
-                    self.keithley.setup_source_v_measure_i("a", points[0], limit)
+                    self.keithley.setup_source_v_measure_i("a", points[0], limit, nplc, avg_count)
                 else:
-                    self.keithley.setup_source_i_measure_v("a", points[0], limit)
+                    self.keithley.setup_source_i_measure_v("a", points[0], limit, nplc, avg_count)
                 self.keithley.output_on("a")
 
                 first_pass = True
