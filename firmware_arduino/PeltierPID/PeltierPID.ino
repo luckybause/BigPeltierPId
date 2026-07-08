@@ -360,15 +360,26 @@ void runST(float temp){
 int compPID(float temp){
   float dt=PID_DT_MS/1000.0f,err=spA-temp;
 
-  // Kierunek (grzanie/chlodzenie) na podstawie RZECZYWISTEGO bledu (spA-temp),
-  // nie porownania spT vs spA. STARY blad: spT>(spA-1.0) staje sie ZAWSZE
-  // prawdziwe gdy rampa dojdzie do celu (spA==spT), wiec system nagle "myslal"
-  // ze grzeje nawet gdy realna temp byla dziesiatki stopni ZA WYSOKO i trzeba
-  // bylo chlodzic - wyjscie bylo wtedy obcinane do 0 (tryb grzania = tylko
-  // PWM>=0) i caly PID zamrazal sie na PWM=0 na zawsze, mimo rosnacego bledu.
-  // Teraz kierunek zalezy od aktualnego bledu z histereza +-1C (unika czestego
-  // przelaczania dokladnie przy setpoincie).
-  bool rH = (err > 1.0f) ? true : (err < -1.0f ? false : htg);
+  // Kierunek (grzanie/chlodzenie): domyslnie stabilna logika oparta na rampie
+  // (spT vs spA) - to jest odporne na szum termopary, bo zalezy tylko od
+  // wewnetrznych zmiennych rampy, nie od zaszumionego pomiaru temp. Dziala
+  // dobrze W TRAKCIE aktywnej rampy.
+  // PROBLEM ktory to powodowalo: gdy rampa DOJDZIE do celu (spA==spT), ten
+  // warunek staje sie ZAWSZE prawdziwy (grzanie), nawet gdy realna temp jest
+  // dziesiatki stopni w zla strone (Peltier nie nadazyl za rampa) - wyjscie
+  // bylo wtedy obcinane do 0 i PID zamrazal sie na zawsze.
+  // POPRAWKA: gdy rzeczywisty blad jest DUZY (>3C) w kierunku PRZECIWNYM do
+  // tego co sugeruje rampa, ufamy realnemu bledowi zamiast rampy - to naprawia
+  // wlasnie ten patologiczny przypadek, ale NIE zmienia zachowania podczas
+  // normalnego sledzenia rampy (male/umiarkowane bledy, szum termopary) -
+  // dzieki temu brak czestych przelaczen trybu i resetow integratora, ktore
+  // dawaly efekt "schodkow" przy zbyt ciasnej histerezie opartej samym na bledzie.
+  bool rH_ramp = (spT>(spA-1.0f));
+  bool rH;
+  if(err > 3.0f) rH = true;        // duzy blad w strone grzania - ufaj realnej temp
+  else if(err < -3.0f) rH = false; // duzy blad w strone chlodzenia - ufaj realnej temp
+  else rH = rH_ramp;               // normalny zakres - stabilna logika rampy jak dawniej
+
   if(rH!=htg){
     ig=0;htg=rH;
     if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}
