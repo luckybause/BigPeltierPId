@@ -6,7 +6,7 @@ Panel sterowania PID Peltiera (Feed-Forward) z dwukierunkowa komunikacja JSON.
 Firmware: ItsyBitsy M0 + Cytron MDD10A + 2x MAX31856
 """
 
-import sys, os, time, csv, json, threading, queue, socket
+import sys, os, time, csv, json, threading, queue, socket, bisect
 from datetime import datetime
 from pathlib import Path
 
@@ -2144,6 +2144,20 @@ class PeltierControl:
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
         self.cv_a.draw()
 
+        # ─── HOVER: kursor pokazujacy czas/temperature/prad w punkcie ───
+        self._arch_hover_series = []
+        self._arch_hover_mode = 'time'
+        self._arch_annot = None
+        self._arch_vline_top = None
+        self._arch_vline_bottom = None
+        self._arch_marker_top = None
+        self._arch_marker_bottom = None
+        self._arch_marker_main = None
+        self._arch_hover_last_key = None
+        self.cv_a.mpl_connect('motion_notify_event', self._on_arch_hover)
+        self.cv_a.mpl_connect('figure_leave_event', lambda e: self._arch_hide_hover())
+        self.cv_a.mpl_connect('axes_leave_event', lambda e: self._arch_hide_hover())
+
         tbf = tk.Frame(cf, bg='#3a3f44')
         tbf.pack(fill='x', padx=8, pady=(4, 0))
         try:
@@ -2160,12 +2174,33 @@ class PeltierControl:
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
         mk_btn(atb, "⤓ POBIERZ CSV (zaznaczony cykl)", self.export_selected_cycle_csv, C['green']).pack(
             side='right', padx=(4, 0))
+        mk_btn_outline(atb, "❓ CSV w Excelu", self._show_excel_help, C['yellow']).pack(
+            side='right', padx=(4, 0))
+
+        atb2 = tk.Frame(cf, bg=C['panel'])
+        atb2.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Label(atb2, text="WYKRES:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        self.arch_chart_mode = tk.StringVar(value='time')
+        def _mode_btn(text, val):
+            b = tk.Radiobutton(atb2, text=text, variable=self.arch_chart_mode, value=val,
+                          command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
+                          selectcolor=C['bg2'], font=(FONT, fsz(9)),
+                          activebackground=C['panel'], activeforeground=C['text'],
+                          indicatoron=False, padx=10, pady=3, relief='flat',
+                          bd=1, highlightthickness=0)
+            b.pack(side='left', padx=(0, 4))
+            return b
+        _mode_btn("temperatura / czas", 'time')
+        _mode_btn("prad Keithley / temperatura", 'iT')
         self.arch_show_current_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(atb, text="Pokaz prad Keithley (wykres pod temperatura)", variable=self.arch_show_current_var,
-                      command=lambda: self._redraw_arch(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(side='left')
+        self.arch_show_current_chk = tk.Checkbutton(
+            atb2, text="Pokaz prad Keithley (wykres pod temperatura)",
+            variable=self.arch_show_current_var, command=lambda: self._redraw_arch(),
+            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+            font=(FONT, fsz(9)), activebackground=C['panel'],
+            activeforeground=C['text'])
+        self.arch_show_current_chk.pack(side='left', padx=(12, 0))
 
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
@@ -2202,6 +2237,11 @@ class PeltierControl:
                             relief='flat', cursor='hand2', bd=0, padx=8,
                             activebackground=C['red'], activeforeground='#fff')
             delb.pack(side='right', padx=(2, 4))
+            dlb = tk.Button(row, text="⤓", command=lambda p=f: self._export_single_cycle_csv(p),
+                            bg=C['bg2'], fg=C['green'], font=(FONT, fsz(10), 'bold'),
+                            relief='flat', cursor='hand2', bd=0, padx=8,
+                            activebackground=C['green'], activeforeground='#fff')
+            dlb.pack(side='right', padx=(2, 4))
             tk.Frame(row, bg=col, width=8).pack(side='left', fill='y')
             name = self._cycle_display_name(f)
             disp = name if len(name) <= 24 else name[:22]+"…"
@@ -2246,10 +2286,190 @@ class PeltierControl:
         ax.grid(True, alpha=0.3, color=C['grid'])
         for sp2 in ax.spines.values(): sp2.set_color(C['border'])
 
+    # ─── HOVER: kursor "co sie stalo w tym punkcie" ─────────
+    def _arch_reset_hover(self):
+        """Czysci stan hover przy pustym wykresie (brak zaznaczonych cykli) -
+        stare artysty (linie/adnotacja) zostaly juz usuniete przez fig.clear()."""
+        self._arch_hover_series = []
+        self._arch_annot = None
+        self._arch_vline_top = None
+        self._arch_vline_bottom = None
+        self._arch_marker_top = None
+        self._arch_marker_bottom = None
+        self._arch_marker_main = None
+        self._arch_hover_last_key = None
+
+    def _arch_setup_hover(self, mode, hover_series):
+        """Tworzy niewidoczne na starcie artysty (linia pionowa + kropka +
+        dymek z tekstem) uzywane przez _on_arch_hover. Wywolywane po kazdym
+        przebudowaniu wykresu (fig.clear() kasuje poprzednie artysty)."""
+        self._arch_hover_mode = mode
+        self._arch_hover_series = hover_series
+        self._arch_hover_last_key = None
+        if mode == 'time':
+            self._arch_vline_top = self.ax_a.axvline(
+                0, color=C['text'], lw=0.8, ls=':', alpha=0)
+            self._arch_marker_top, = self.ax_a.plot(
+                [], [], 'o', ms=5, alpha=0, zorder=9)
+            if self.ax_a_current is not None:
+                self._arch_vline_bottom = self.ax_a_current.axvline(
+                    0, color=C['text'], lw=0.8, ls=':', alpha=0)
+                self._arch_marker_bottom, = self.ax_a_current.plot(
+                    [], [], 'o', ms=5, alpha=0, zorder=9)
+            else:
+                self._arch_vline_bottom = None
+                self._arch_marker_bottom = None
+            self._arch_marker_main = None
+        else:  # iT
+            self._arch_marker_main, = self.ax_a.plot(
+                [], [], 'o', ms=7, alpha=0, zorder=9)
+            self._arch_vline_top = None
+            self._arch_vline_bottom = None
+            self._arch_marker_top = None
+            self._arch_marker_bottom = None
+        self._arch_annot = self.ax_a.annotate(
+            '', xy=(0, 0), xytext=(14, 14), textcoords='offset points',
+            bbox=dict(boxstyle='round,pad=0.4', fc=C['panel2'], ec=C['border'], alpha=0.95),
+            fontsize=fsz(8), color=C['text'], family=FONT, visible=False, zorder=10)
+
+    def _arch_hover_axes(self):
+        if getattr(self, '_arch_hover_mode', 'time') == 'time':
+            axes = [self.ax_a]
+            if self.ax_a_current is not None:
+                axes.append(self.ax_a_current)
+            return axes
+        return [self.ax_a]
+
+    def _arch_nearest_index(self, xs, target, sorted_asc):
+        """Zwraca indeks najblizszego punktu w xs do target. Dla danych
+        posortowanych (czas) uzywa bisekcji - szybkie nawet dla dlugich
+        cykli. Dla niesortowanych (temperatura w trybie I-T, gdzie moze
+        rosnac i malec w jednym cyklu) robi skan liniowy."""
+        n = len(xs)
+        if n == 0:
+            return None
+        if sorted_asc:
+            idx = bisect.bisect_left(xs, target)
+            cands = [i for i in (idx - 1, idx) if 0 <= i < n]
+            if not cands:
+                return 0
+            return min(cands, key=lambda i: abs(xs[i] - target))
+        return min(range(n), key=lambda i: abs(xs[i] - target))
+
+    def _on_arch_hover(self, event):
+        series = getattr(self, '_arch_hover_series', None)
+        if not series or getattr(self, '_arch_annot', None) is None:
+            return
+        if event.inaxes not in self._arch_hover_axes() or event.xdata is None:
+            self._arch_hide_hover()
+            return
+
+        mode = self._arch_hover_mode
+        # Dopasowanie do panelu pod kursorem: gorny = temperatura, dolny = prad
+        # (dla trybu iT jest tylko jeden panel = prad vs temperatura).
+        if mode == 'time' and event.inaxes is self.ax_a_current:
+            field = 'current'
+        elif mode == 'time':
+            field = 'temp'
+        else:
+            field = 'current'
+
+        xlo, xhi = event.inaxes.get_xlim()
+        ylo, yhi = event.inaxes.get_ylim()
+        xr = (xhi - xlo) or 1.0
+        yr = (yhi - ylo) or 1.0
+
+        best = None  # (score, series_dict, idx)
+        for s in series:
+            idx = self._arch_nearest_index(s['x'], event.xdata, s['sorted'])
+            if idx is None:
+                continue
+            yv = s.get(field, [None]*len(s['x']))[idx]
+            if yv is None:
+                # brak wartosci Keithleya w tym punkcie (np. sweep byl wylaczony) -
+                # ciagle liczy sie jako kandydat po samym X, tylko z gorszym scorem
+                dy = yr
+            else:
+                dy = abs(yv - (event.ydata if event.ydata is not None else yv))
+            dx = abs(s['x'][idx] - event.xdata)
+            score = (dx / xr) ** 2 + (dy / yr) ** 2
+            if best is None or score < best[0]:
+                best = (score, s, idx)
+
+        if best is None:
+            self._arch_hide_hover()
+            return
+        _, s, idx = best
+        key = (s['name'], idx)
+        if key == self._arch_hover_last_key:
+            return
+        self._arch_hover_last_key = key
+
+        t_val = s['t'][idx]
+        temp_val = s['temp'][idx] if idx < len(s['temp']) else None
+        cur_val = s['current'][idx] if idx < len(s['current']) else None
+
+        lines = [s['name']]
+        lines.append(f"czas: {t_val:.2f} s")
+        if temp_val is not None:
+            lines.append(f"T1: {temp_val:.3f} °C")
+        if cur_val is not None:
+            v, p = fmt_si(cur_val, 3)
+            lines.append(f"I: {v} {p}A")
+        else:
+            lines.append("I: --")
+        text = "\n".join(lines)
+
+        self._arch_annot.set_text(text)
+        self._arch_annot.set_visible(True)
+        self._arch_annot.get_bbox_patch().set_edgecolor(s['color'])
+
+        if mode == 'time':
+            xv = s['x'][idx]
+            self._arch_annot.xy = (xv, temp_val if event.inaxes is self.ax_a else (cur_val or 0))
+            self._arch_vline_top.set_xdata([xv, xv]); self._arch_vline_top.set_alpha(0.6)
+            if temp_val is not None:
+                self._arch_marker_top.set_data([xv], [temp_val])
+                self._arch_marker_top.set_color(s['color']); self._arch_marker_top.set_alpha(1)
+            if self._arch_vline_bottom is not None:
+                self._arch_vline_bottom.set_xdata([xv, xv]); self._arch_vline_bottom.set_alpha(0.6)
+                if cur_val is not None:
+                    self._arch_marker_bottom.set_data([xv], [cur_val])
+                    self._arch_marker_bottom.set_color(s['color']); self._arch_marker_bottom.set_alpha(1)
+                else:
+                    self._arch_marker_bottom.set_alpha(0)
+        else:
+            xv = s['x'][idx]
+            self._arch_annot.xy = (xv, cur_val if cur_val is not None else 0)
+            if cur_val is not None:
+                self._arch_marker_main.set_data([xv], [cur_val])
+                self._arch_marker_main.set_color(s['color']); self._arch_marker_main.set_alpha(1)
+
+        self.cv_a.draw_idle()
+
+    def _arch_hide_hover(self):
+        if getattr(self, '_arch_annot', None) is None:
+            return
+        if self._arch_hover_last_key is None:
+            return
+        self._arch_hover_last_key = None
+        self._arch_annot.set_visible(False)
+        if self._arch_hover_mode == 'time':
+            self._arch_vline_top.set_alpha(0)
+            self._arch_marker_top.set_alpha(0)
+            if self._arch_vline_bottom is not None:
+                self._arch_vline_bottom.set_alpha(0)
+                self._arch_marker_bottom.set_alpha(0)
+        elif self._arch_marker_main is not None:
+            self._arch_marker_main.set_alpha(0)
+        self.cv_a.draw_idle()
+
     def _redraw_arch(self):
         sel = [(p,v) for p,v in self.arch_vars.items() if v.get()]
         show_current = getattr(self, 'arch_show_current_var', None) is not None \
                        and self.arch_show_current_var.get()
+        mode = getattr(self, 'arch_chart_mode', None)
+        mode = mode.get() if mode is not None else 'time'
 
         # Najpierw wczytaj dane - dopiero potem decyduj o ukladzie osi
         files = sorted([f for f in self.log_dir.glob("*.csv")
@@ -2265,6 +2485,14 @@ class PeltierControl:
             has_i = any(v is not None for v in ki)
             any_current_data = any_current_data or has_i
             loaded.append((path, t, t1, sp, ki, has_i))
+
+        # checkbox "pokaz prad pod spodem" ma sens tylko w widoku czasowym
+        if hasattr(self, 'arch_show_current_chk'):
+            self.arch_show_current_chk.config(state='normal' if mode == 'time' else 'disabled')
+
+        if mode == 'iT':
+            self._redraw_arch_iT(sel, loaded, forder)
+            return
 
         # Przebuduj uklad figury od zera (jedna os lub dwie jedna pod druga)
         self.fig_a.clear()
@@ -2286,8 +2514,10 @@ class PeltierControl:
             self.ax_a.text(0.5,0.5,"Tick a cycle to display",
                            ha='center',va='center',color=C['dim2'],
                            fontsize=11,transform=self.ax_a.transAxes)
+            self._arch_reset_hover()
             self.cv_a.draw(); return
 
+        hover_series = []
         for path, t, t1, sp, ki, has_i in loaded:
             ci = forder.get(path,0)%len(self._arch_colors)
             col = self._arch_colors[ci]
@@ -2298,6 +2528,9 @@ class PeltierControl:
             if ax_i is not None and has_i:
                 # ten sam kolor co T1 danego cyklu - latwo skojarzyc pary krzywych
                 ax_i.plot(tx, ki, color=col, lw=1.4)
+            # dane do hover-kursora: tx jest chronologicznie rosnace (bisect OK)
+            hover_series.append({'name': nm, 'color': col, 'x': tx, 't': tx,
+                                  'temp': t1, 'current': ki, 'sorted': True})
 
         if ax_i is not None:
             try:
@@ -2322,6 +2555,70 @@ class PeltierControl:
         if hasattr(self, 'mpl_toolbar_a'):
             try: self.mpl_toolbar_a.update()
             except Exception: pass
+        self._arch_setup_hover('time', hover_series)
+        self.cv_a.draw()
+
+    def _redraw_arch_iT(self, sel, loaded, forder):
+        """Wykres prad Keithleya (Y) w funkcji temperatury T1 (X), oddzielnie dla
+        kazdego zaznaczonego cyklu. Punkty polaczone linia w kolejnosci czasowej,
+        wiec widac petle grzanie/chlodzenie (histereza) jesli wystepuje - typowe
+        dla sygnalu piroelektrycznego, ktory zalezy od dT/dt, a nie tylko od T."""
+        self.fig_a.clear()
+        self.ax_a = self.fig_a.add_subplot(111)
+        self.fig_a.subplots_adjust(left=0.12, right=0.97, top=0.96, bottom=0.11)
+        self.ax_a_current = None
+        self._style_arch_ax(self.ax_a)
+
+        if not sel:
+            self.ax_a.text(0.5, 0.5, "Tick a cycle to display",
+                           ha='center', va='center', color=C['dim2'],
+                           fontsize=11, transform=self.ax_a.transAxes)
+            self._arch_reset_hover()
+            self.cv_a.draw(); return
+
+        any_i = False
+        hover_series = []
+        for path, t, t1, sp, ki, has_i in loaded:
+            if not has_i:
+                continue
+            any_i = True
+            ci = forder.get(path, 0) % len(self._arch_colors)
+            col = self._arch_colors[ci]
+            nm = self._cycle_display_name(path)
+            t0 = t[0]
+            xs, ys, ts = [], [], []
+            for tt, ii, ttime in zip(t1, ki, t):
+                if ii is not None and tt is not None:
+                    xs.append(tt); ys.append(ii); ts.append(ttime - t0)
+            if not xs:
+                continue
+            self.ax_a.plot(xs, ys, color=col, lw=1.1, alpha=0.85,
+                           marker='.', markersize=2, label=nm[:20])
+            # temperatura nie zawsze rosnie monotonicznie (grzanie+chlodzenie
+            # w jednym cyklu, szum) - wyszukiwanie najblizszego punktu liniowe
+            hover_series.append({'name': nm, 'color': col, 'x': xs, 't': ts,
+                                  'temp': xs, 'current': ys, 'sorted': False})
+
+        if not any_i:
+            self.ax_a.text(0.5, 0.5, "brak danych Keithleya w zaznaczonych cyklach",
+                           ha='center', va='center', color=C['dim2'],
+                           fontsize=10, transform=self.ax_a.transAxes)
+            self._arch_reset_hover()
+            self.cv_a.draw(); return
+
+        try:
+            from matplotlib.ticker import EngFormatter
+            self.ax_a.yaxis.set_major_formatter(EngFormatter(unit='A'))
+        except Exception:
+            pass
+        self.ax_a.set_xlabel('temperatura T1 [°C]', color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel('prad Keithley', color=C['dim'], fontsize=9)
+        self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
+                         labelcolor=C['dim'], fontsize=8)
+        if hasattr(self, 'mpl_toolbar_a'):
+            try: self.mpl_toolbar_a.update()
+            except Exception: pass
+        self._arch_setup_hover('iT', hover_series)
         self.cv_a.draw()
 
     def save_arch_chart(self):
@@ -2336,41 +2633,141 @@ class PeltierControl:
             messagebox.showinfo("Saved", f"{dest}")
 
     def export_selected_cycle_csv(self):
-        """Kopiuje surowy plik CSV zaznaczonego cyklu (lub cykli) do wskazanej
-        lokalizacji. Plik juz zawiera komplet danych raw: T1, T2, setpointy,
-        PID, Keithley - dokladnie to co zostalo zapisane od START do STOP."""
+        """Kopiuje surowy plik CSV zaznaczonego cyklu (lub cykli - checkboxy na
+        liscie po lewej) do wskazanej lokalizacji. Plik juz zawiera komplet
+        danych raw: T1, T2, setpointy, PID, Keithley - dokladnie to co zostalo
+        zapisane od START do STOP. Dla pojedynczego pliku mozna tez uzyc
+        przycisku ⤓ bezposrednio przy pozycji na liscie (bez zaznaczania)."""
         import shutil
         from pathlib import Path as _P
         selected = [_P(p) for p, v in self.arch_vars.items() if v.get()]
         if not selected:
-            messagebox.showinfo("Brak zaznaczenia", "Zaznacz cykl (checkbox) na liscie po lewej.")
+            messagebox.showinfo("Brak zaznaczenia", "Zaznacz cykl (checkbox) na liscie po lewej, "
+                                "albo uzyj przycisku ⤓ bezposrednio przy wybranej pozycji.")
+            return
+        if len(selected) == 1:
+            self._export_single_cycle_csv(selected[0])
             return
         from tkinter import filedialog
-        if len(selected) == 1:
-            src = selected[0]
-            dest = filedialog.asksaveasfilename(
-                title="Zapisz raw dane cyklu", defaultextension=".csv",
-                initialfile=src.name,
-                filetypes=[("CSV", "*.csv")])
-            if not dest:
-                return
+        dest_dir = filedialog.askdirectory(title="Wybierz folder docelowy dla CSV")
+        if not dest_dir:
+            return
+        ok = 0
+        for src in selected:
             try:
-                shutil.copy(src, dest)
-                messagebox.showinfo("Zapisano", f"Raw dane cyklu zapisane do:\n{dest}")
-            except Exception as e:
-                messagebox.showerror("Blad", str(e))
-        else:
-            dest_dir = filedialog.askdirectory(title="Wybierz folder docelowy dla CSV")
-            if not dest_dir:
-                return
-            ok = 0
-            for src in selected:
-                try:
-                    shutil.copy(src, _P(dest_dir) / src.name)
-                    ok += 1
-                except Exception:
-                    pass
-            messagebox.showinfo("Zapisano", f"Skopiowano {ok}/{len(selected)} plikow do:\n{dest_dir}")
+                shutil.copy(src, _P(dest_dir) / src.name)
+                ok += 1
+            except Exception:
+                pass
+        messagebox.showinfo("Zapisano", f"Skopiowano {ok}/{len(selected)} plikow do:\n{dest_dir}")
+
+    def _export_single_cycle_csv(self, src):
+        """Zapisuje jeden konkretny plik cyklu (przycisk ⤓ przy pozycji na liscie -
+        dziala od razu, bez zaznaczania checkboxa)."""
+        from pathlib import Path as _P
+        import shutil
+        src = _P(src)
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(
+            title="Zapisz raw dane cyklu", defaultextension=".csv",
+            initialfile=src.name, filetypes=[("CSV", "*.csv")])
+        if not dest:
+            return
+        try:
+            shutil.copy(src, dest)
+            messagebox.showinfo("Zapisano", f"Raw dane cyklu zapisane do:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Blad", str(e))
+
+    def _show_excel_help(self):
+        """Instrukcja: dlaczego Excel czesto psuje ten CSV przy zwyklym
+        dwuklikni?ciu, i jak poprawnie zaimportowac dane (osobne kolumny,
+        poprawny separator dziesietny), zeby dalsza obrobka byla latwa."""
+        win = tk.Toplevel(self.root)
+        win.title("Jak otworzyc CSV w Excelu")
+        win.configure(bg=C['bg'])
+        w, h = px(620), px(560)
+        try:
+            self.root.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - w)//2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - h)//2
+            win.geometry(f"{w}x{h}+{max(0,x)}+{max(0,y)}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
+        win.minsize(w, h)
+        win.transient(self.root)
+
+        tk.Label(win, text="Import CSV do Excela", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(13), 'bold')).pack(anchor='w', padx=16, pady=(14, 4))
+
+        body = tk.Frame(win, bg=C['bg'])
+        body.pack(fill='both', expand=True, padx=16, pady=(0, 12))
+        txt = tk.Text(body, bg=C['panel2'], fg=C['text'], font=(FONT, fsz(9)),
+                       wrap='word', relief='flat', padx=12, pady=12,
+                       highlightthickness=1, highlightbackground=C['border'])
+        sb = tk.Scrollbar(body, command=txt.yview)
+        txt.config(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        txt.pack(side='left', fill='both', expand=True)
+
+        content = (
+            "PROBLEM: nasz plik CSV rozdziela kolumny PRZECINKIEM, a liczby "
+            "dziesietne maja KROPKE (np. 48.30, nie 48,30). Polski Excel domyslnie "
+            "oczekuje odwrotnie: srednika jako separatora kolumn i przecinka jako "
+            "separatora dziesietnego. Dlatego zwykle dwuklikniecie na plik CSV czesto "
+            "wrzuca WSZYSTKO do jednej kolumny albo zamienia liczby na tekst.\n\n"
+            "NAJLEPSZY SPOSOB (Excel 2016+, zawsze dziala poprawnie):\n"
+            "1. Otworz PUSTY skoroszyt Excela (nie klikaj CSV dwa razy).\n"
+            "2. Zakladka DANE -> \"Z tekstu/CSV\" (Get Data From Text/CSV).\n"
+            "3. Wskaz nasz plik cykl_....csv.\n"
+            "4. W oknie podgladu ustaw:\n"
+            "     Ogranicznik (Delimiter): Przecinek\n"
+            "     Pochodzenie pliku: UTF-8\n"
+            "5. Kliknij \"Przeksztalc dane\" (Transform Data) albo od razu \"Zaladuj\".\n"
+            "6. Jesli liczby wyjda jako tekst (wyrownane do lewej), zaznacz kolumny "
+            "z liczbami -> DANE -> Tekst jako kolumny -> Dalej -> Dalej -> w kroku 3 "
+            "wybierz \"Kropka\" jako separator dziesietny (przycisk Zaawansowane) "
+            "-> Zakoncz.\n\n"
+            "SZYBSZY SPOSOB (dwuklik na plik, gdy nie chce sie robic importu):\n"
+            "1. Otworz plik zwyklym dwuklikiem - dane wpadna w jedna kolumne.\n"
+            "2. Zaznacz cala kolumne A.\n"
+            "3. DANE -> Tekst jako kolumny.\n"
+            "4. Wybierz \"Rozdzielany\" -> Dalej.\n"
+            "5. Zaznacz ogranicznik \"Przecinek\" (odznacz inne) -> Dalej.\n"
+            "6. Kliknij \"Zaawansowane\" (Advanced) w prawym dolnym rogu -> ustaw "
+            "\"Separator dziesietny: kropka\", \"Separator tysiecy: (puste)\" -> OK.\n"
+            "7. Zakoncz.\n\n"
+            "KOLUMNY W PLIKU CYKLU (cykl_*.csv / c_*.csv):\n"
+            "  timestamp_pc          - znacznik czasu komputera (ISO 8601)\n"
+            "  czas_firmware_s       - czas wg zegara mikrokontrolera [s]\n"
+            "  czas_od_startu_s      - czas od poczatku cyklu [s] (najwygodniejszy do wykresow)\n"
+            "  temperatura1_C        - temperatura z czujnika 1 [°C]\n"
+            "  temperatura2_C        - temperatura z czujnika 2 [°C]\n"
+            "  setpoint_aktywny_C    - biezacy punkt zadany (w trakcie rampy) [°C]\n"
+            "  setpoint_cel_C        - docelowy punkt zadany [°C]\n"
+            "  peltier_pct           - moc Peltiera [%]\n"
+            "  fan_pct               - moc wentylatora [%]\n"
+            "  kierunek              - HEAT / COOL\n"
+            "  Kp, Ki, Kd            - nastawy regulatora PID\n"
+            "  stan                  - stan automatu (RUN / IDLE / itp.)\n"
+            "  keithley_prad_A       - prad zmierzony przez SMU [A], notacja naukowa np. 4.83e-08\n"
+            "  keithley_napiecie_V   - napiecie zmierzone przez SMU [V]\n\n"
+            "UWAGA na notacje naukowa (np. 4.83e-08): Excel poprawnie ja rozumie jako "
+            "liczbe, o ile format kolumny to \"Ogolny\" lub \"Naukowy\" - NIE formatuj "
+            "tych kolumn jako \"Tekst\" przed importem, bo zostana zamienione na string "
+            "i nie da sie ich uzyc w wykresach/formulach.\n\n"
+            "SZYBKI WYKRES W EXCELU (I vs T albo I vs czas):\n"
+            "1. Po poprawnym imporcie zaznacz dwie kolumny, np. temperatura1_C i "
+            "keithley_prad_A (przytrzymaj Ctrl, zeby zaznaczyc niesasiadujace kolumny).\n"
+            "2. WSTAWIANIE -> Wykres punktowy (XY Scatter) -> \"Punktowy z liniami "
+            "prostymi\" jesli chcesz zachowac kolejnosc czasowa (widac wtedy petle "
+            "histerezy grzanie/chlodzenie), albo zwykly \"Punktowy\" dla samej chmury "
+            "punktow."
+        )
+        txt.insert('1.0', content)
+        txt.config(state='disabled')
+
+        mk_btn(win, "ZAMKNIJ", win.destroy, C['cyan']).pack(pady=(0, 14))
 
     def open_log_folder(self):
         import subprocess
