@@ -43,6 +43,23 @@ C = {
 FONT = 'Consolas'
 FS = 1.0
 def fsz(n): return max(6, int(round(n * FS)))
+def px(n): return max(1, int(round(n * FS)))  # skalowanie wymiarow (szerokosci/wysokosci) wg DPI
+
+_SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
+def fmt_si(value, digits=3):
+    """Formatuje mala wartosc z prefiksem SI, np. 4.83e-8 -> ('48.30', 'n').
+    Zwraca (tekst_wartosci, prefiks). Dla None zwraca ('--', '')."""
+    if value is None:
+        return "--", ""
+    av = abs(value)
+    if av == 0:
+        return f"{0:.{digits}f}", ""
+    if av >= 1.0:
+        return f"{value:.{digits}f}", ""
+    for scale, pref in _SI_PREFIXES:
+        if av >= scale:
+            return f"{value/scale:.{digits}f}", pref
+    return f"{value/1e-12:.{digits}f}", "p"
 
 def _lighten(hex_color, amount=0.15):
     h = hex_color.lstrip('#')
@@ -336,8 +353,8 @@ class PeltierControl:
         self.root = root
         self.root.title("PeltierControl - BRUTALIST")
         self.root.configure(bg=C['bg'])
-        self.root.geometry("1280x800")
-        self.root.minsize(1100, 720)
+        self.root.geometry(f"{px(1280)}x{px(800)}")
+        self.root.minsize(px(1100), px(720))
 
         self.ser = None
         self.port_name = None
@@ -379,12 +396,13 @@ class PeltierControl:
         self.sweep_points = []  # lista (v_set_lub_i_set, i_meas, v_meas)
         self.sweep_mode = "V"   # "V" = source V/measure I, "I" = source I/measure V
         self.sweep_saved_settings = {
-            "V": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "0.0001"},
-            "I": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "1.0"},
+            "V": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "0.0001", "value": "0.000001"},
+            "I": {"start": "0.000001", "stop": "0.00005", "steps": "50", "limit": "1.0", "value": "0.000001"},
         }
         self.sweep_total = 0
         self.sweep_done = 0
         self.sweep_loop_count = 0
+        self.sweep_t0 = None
         self.last_known_rel = 0.0
         self.last_known_t1 = None
         self.last_known_t2 = None
@@ -406,6 +424,8 @@ class PeltierControl:
         self.log_dir.mkdir(exist_ok=True)
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         self.cyc_t0 = None; self.cyc_fn = None; self.cyc_rows = 0
+        self.cyc_write_errors = 0
+        self._recover_tmp_cycles()
 
         self._cfg_synced = False
         self.is_running = False
@@ -585,7 +605,7 @@ class PeltierControl:
 
     # ─── UI ──────────────────────────────────────────────
     def _build_ui(self):
-        top = tk.Frame(self.root, bg=C['bg2'], height=44)
+        top = tk.Frame(self.root, bg=C['bg2'], height=px(44))
         top.pack(fill='x'); top.pack_propagate(False)
         tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
         tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
@@ -768,14 +788,14 @@ class PeltierControl:
     def _build_sweep_mini_chart(self, parent):
         """Kompaktowy wykres I-V na ekranie CONTROL, obok wykresu temperatury -
         pokazuje ten sam sweep co zakladka KEITHLEY, zeby widziec oba na raz."""
-        wrap = tk.Frame(parent, bg=C['panel'], height=220)
+        wrap = tk.Frame(parent, bg=C['panel'], height=px(220))
         wrap.pack(side='top', fill='x')
         wrap.pack_propagate(False)
         tk.Frame(wrap, bg=C['orange'], height=3).pack(fill='x')
 
         hd = tk.Frame(wrap, bg=C['panel'])
         hd.pack(fill='x', padx=14, pady=(8, 2))
-        tk.Label(hd, text="SWEEP I-V (KEITHLEY)", bg=C['panel'], fg=C['dim'],
+        tk.Label(hd, text="WYKRES KEITHLEY", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(side='left')
         self.sweep_mini_status_lbl = tk.Label(hd, text="--", bg=C['panel'], fg=C['dim2'],
                                               font=(FONT, fsz(8)))
@@ -795,6 +815,25 @@ class PeltierControl:
         self.sweep_cv_mini = FigureCanvasTkAgg(self.sweep_fig_mini, master=wrap)
         self.sweep_cv_mini.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 8))
 
+    def _live_toolbar_busy(self):
+        """True gdy w toolbarze matplotliba aktywny jest tryb ZOOM lub PAN -
+        wtedy wstrzymujemy auto-odswiezanie, zeby przyblizenie nie znikalo.
+        Wylaczenie narzedzia (ponowne klikniecie lupy) wznawia live."""
+        tb = getattr(self, 'mpl_toolbar', None)
+        if tb is None:
+            return False
+        mode = getattr(tb, 'mode', '')
+        busy = bool(mode) and str(mode) != ''
+        # wizualna informacja na przycisku pauzy
+        if hasattr(self, 'btn_pause') and not self.chart_paused:
+            if busy and self.btn_pause['text'] != "🔍 ZOOM (live wstrzymane)":
+                self.btn_pause.config(text="🔍 ZOOM (live wstrzymane)", fg=C['cyan'],
+                                      highlightbackground=C['cyan'])
+            elif not busy and self.btn_pause['text'] != "⏸ PAUSE":
+                self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'],
+                                      highlightbackground=C['yellow'])
+        return busy
+
     def toggle_pause(self):
         self.chart_paused = not self.chart_paused
         if self.chart_paused:
@@ -806,14 +845,14 @@ class PeltierControl:
         self.chart_window = secs
 
     def _build_panel(self, parent):
-        panel = tk.Frame(parent, bg=C['bg2'], width=312)
+        panel = tk.Frame(parent, bg=C['bg2'], width=px(312))
         panel.pack(side='right', fill='y')
         panel.pack_propagate(False)
-        tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
+        tk.Frame(panel, bg=C['red'], width=px(6)).pack(side='left', fill='y')
 
         scroll_wrap = tk.Frame(panel, bg=C['bg2'])
         scroll_wrap.pack(side='left', fill='both', expand=True)
-        pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0, width=290)
+        pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0, width=px(290))
         psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
         pcanvas.configure(yscrollcommand=psb.set)
         psb.pack(side='right', fill='y')
@@ -1066,7 +1105,7 @@ class PeltierControl:
             'idx': '#', 'czas_fw': 'czas FW [s]', 'pc_time': 'czas PC',
             't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP cel [C]',
             'spa': 'SP akt [C]', 'pct': 'Peltier %', 'fan': 'Fan %', 'dir': 'Kierunek',
-            'k_i': 'I Keithley [A]', 'k_v': 'V Keithley [V]', 'state': 'stan'
+            'k_i': 'I Keithley', 'k_v': 'V Keithley', 'state': 'stan'
         }
         widths = {
             'idx': 50, 'czas_fw': 90, 'pc_time': 110, 't1': 80, 't2': 80,
@@ -1138,8 +1177,12 @@ class PeltierControl:
         czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
-        kis = f"{k_i:.9f}" if k_i is not None else "—"
-        kvs = f"{k_v:.9f}" if k_v is not None else "—"
+        if k_i is not None:
+            _v, _p = fmt_si(k_i, 4); kis = f"{_v} {_p}A"
+        else: kis = "—"
+        if k_v is not None:
+            _v, _p = fmt_si(k_v, 4); kvs = f"{_v} {_p}V"
+        else: kvs = "—"
         dirs = "▲ HEAT" if heat else "▼ COOL"
         if pct < 0.5:
             dirs = "—"  # PWM prawie zero - kierunek bez znaczenia
@@ -1184,7 +1227,7 @@ class PeltierControl:
                         f"{t2:.3f}" if t2 is not None else "",
                         f"{sp:.3f}", spas, f"{pct:.2f}", f"{fan:.2f}", dirs,
                         f"{k_i:.9e}" if k_i is not None else "",
-                        f"{k_v:.6e}" if k_v is not None else "",
+                        f"{k_v:.9e}" if k_v is not None else "",
                         state
                     ])
             messagebox.showinfo("Zapisano", f"Wyeksportowano {len(self.raw_rows)} probek do:\n{dest}")
@@ -1196,13 +1239,31 @@ class PeltierControl:
         wrap = tk.Frame(parent, bg=C['bg'])
         wrap.pack(fill='both', expand=True, padx=16, pady=12)
 
-        # ── PANEL LEWY: konfiguracja sweep ──
-        left = tk.Frame(wrap, bg=C['panel'], width=300)
+        # ── PANEL LEWY: konfiguracja sweep (SCROLLOWALNY - zeby przyciski
+        # START/STOP nigdy nie znikaly niezaleznie od wysokosci okna) ──
+        left = tk.Frame(wrap, bg=C['panel'], width=px(300))
         left.pack(side='left', fill='y', padx=(0, 12))
         left.pack_propagate(False)
         tk.Frame(left, bg=C['orange'], height=3).pack(fill='x')
-        linner = tk.Frame(left, bg=C['panel'])
-        linner.pack(fill='both', expand=True, padx=16, pady=14)
+
+        scroll_wrap = tk.Frame(left, bg=C['panel'])
+        scroll_wrap.pack(fill='both', expand=True)
+        pcanvas = tk.Canvas(scroll_wrap, bg=C['panel'], highlightthickness=0, width=px(280))
+        psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
+        pcanvas.configure(yscrollcommand=psb.set)
+        psb.pack(side='right', fill='y')
+        pcanvas.pack(side='left', fill='both', expand=True)
+
+        linner = tk.Frame(pcanvas, bg=C['panel'])
+        linner_id = pcanvas.create_window((0, 0), window=linner, anchor='nw')
+        linner.bind('<Configure>', lambda e: pcanvas.configure(scrollregion=pcanvas.bbox('all')))
+        pcanvas.bind('<Configure>', lambda e: pcanvas.itemconfig(linner_id, width=e.width))
+        pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>',
+                     lambda ev: pcanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        pcanvas.bind('<Leave>', lambda e: pcanvas.unbind_all('<MouseWheel>'))
+        linner_pad = tk.Frame(linner, bg=C['panel'])
+        linner_pad.pack(fill='both', expand=True, padx=16, pady=14)
+        linner = linner_pad  # reszta kodu buduje wewnatrz tego z paddingiem
 
         tk.Label(linner, text="SWEEP V/I", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w', pady=(0, 4))
@@ -1227,11 +1288,23 @@ class PeltierControl:
                                     relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_i.pack(side='left', fill='x', expand=True)
 
+        # Tylko pomiar (bez sweepu) - pojedyncza stala wartosc, ciagly pomiar
+        self.sweep_continuous_var = tk.BooleanVar(value=False)
+        cont_row = tk.Frame(linner, bg=C['panel'])
+        cont_row.pack(fill='x', pady=(10, 0))
+        tk.Checkbutton(cont_row, text="Tylko pomiar (bez sweepu - stala wartosc)",
+                      variable=self.sweep_continuous_var, command=lambda: self._toggle_continuous_mode(),
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      font=(FONT, fsz(9)), activebackground=C['panel'],
+                      activeforeground=C['text'], wraplength=240,
+                      justify='left').pack(anchor='w')
+
         def _field(label, default, unit=""):
             row = tk.Frame(linner, bg=C['panel'])
             row.pack(fill='x', pady=4)
-            tk.Label(row, text=label, bg=C['panel'], fg=C['dim'],
-                     font=(FONT, fsz(9)), width=13, anchor='w').pack(side='left')
+            lbl = tk.Label(row, text=label, bg=C['panel'], fg=C['dim'],
+                     font=(FONT, fsz(9)), width=13, anchor='w')
+            lbl.pack(side='left')
             e = tk.Entry(row, bg=C['bg2'], fg=C['text'], font=(FONT, fsz(10)),
                         relief='flat', bd=0, insertbackground=C['orange'],
                         highlightthickness=1, highlightbackground=C['border'])
@@ -1241,11 +1314,22 @@ class PeltierControl:
                             font=(FONT, fsz(8)), width=3, anchor='w')
             ulbl.pack(side='left', padx=(4, 0))
             e.unit_lbl = ulbl
+            e.field_lbl = lbl
             return e
 
-        tk.Label(linner, text="PARAMETRY", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9), 'bold')).pack(anchor='w', pady=(12, 2))
-        tk.Label(linner,
+        # ── PARAMETRY - zwijana sekcja (oszczedza miejsce) ──
+        self.params_expanded = tk.BooleanVar(value=True)
+        phd = tk.Frame(linner, bg=C['panel'])
+        phd.pack(fill='x', pady=(12, 2))
+        self.btn_params_toggle = tk.Button(phd, text="▼ PARAMETRY", command=self._toggle_params_section,
+                                           bg=C['panel'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                           relief='flat', cursor='hand2', bd=0, anchor='w')
+        self.btn_params_toggle.pack(fill='x')
+
+        self.params_body = tk.Frame(linner, bg=C['panel'])
+        self.params_body.pack(fill='x')
+
+        self.params_desc_lbl = tk.Label(self.params_body,
                  text="START/STOP - zakres wartosci zadanej (V lub A,\n"
                       "zalezy od trybu powyzej). KROKI - ile punktow\n"
                       "pomiarowych rozlozonych rownomiernie miedzy\n"
@@ -1256,19 +1340,37 @@ class PeltierControl:
                       "instrument zmierzy wynik (czas na ustalenie\n"
                       "sie sygnalu elektrycznego).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 wraplength=250, justify='left').pack(anchor='w', pady=(0, 8))
+                 wraplength=250, justify='left')
+        self.params_desc_lbl.pack(anchor='w', pady=(0, 8))
+
+        # Pola sweepu (zakres) - ukrywane w trybie "tylko pomiar"
+        self._sweep_range_frame = tk.Frame(self.params_body, bg=C['panel'])
+        self._sweep_range_frame.pack(fill='x')
+        old_linner = linner
+        linner = self._sweep_range_frame
         self.sweep_start_entry = _field("START", "0.000001", "V")
         self.sweep_stop_entry  = _field("STOP", "0.00005", "V")
         self.sweep_step_entry  = _field("KROKI", "50", "")
+        linner = old_linner
+
+        # Pole pojedynczej wartosci - widoczne TYLKO w trybie "tylko pomiar"
+        self._single_value_frame = tk.Frame(self.params_body, bg=C['panel'])
+        linner = self._single_value_frame
+        self.sweep_value_entry = _field("WARTOSC", "0.000001", "V")
+        linner = old_linner
+        self._single_value_frame.pack_forget()  # ukryte domyslnie (tryb sweep aktywny)
+
+        # LIMIT i SETTLE TIME zawsze widoczne (potrzebne w obu trybach)
+        linner = self.params_body
         self.sweep_limit_entry = _field("LIMIT", "0.0001", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
-
+        linner = old_linner
 
         # Sweep dwukierunkowy (tam i z powrotem) - przydatne np. do histerezy
         self.sweep_bidir_var = tk.BooleanVar(value=False)
-        bidir_row = tk.Frame(linner, bg=C['panel'])
-        bidir_row.pack(fill='x', pady=(6, 0))
-        tk.Checkbutton(bidir_row, text="Sweep tam i z powrotem", variable=self.sweep_bidir_var,
+        self._bidir_row = tk.Frame(self.params_body, bg=C['panel'])
+        self._bidir_row.pack(fill='x', pady=(6, 0))
+        tk.Checkbutton(self._bidir_row, text="Sweep tam i z powrotem", variable=self.sweep_bidir_var,
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
@@ -1276,16 +1378,20 @@ class PeltierControl:
 
         # Petla - powtarzaj sweep w kolko, np. przez caly czas rampy PID
         self.sweep_loop_var = tk.BooleanVar(value=False)
-        loop_row = tk.Frame(linner, bg=C['panel'])
-        loop_row.pack(fill='x', pady=(4, 0))
-        tk.Checkbutton(loop_row, text="Petla (powtarzaj do STOP)", variable=self.sweep_loop_var,
+        self._loop_chk_row = tk.Frame(self.params_body, bg=C['panel'])
+        self._loop_chk_row.pack(fill='x', pady=(4, 0))
+        self.chk_loop = tk.Checkbutton(self._loop_chk_row, text="Petla (powtarzaj do STOP)",
+                      variable=self.sweep_loop_var,
                       command=lambda: self._toggle_loop_pause_field(),
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
-                      justify='left').pack(anchor='w')
+                      justify='left')
+        self.chk_loop.pack(anchor='w')
 
+        linner = self.params_body
         self.sweep_loop_pause_entry = _field("PRZERWA", "0", "ms")
+        linner = old_linner
         self.sweep_loop_pause_entry.master.pack_forget()  # ukryte dopoki petla wylaczona
         self._loop_pause_row = self.sweep_loop_pause_entry.master
 
@@ -1303,22 +1409,46 @@ class PeltierControl:
         self.btn_sweep_stop.pack(fill='x')
 
         exp_row = tk.Frame(linner, bg=C['panel'])
-        exp_row.pack(fill='x', pady=(20, 0), side='bottom')
+        exp_row.pack(fill='x', pady=(20, 10))
         mk_btn_outline(exp_row, "⤓ EKSPORTUJ CSV", self.export_sweep_csv, C['green']).pack(fill='x', pady=(0, 4))
         mk_btn_outline(exp_row, "WYCZYSC WYKRES", self.clear_sweep, C['dim']).pack(fill='x')
 
-        # ── PANEL PRAWY: wykres I-V ──
+        # ── PANEL PRAWY: wykres (I-V / V(t) / I(t)) ──
         right = tk.Frame(wrap, bg=C['panel'])
         right.pack(side='left', fill='both', expand=True)
         tk.Frame(right, bg=C['border2'], height=3).pack(fill='x')
 
         rhd = tk.Frame(right, bg=C['panel'])
         rhd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(rhd, text="WYKRES I-V", bg=C['panel'], fg=C['dim'],
+        tk.Label(rhd, text="WYKRES", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
         self.sweep_pts_lbl = tk.Label(rhd, text="0 punktow", bg=C['panel'], fg=C['dim2'],
                                       font=(FONT, fsz(9)))
         self.sweep_pts_lbl.pack(side='right')
+
+        # Przelacznik typu wykresu
+        chart_sel = tk.Frame(right, bg=C['panel'])
+        chart_sel.pack(fill='x', padx=14, pady=(0, 6))
+        self.sweep_chart_view = "IV"  # "IV", "VT", "IT"
+        self.btn_chart_iv = tk.Button(chart_sel, text="I-V", command=lambda: self._set_chart_view("IV"),
+                                      bg=C['orange'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
+                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+        self.btn_chart_iv.pack(side='left', padx=(0, 4))
+        self.btn_chart_vt = tk.Button(chart_sel, text="V(t)", command=lambda: self._set_chart_view("VT"),
+                                      bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+        self.btn_chart_vt.pack(side='left', padx=(0, 4))
+        self.btn_chart_it = tk.Button(chart_sel, text="I(t)", command=lambda: self._set_chart_view("IT"),
+                                      bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+        self.btn_chart_it.pack(side='left')
+
+        self.sweep_autoscale_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(chart_sel, text="Auto-skalowanie", variable=self.sweep_autoscale_var,
+                      command=lambda: self._redraw_sweep_chart(),
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      font=(FONT, fsz(9)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(side='right')
 
         # Duze karty na zywo: napiecie, prad, postep kroku
         scards_wrap = tk.Frame(right, bg=C['panel'])
@@ -1344,9 +1474,123 @@ class PeltierControl:
         self.sweep_fig.tight_layout()
 
         self.sweep_cv = FigureCanvasTkAgg(self.sweep_fig, master=right)
-        self.sweep_cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        self.sweep_cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
+
+        sweep_tbf = tk.Frame(right, bg='#3a3f44')
+        sweep_tbf.pack(fill='x', padx=8, pady=(0, 8))
+        try:
+            self.mpl_toolbar_sweep = NavigationToolbar2Tk(self.sweep_cv, sweep_tbf, pack_toolbar=False)
+            self.mpl_toolbar_sweep.config(bg='#3a3f44')
+            self.mpl_toolbar_sweep.update()
+            self.mpl_toolbar_sweep.pack(side='left', fill='x')
+        except Exception as e:
+            print(f"sweep toolbar err: {e}")
 
         self._sweep_tick()  # startuje petle odswiezania wykresu/tabeli
+
+    def _set_chart_view(self, view):
+        self.sweep_chart_view = view
+        for v, btn in [("IV", self.btn_chart_iv), ("VT", self.btn_chart_vt), ("IT", self.btn_chart_it)]:
+            if v == view:
+                btn.config(bg=C['orange'], fg='#1a1c1f')
+            else:
+                btn.config(bg=C['bg2'], fg=C['dim'])
+        self._redraw_sweep_chart()
+
+    def _redraw_sweep_chart(self):
+        """Przerysowuje caly wykres wg aktualnie wybranego widoku (I-V / V-t / I-t)."""
+        try:
+            from matplotlib.ticker import EngFormatter, ScalarFormatter
+        except Exception:
+            EngFormatter = None
+        def _fmt(ax, x_unit, y_unit):
+            # czytelne osie: 50 µA zamiast 5e-05; brak jednostki = zwykly format
+            if EngFormatter is None: return
+            ax.xaxis.set_major_formatter(EngFormatter(unit=x_unit) if x_unit else ScalarFormatter())
+            ax.yaxis.set_major_formatter(EngFormatter(unit=y_unit) if y_unit else ScalarFormatter())
+        pts = self.sweep_points
+        if self.sweep_chart_view == "IV":
+            if self.sweep_mode == "V":
+                xs = [p[1] for p in pts]; ys = [p[2] for p in pts]
+                self.sweep_ax.set_xlabel("Napiecie zadane", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_ylabel("Prad zmierzony", color=C['dim'], fontsize=8)
+                _fmt(self.sweep_ax, 'V', 'A'); mini_units = ('V', 'A')
+            else:
+                xs = [p[1] for p in pts]; ys = [p[3] for p in pts]
+                self.sweep_ax.set_xlabel("Prad zadany", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_ylabel("Napiecie zmierzone", color=C['dim'], fontsize=8)
+                _fmt(self.sweep_ax, 'A', 'V'); mini_units = ('A', 'V')
+            self.sweep_line.set_marker('o')
+        elif self.sweep_chart_view == "VT":
+            xs = [p[0] for p in pts]; ys = [p[3] for p in pts]
+            self.sweep_ax.set_xlabel("Czas [s]", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_ylabel("Napiecie zmierzone", color=C['dim'], fontsize=8)
+            _fmt(self.sweep_ax, '', 'V'); mini_units = ('', 'V')
+            self.sweep_line.set_marker('')
+        else:  # IT
+            xs = [p[0] for p in pts]; ys = [p[2] for p in pts]
+            self.sweep_ax.set_xlabel("Czas [s]", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_ylabel("Prad zmierzony", color=C['dim'], fontsize=8)
+            _fmt(self.sweep_ax, '', 'A'); mini_units = ('', 'A')
+            self.sweep_line.set_marker('')
+        self.sweep_line.set_data(xs, ys)
+        if getattr(self, 'sweep_autoscale_var', None) is None or self.sweep_autoscale_var.get():
+            self.sweep_ax.relim(); self.sweep_ax.autoscale_view()
+        self.sweep_cv.draw_idle()
+        if hasattr(self, 'sweep_line_mini'):
+            _fmt(self.sweep_ax_mini, mini_units[0], mini_units[1])
+            self.sweep_line_mini.set_data(xs, ys)
+            self.sweep_ax_mini.relim(); self.sweep_ax_mini.autoscale_view()
+            self.sweep_cv_mini.draw_idle()
+
+    def _toggle_params_section(self):
+        if self.params_expanded.get():
+            self.params_body.pack_forget()
+            self.btn_params_toggle.config(text="▶ PARAMETRY")
+            self.params_expanded.set(False)
+        else:
+            self.params_body.pack(fill='x', after=self.btn_params_toggle)
+            self.btn_params_toggle.config(text="▼ PARAMETRY")
+            self.params_expanded.set(True)
+
+    def _toggle_continuous_mode(self):
+        if self.sweep_continuous_var.get():
+            self._sweep_range_frame.pack_forget()
+            self._single_value_frame.pack(fill='x', before=self.sweep_limit_entry.master)
+            self._bidir_row.pack_forget()
+            self.sweep_loop_var.set(True)
+            self.chk_loop.config(state='disabled')
+            self._loop_pause_row.pack(fill='x', pady=4, before=self._sweep_btn_row)
+            self.sweep_loop_pause_entry.field_lbl.config(text="INTERWAL")
+            self.params_desc_lbl.config(
+                text="WARTOSC - stala wartosc zadana (V lub A,\n"
+                     "zalezy od trybu powyzej), Keithley bedzie ja\n"
+                     "utrzymywal i ciagle mierzyl. LIMIT - compliance\n"
+                     "(chroni probke/kontakty). To DWIE OSOBNE rzeczy:\n"
+                     "SETTLE TIME - czas fizycznego ustalenia sie\n"
+                     "sygnalu PO zmianie wartosci (tu bez znaczenia,\n"
+                     "bo wartosc jest stala - mozna dac 0). INTERWAL -\n"
+                     "odstep miedzy KOLEJNYMI probkami [ms] - TO steruje\n"
+                     "czestotliwoscia zbierania danych (np. 100ms =\n"
+                     "10 probek/s).")
+        else:
+            self._single_value_frame.pack_forget()
+            self._sweep_range_frame.pack(fill='x', before=self.sweep_limit_entry.master)
+            self._bidir_row.pack(fill='x', pady=(6, 0), before=self._loop_chk_row)
+            self.chk_loop.config(state='normal')
+            self.sweep_loop_var.set(False)
+            self._loop_pause_row.pack_forget()
+            self.sweep_loop_pause_entry.field_lbl.config(text="PRZERWA")
+            self.params_desc_lbl.config(
+                text="START/STOP - zakres wartosci zadanej (V lub A,\n"
+                     "zalezy od trybu powyzej). KROKI - ile punktow\n"
+                     "pomiarowych rozlozonych rownomiernie miedzy\n"
+                     "START a STOP. LIMIT - compliance (np. przy\n"
+                     "zrodle V to maks. dopuszczalny prad - chroni\n"
+                     "probke/kontakty). SETTLE TIME - ile ms czekac\n"
+                     "po kazdej zmianie wartosci zadanej, zanim\n"
+                     "instrument zmierzy wynik (czas na ustalenie\n"
+                     "sie sygnalu elektrycznego).")
 
     def _toggle_loop_pause_field(self):
         if self.sweep_loop_var.get():
@@ -1364,6 +1608,7 @@ class PeltierControl:
             'stop': self.sweep_stop_entry.get(),
             'steps': self.sweep_step_entry.get(),
             'limit': self.sweep_limit_entry.get(),
+            'value': self.sweep_value_entry.get(),
         }
         self.sweep_mode = mode
         saved = self.sweep_saved_settings[mode]
@@ -1373,25 +1618,24 @@ class PeltierControl:
             self.btn_mode_i.config(bg=C['bg2'], fg=C['dim'])
             self.sweep_start_entry.unit_lbl.config(text="V")
             self.sweep_stop_entry.unit_lbl.config(text="V")
+            self.sweep_value_entry.unit_lbl.config(text="V")
             self.sweep_limit_entry.unit_lbl.config(text="A")
-            self.sweep_ax.set_xlabel("Napiecie zadane [V]", color=C['dim'], fontsize=8)
-            self.sweep_ax.set_ylabel("Prad zmierzony [A]", color=C['dim'], fontsize=8)
         else:
             self.btn_mode_i.config(bg=C['orange'], fg='#1a1c1f')
             self.btn_mode_v.config(bg=C['bg2'], fg=C['dim'])
             self.sweep_start_entry.unit_lbl.config(text="A")
             self.sweep_stop_entry.unit_lbl.config(text="A")
+            self.sweep_value_entry.unit_lbl.config(text="A")
             self.sweep_limit_entry.unit_lbl.config(text="V")
-            self.sweep_ax.set_xlabel("Prad zadany [A]", color=C['dim'], fontsize=8)
-            self.sweep_ax.set_ylabel("Napiecie zmierzone [V]", color=C['dim'], fontsize=8)
 
         # Przywroc zapamietane wartosci dla tego trybu (kazdy tryb ma wlasne,
         # niezalezne ustawienia - przelaczanie nie kasuje juz wpisanych danych)
         for entry, key in [(self.sweep_start_entry, 'start'), (self.sweep_stop_entry, 'stop'),
-                           (self.sweep_step_entry, 'steps'), (self.sweep_limit_entry, 'limit')]:
+                           (self.sweep_step_entry, 'steps'), (self.sweep_limit_entry, 'limit'),
+                           (self.sweep_value_entry, 'value')]:
             entry.delete(0, 'end'); entry.insert(0, saved[key])
 
-        self.sweep_cv.draw_idle()
+        self._redraw_sweep_chart()
 
     def clear_sweep(self):
         self.sweep_points = []
@@ -1410,20 +1654,27 @@ class PeltierControl:
             messagebox.showwarning("Keithley zajety",
                 "Pomiar ciagly PID uzywa teraz Keithleya. Zatrzymaj PID (STOP) przed sweepem.")
             return
+
+        continuous = self.sweep_continuous_var.get()
         try:
-            v0 = float(self.sweep_start_entry.get().replace(',', '.'))
-            v1 = float(self.sweep_stop_entry.get().replace(',', '.'))
-            n_steps = int(round(float(self.sweep_step_entry.get().replace(',', '.'))))
+            if continuous:
+                val = float(self.sweep_value_entry.get().replace(',', '.'))
+                v0 = v1 = val
+                n_steps = 2  # bez znaczenia gdy v0==v1, generuje pojedynczy punkt
+            else:
+                v0 = float(self.sweep_start_entry.get().replace(',', '.'))
+                v1 = float(self.sweep_stop_entry.get().replace(',', '.'))
+                n_steps = int(round(float(self.sweep_step_entry.get().replace(',', '.'))))
             limit = float(self.sweep_limit_entry.get().replace(',', '.'))
             settle_ms = float(self.sweep_settle_entry.get().replace(',', '.'))
         except ValueError:
             messagebox.showerror("Blad", "Sprawdz wartosci liczbowe pol sweep.")
             return
-        if n_steps < 2:
+        if not continuous and n_steps < 2:
             messagebox.showerror("Blad", "Liczba krokow musi byc co najmniej 2.")
             return
 
-        loop = self.sweep_loop_var.get()
+        loop = True if continuous else self.sweep_loop_var.get()
         loop_pause_ms = 0.0
         if loop:
             try:
@@ -1435,10 +1686,11 @@ class PeltierControl:
         self.sweep_abort = False
         self.sweep_running = True
         self.sweep_loop_count = 0
+        self.sweep_t0 = time.time()
         self.btn_sweep_start.config(state='disabled')
         self.btn_sweep_stop.config(state='normal')
 
-        bidir = self.sweep_bidir_var.get()
+        bidir = False if continuous else self.sweep_bidir_var.get()
         mode = self.sweep_mode
 
         # ── AUTOMATYCZNY ZAPIS NA DYSK - pelna precyzja, korelacja z temp/czasem,
@@ -1449,7 +1701,8 @@ class PeltierControl:
         sweep_log_file = open(sweep_log_path, 'w', newline='', encoding='utf-8')
         sweep_log_wr = csv.writer(sweep_log_file)
         sweep_log_wr.writerow([
-            'timestamp_pc', 'czas_od_startu_PID_s', 'temperatura1_C', 'temperatura2_C', 'setpoint_C',
+            'timestamp_pc', 'czas_od_startu_sweep_s', 'czas_od_startu_PID_s',
+            'temperatura1_C', 'temperatura2_C', 'setpoint_C',
             'petla_nr', 'wartosc_zadana', 'jednostka_zadana',
             'prad_zmierzony_A', 'napiecie_zmierzone_V',
         ])
@@ -1465,10 +1718,14 @@ class PeltierControl:
                     self.root.after(0, lambda: self.keithley_status_lbl.config(
                         text=f"● polaczono: {idn[:40]}", fg=C['green']))
 
-                # zbuduj liste punktow - n_steps to LICZBA punktow, nie wielkosc kroku
-                n = n_steps
-                fwd = [v0 + (v1 - v0) * i / (n - 1) for i in range(n)] if n > 1 else [v0]
-                points = fwd + list(reversed(fwd)) if bidir else fwd
+                # zbuduj liste punktow - n_steps to LICZBA punktow, nie wielkosc kroku.
+                # W trybie ciaglym (continuous) jest to zawsze jeden, staly punkt.
+                if continuous:
+                    points = [v0]
+                else:
+                    n = n_steps
+                    fwd = [v0 + (v1 - v0) * i / (n - 1) for i in range(n)] if n > 1 else [v0]
+                    points = fwd + list(reversed(fwd)) if bidir else fwd
                 unit = "V" if mode == "V" else "A"
 
                 if mode == "V":
@@ -1484,7 +1741,9 @@ class PeltierControl:
                     self.sweep_loop_count += 1
                     if not first_pass:
                         # sygnal dla _sweep_tick (glowny watek): wyczysc wykres na nowa petle
-                        self.sweep_queue.put(("__NEW_LOOP__", None, None))
+                        # (w trybie ciaglym NIE czyscimy - chcemy widziec cala historie V(t)/I(t))
+                        if not continuous:
+                            self.sweep_queue.put(("__NEW_LOOP__", None, None, None))
                     first_pass = False
 
                     self.sweep_total = len(points)
@@ -1499,7 +1758,8 @@ class PeltierControl:
                         else:
                             i_meas, v_meas = self.keithley.set_current_and_measure("a", p, settle_s)
                         self.sweep_done += 1
-                        self.sweep_queue.put((p, i_meas, v_meas))
+                        t_elapsed = time.time() - self.sweep_t0
+                        self.sweep_queue.put((t_elapsed, p, i_meas, v_meas))
 
                         # Nakarm te same "ostatnie znane" pola co stary tryb ciaglego
                         # pomiaru - dzieki temu RAW DATA / ARCHIVE / karta na CONTROL
@@ -1522,7 +1782,7 @@ class PeltierControl:
                         sp_str = f"{sp_now:.4f}" if sp_now is not None else ""
                         try:
                             sweep_log_wr.writerow([
-                                pc_ts, f"{t_rel:.3f}", t1_str, t2_str, sp_str,
+                                pc_ts, f"{t_elapsed:.3f}", f"{t_rel:.3f}", t1_str, t2_str, sp_str,
                                 self.sweep_loop_count, f"{p:.9f}", unit,
                                 f"{i_meas:.12e}", f"{v_meas:.9f}",
                             ])
@@ -1564,9 +1824,6 @@ class PeltierControl:
             if pt[0] == "__NEW_LOOP__":
                 # nowa iteracja petli - wyczysc wykres, zacznij od nowa
                 self.sweep_points = []
-                self.sweep_line.set_data([], [])
-                if hasattr(self, 'sweep_line_mini'):
-                    self.sweep_line_mini.set_data([], [])
                 got_new = True
                 continue
             self.sweep_points.append(pt)
@@ -1574,26 +1831,17 @@ class PeltierControl:
             got_new = True
 
         if got_new:
-            if self.sweep_mode == "V":
-                xs = [p[0] for p in self.sweep_points]   # V zadane
-                ys = [p[1] for p in self.sweep_points]   # I zmierzone
-            else:
-                xs = [p[0] for p in self.sweep_points]   # I zadane
-                ys = [p[2] for p in self.sweep_points]   # V zmierzone
-            self.sweep_line.set_data(xs, ys)
-            self.sweep_ax.relim(); self.sweep_ax.autoscale_view()
-            self.sweep_cv.draw_idle()
+            self._redraw_sweep_chart()
             self.sweep_pts_lbl.config(text=f"{len(self.sweep_points)} punktow")
 
-            if hasattr(self, 'sweep_line_mini'):
-                self.sweep_line_mini.set_data(xs, ys)
-                self.sweep_ax_mini.relim(); self.sweep_ax_mini.autoscale_view()
-                self.sweep_cv_mini.draw_idle()
-
             if last_pt is not None:
-                _, i_meas, v_meas = last_pt
-                self.sweep_cards['v']['val'].config(text=f"{v_meas:.9f}")
-                self.sweep_cards['i']['val'].config(text=f"{i_meas:.9f}")
+                _, p_val, i_meas, v_meas = last_pt
+                vv, vpref = fmt_si(v_meas, 3)
+                iv, ipref = fmt_si(i_meas, 3)
+                self.sweep_cards['v']['val'].config(text=vv)
+                self.sweep_cards['v']['unit_lbl'].config(text=f" {vpref}V")
+                self.sweep_cards['i']['val'].config(text=iv)
+                self.sweep_cards['i']['unit_lbl'].config(text=f" {ipref}A")
 
         looping = getattr(self, 'sweep_loop_var', None) is not None and self.sweep_loop_var.get()
         loop_prefix = f"P{self.sweep_loop_count} " if looping else ""
@@ -1634,11 +1882,11 @@ class PeltierControl:
             with open(dest, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
                 if self.sweep_mode == "V":
-                    w.writerow(['napiecie_zadane_V', 'prad_zmierzony_A', 'napiecie_zmierzone_V'])
+                    w.writerow(['czas_s', 'napiecie_zadane_V', 'prad_zmierzony_A', 'napiecie_zmierzone_V'])
                 else:
-                    w.writerow(['prad_zadany_A', 'prad_zmierzony_A', 'napiecie_zmierzone_V'])
-                for p, i_m, v_m in self.sweep_points:
-                    w.writerow([f"{p:.9f}", f"{i_m:.12e}", f"{v_m:.9f}"])
+                    w.writerow(['czas_s', 'prad_zadany_A', 'prad_zmierzony_A', 'napiecie_zmierzone_V'])
+                for t, p, i_m, v_m in self.sweep_points:
+                    w.writerow([f"{t:.3f}", f"{p:.9f}", f"{i_m:.12e}", f"{v_m:.9f}"])
             messagebox.showinfo("Zapisano",
                 f"Wyeksportowano {len(self.sweep_points)} punktow (biezaca petla) do:\n{dest}\n\n"
                 f"Pelny zapis wszystkich petli z korelacja czasowa jest w ~/BigPeltierPidLogi/")
@@ -1825,7 +2073,7 @@ class PeltierControl:
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
-        lf = tk.Frame(body, bg=C['panel'], width=340)
+        lf = tk.Frame(body, bg=C['panel'], width=px(340))
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
@@ -1859,8 +2107,11 @@ class PeltierControl:
         cf.pack(side='left', fill='both', expand=True)
         tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
         self.fig_a = Figure(figsize=(8, 6), facecolor=C['panel'], dpi=100)
+        # Osie tworzone dynamicznie w _redraw_arch: sama temperatura, albo
+        # temperatura (gora) + prad Keithleya (dol) jeden pod drugim, wspolna os X.
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
+        self.ax_a_current = None
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
         self.cv_a.draw()
@@ -1881,6 +2132,12 @@ class PeltierControl:
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
         mk_btn(atb, "⤓ POBIERZ CSV (zaznaczony cykl)", self.export_selected_cycle_csv, C['green']).pack(
             side='right', padx=(4, 0))
+        self.arch_show_current_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(atb, text="Pokaz prad Keithley (wykres pod temperatura)", variable=self.arch_show_current_var,
+                      command=lambda: self._redraw_arch(),
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      font=(FONT, fsz(9)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(side='left')
 
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
@@ -1939,7 +2196,7 @@ class PeltierControl:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 rows = list(csv.DictReader(f))
-            t,t1,t2,sp,pwm = [],[],[],[],[]
+            t,t1,t2,sp,pwm,ki = [],[],[],[],[],[]
             for r in rows:
                 try:
                     t.append(float(r.get('czas_od_startu_s',0)))
@@ -1949,40 +2206,94 @@ class PeltierControl:
                     t2.append(float(v2) if v2 else None)
                     sp.append(float(r.get('setpoint_cel_C',0)))
                     pwm.append(float(r.get('peltier_pct',0)))
+                    vki = r.get('keithley_prad_A','')
+                    ki.append(float(vki) if vki else None)
                 except: continue
-            return (t,t1,t2,sp,pwm) if t else None
+            return (t,t1,t2,sp,pwm,ki) if t else None
         except: return None
+
+    def _style_arch_ax(self, ax):
+        ax.set_facecolor(C['panel2'])
+        ax.tick_params(colors=C['dim'], labelsize=8)
+        ax.grid(True, alpha=0.3, color=C['grid'])
+        for sp2 in ax.spines.values(): sp2.set_color(C['border'])
 
     def _redraw_arch(self):
         sel = [(p,v) for p,v in self.arch_vars.items() if v.get()]
-        self.ax_a.clear(); self.ax_a.set_facecolor(C['panel2'])
+        show_current = getattr(self, 'arch_show_current_var', None) is not None \
+                       and self.arch_show_current_var.get()
+
+        # Najpierw wczytaj dane - dopiero potem decyduj o ukladzie osi
+        files = sorted([f for f in self.log_dir.glob("*.csv")
+                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
+                        and not f.name.startswith("_tmp")], reverse=True)
+        forder = {str(f):i for i,f in enumerate(files)}
+        loaded = []
+        any_current_data = False
+        for path,_ in sel:
+            d = self._load_cycle(path)
+            if not d: continue
+            t,t1,t2,sp,pwm,ki = d
+            has_i = any(v is not None for v in ki)
+            any_current_data = any_current_data or has_i
+            loaded.append((path, t, t1, sp, ki, has_i))
+
+        # Przebuduj uklad figury od zera (jedna os lub dwie jedna pod druga)
+        self.fig_a.clear()
+        two_panels = show_current and any_current_data
+        if two_panels:
+            gs = self.fig_a.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.12,
+                                         left=0.1, right=0.97, top=0.96, bottom=0.09)
+            self.ax_a = self.fig_a.add_subplot(gs[0])
+            ax_i = self.fig_a.add_subplot(gs[1], sharex=self.ax_a)
+        else:
+            self.ax_a = self.fig_a.add_subplot(111)
+            self.fig_a.subplots_adjust(left=0.1, right=0.97, top=0.96, bottom=0.09)
+            ax_i = None
+        self.ax_a_current = ax_i
+        self._style_arch_ax(self.ax_a)
+        if ax_i is not None: self._style_arch_ax(ax_i)
+
         if not sel:
             self.ax_a.text(0.5,0.5,"Tick a cycle to display",
                            ha='center',va='center',color=C['dim2'],
                            fontsize=11,transform=self.ax_a.transAxes)
             self.cv_a.draw(); return
-        files = sorted([f for f in self.log_dir.glob("*.csv")
-                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
-                        and not f.name.startswith("_tmp")], reverse=True)
-        forder = {str(f):i for i,f in enumerate(files)}
-        for path,_ in sel:
-            d = self._load_cycle(path)
-            if not d: continue
-            t,t1,t2,sp,pwm = d
+
+        for path, t, t1, sp, ki, has_i in loaded:
             ci = forder.get(path,0)%len(self._arch_colors)
             col = self._arch_colors[ci]
             t0 = t[0]; tx=[x-t0 for x in t]
             nm = self._cycle_display_name(path)
             self.ax_a.plot(tx, sp, color=C['orange'], lw=1, ls='--', alpha=0.5)
             self.ax_a.plot(tx, t1, color=col, lw=2, label=nm[:20])
-        self.ax_a.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+            if ax_i is not None and has_i:
+                # ten sam kolor co T1 danego cyklu - latwo skojarzyc pary krzywych
+                ax_i.plot(tx, ki, color=col, lw=1.4)
+
+        if ax_i is not None:
+            try:
+                from matplotlib.ticker import EngFormatter
+                ax_i.yaxis.set_major_formatter(EngFormatter(unit='A'))
+            except Exception:
+                pass
+            ax_i.set_ylabel('prad Keithley', color=C['dim'], fontsize=9)
+            ax_i.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+            # ukryj etykiety X gornego wykresu - wspolna os czasu na dole
+            self.ax_a.tick_params(labelbottom=False)
+        else:
+            self.ax_a.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+            if show_current and not any_current_data:
+                self.ax_a.text(0.02, 0.02, "brak danych Keithleya w zaznaczonych cyklach",
+                               color=C['dim2'], fontsize=8, transform=self.ax_a.transAxes)
+
         self.ax_a.set_ylabel('temperatura [°C]', color=C['dim'], fontsize=9)
-        self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                          labelcolor=C['dim'], fontsize=8)
-        self.ax_a.grid(True, alpha=0.3, color=C['grid'])
-        for sp2 in self.ax_a.spines.values(): sp2.set_color(C['border'])
-        self.fig_a.tight_layout()
+        # zresetuj stos nawigacji toolbara (HOME wraca do nowego widoku, nie starego)
+        if hasattr(self, 'mpl_toolbar_a'):
+            try: self.mpl_toolbar_a.update()
+            except Exception: pass
         self.cv_a.draw()
 
     def save_arch_chart(self):
@@ -2138,11 +2449,14 @@ class PeltierControl:
                 self.cards['sp']['val'].config(text=f"{sp:.1f}")
                 self.cards['pwm']['val'].config(text=f"{pct:.0f}")
                 if k_i is not None:
-                    self.cards['kcur']['val'].config(text=f"{k_i:.9f}")
+                    kv, kpref = fmt_si(k_i, 3)
+                    self.cards['kcur']['val'].config(text=kv)
+                    self.cards['kcur']['unit_lbl'].config(text=f" {kpref}A")
                 elif self.keithley_running:
                     self.cards['kcur']['val'].config(text="...")
                 else:
                     self.cards['kcur']['val'].config(text="--")
+                    self.cards['kcur']['unit_lbl'].config(text=" A")
 
                 avg_rate = 0.0
                 if (self.reach_start_t is not None and self.reach_start_temp is not None
@@ -2174,7 +2488,10 @@ class PeltierControl:
                 elif not pid_on:
                     self.reach_lbl.config(text="")
 
-            if self.t and not self.chart_paused:
+            # Nie przerysowuj gdy uzytkownik ma aktywne narzedzie ZOOM/PAN z
+            # toolbara - inaczej ax.clear() co 250 ms kasowalby przyblizenie
+            # i zoom na wykresie live nigdy nie dzialal.
+            if self.t and not self.chart_paused and not self._live_toolbar_busy():
                 self._draw_chart()
 
         except Exception as e:
@@ -2231,6 +2548,27 @@ class PeltierControl:
         self.cv.draw_idle()
 
     # ─── CSV CYKLU ───────────────────────────────────────
+    def _recover_tmp_cycles(self):
+        """Po awarii/wymuszonym zamknieciu programu pliki _tmp_cykl_* zostaja na
+        dysku i nigdy nie trafialy do archiwum (filtr _tmp je ukrywal) - dane
+        przepadaly. Teraz przy starcie zmieniamy je na c_odzyskane_* zeby byly
+        widoczne w ARCHIVE. Puste pliki (sam naglowek) sa usuwane."""
+        try:
+            for f in self.log_dir.glob("_tmp_cykl_*.csv"):
+                try:
+                    if f.stat().st_size < 300:  # sam naglowek / prawie puste
+                        f.unlink()
+                        continue
+                    ts = f.stem.replace("_tmp_cykl_", "")
+                    dest = self.log_dir / f"c_odzyskane_{ts}.csv"
+                    if not dest.exists():
+                        f.rename(dest)
+                        print(f"Odzyskano przerwany cykl -> {dest.name}")
+                except Exception as e:
+                    print(f"recover err ({f.name}): {e}")
+        except Exception as e:
+            print(f"recover scan err: {e}")
+
     def _cyc_start(self, temp0):
         self.cyc_on = True; self.cyc_t0 = time.time()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2272,7 +2610,16 @@ class PeltierControl:
                     kis_a, kvs,
                 ])
                 self.cyc_file.flush(); self.cyc_rows += 1
-            except: pass
+            except Exception as e:
+                # NIE gub bledow po cichu - licz je i pokaz w naglowku statusu,
+                # zeby brak danych w CSV nie byl niespodzianka po eksperymencie
+                self.cyc_write_errors = getattr(self, 'cyc_write_errors', 0) + 1
+                print(f"cyc_log write err #{self.cyc_write_errors}: {e}")
+                if self.cyc_write_errors == 1 and hasattr(self, 's_lbl'):
+                    try:
+                        self.s_lbl.config(text="UWAGA: blad zapisu CSV cyklu!", fg=C['red'])
+                    except Exception:
+                        pass
 
     def cyc_stop(self, reason=""):
         if self.cyc_file:
@@ -2322,7 +2669,16 @@ class SaveCycleDialog:
         self.win = tk.Toplevel(parent)
         self.win.title("Save cycle")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("440x230")
+        w, h = px(440), px(230)
+        # wysrodkuj nad oknem glownym (a nie w rogu ekranu)
+        try:
+            parent.update_idletasks()
+            x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+            self.win.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            self.win.geometry(f"{w}x{h}")
+        self.win.minsize(w, h)
         self.win.transient(parent)
         self.win.grab_set()
 
