@@ -394,6 +394,8 @@ class PeltierControl:
         self.raw_rows = []
         self.raw_paused = False
         self.raw_autoscroll = True
+        self._raw_last_ui_ts = 0.0
+        self.raw_ui_interval = 0.2  # throttling: max 5 aktualizacji Treeview / sekunde
 
         # Keithley 2611B (SMU) - pomiar pradu przez LAN/TSP, synchronizowany z PID
         self.keithley = KeithleyClient()
@@ -651,12 +653,29 @@ class PeltierControl:
         t6 = tk.Frame(nb, bg=C['bg']); nb.add(t6, text='KEITHLEY')
         t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
         t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
+        self.nb = nb
+        self.raw_tab_frame = t5
+        self.raw_tab_visible = False
+        nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
         self.build_live(t1)
         self.build_advanced(t2)
         self.build_raw(t5)
         self.build_keithley_tab(t6)
         self.build_arch(t3)
         self.build_conn(t4)
+
+    def _on_tab_changed(self, event):
+        """RAW DATA to jedyna zakladka gdzie odswiezanie UI jest kosztowne
+        (Treeview.insert 10x/s) - aktualizujemy ja tylko gdy jest faktycznie
+        widoczna, zeby nie obciazac programu w tle gdy uzytkownik patrzy
+        np. na CONTROL albo ARCHIVE."""
+        try:
+            was_visible = self.raw_tab_visible
+            self.raw_tab_visible = (self.nb.select() == str(self.raw_tab_frame))
+            if self.raw_tab_visible and not was_visible:
+                self._raw_rebuild_tree()
+        except Exception:
+            pass
 
     def _draw_dot(self, color, glow=True):
         self.s_dot.delete('all')
@@ -1162,8 +1181,10 @@ class PeltierControl:
         self.raw_tree.bind('<Button-4>', lambda e: setattr(self, 'raw_autoscroll', False))
         self.raw_tree.bind('<Button-5>', lambda e: setattr(self, 'raw_autoscroll', False))
 
-        info = tk.Label(wrap, text="Tabela pokazuje ostatnie probki (max 2000). Pelny zapis surowych danych od START do STOP jest w zakladce ARCHIVE.",
-                        bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)))
+        info = tk.Label(wrap, text="Tabela aktualizuje sie tylko gdy ta zakladka jest otwarta (max 5x/s) - dlatego nie "
+                        "obciaza programu w tle. Bufor (max 2000 probek) zbiera dane zawsze, wiec EXPORT CSV "
+                        "dziala niezaleznie. Pelny zapis surowych danych od START do STOP jest w zakladce ARCHIVE.",
+                        bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), wraplength=900, justify='left')
         info.pack(anchor='w', pady=(8, 0))
 
     def _toggle_raw_pause(self):
@@ -1181,20 +1202,8 @@ class PeltierControl:
         if hasattr(self, 'raw_count_lbl'):
             self.raw_count_lbl.config(text="0 probek")
 
-    def _raw_append(self, row):
-        # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat)
-        self.raw_rows.append(row)
-        if len(self.raw_rows) > self.raw_maxrows:
-            self.raw_rows = self.raw_rows[-self.raw_maxrows:]
-            if hasattr(self, 'raw_tree'):
-                children = self.raw_tree.get_children()
-                if len(children) > self.raw_maxrows:
-                    for item in children[:len(children)-self.raw_maxrows]:
-                        self.raw_tree.delete(item)
-
-        if self.raw_paused or not hasattr(self, 'raw_tree'):
-            return
-        idx = len(self.raw_rows)
+    def _raw_row_values(self, row, idx):
+        """Formatuje jeden wiersz (krotke danych) na wartosci wyswietlane w Treeview."""
         czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
@@ -1207,13 +1216,58 @@ class PeltierControl:
         dirs = "▲ HEAT" if heat else "▼ COOL"
         if pct < 0.5:
             dirs = "—"  # PWM prawie zero - kierunek bez znaczenia
-        # W trybie MAN firmware wysyla T1 zamiast spA (brak aktywnej rampy) -
-        # pokazujemy myslnik zeby nie mylic uzytkownika ze rampa dziala
         spas = "—" if state == "MAN" else f"{spa:.2f}"
-        self.raw_tree.insert('', 'end', values=(
-            idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
-            f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", dirs, kis, kvs, state
-        ))
+        return (idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
+                f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", dirs, kis, kvs, state)
+
+    def _raw_rebuild_tree(self):
+        """Pelne przebudowanie tabeli z bufora self.raw_rows - wywolywane raz,
+        gdy uzytkownik dopiero co przelaczyl sie na zakladke RAW DATA (zeby od
+        razu zobaczyc aktualny stan, a nie czekac na throttlowane aktualizacje)."""
+        if not hasattr(self, 'raw_tree'):
+            return
+        for item in self.raw_tree.get_children():
+            self.raw_tree.delete(item)
+        start_idx = max(1, len(self.raw_rows) - self.raw_maxrows + 1)
+        for i, row in enumerate(self.raw_rows[-self.raw_maxrows:]):
+            self.raw_tree.insert('', 'end', values=self._raw_row_values(row, start_idx + i))
+        if self.raw_autoscroll:
+            children = self.raw_tree.get_children()
+            if children:
+                self.raw_tree.see(children[-1])
+        if hasattr(self, 'raw_count_lbl'):
+            self.raw_count_lbl.config(text=f"{len(self.raw_rows)} probek")
+        self._raw_last_ui_ts = time.time()
+
+    def _raw_append(self, row):
+        # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat)
+        # Bufor w pamieci rosnie zawsze (tani append+trim na liscie Pythona) -
+        # to on zasila EXPORT CSV i pelne przebudowanie tabeli, niezaleznie od
+        # tego czy ktokolwiek aktualnie patrzy na zakladke.
+        self.raw_rows.append(row)
+        if len(self.raw_rows) > self.raw_maxrows:
+            self.raw_rows = self.raw_rows[-self.raw_maxrows:]
+
+        if self.raw_paused or not hasattr(self, 'raw_tree'):
+            return
+
+        # Kosztowna czesc (Treeview.insert, .see(), przewijanie) wykonujemy
+        # TYLKO gdy zakladka RAW DATA jest faktycznie widoczna na ekranie,
+        # i nie czesciej niz raw_ui_interval - inaczej caly program przycinal
+        # sie od aktualizacji tabeli 10x/s w tle, nawet gdy nikt na nia nie patrzy.
+        if not self.raw_tab_visible:
+            return
+        now = time.time()
+        if now - self._raw_last_ui_ts < self.raw_ui_interval:
+            return
+        self._raw_last_ui_ts = now
+
+        idx = len(self.raw_rows)
+        self.raw_tree.insert('', 'end', values=self._raw_row_values(row, idx))
+        children = self.raw_tree.get_children()
+        if len(children) > self.raw_maxrows:
+            for item in children[:len(children) - self.raw_maxrows]:
+                self.raw_tree.delete(item)
         if self.raw_autoscroll:
             children = self.raw_tree.get_children()
             if children:
@@ -2202,10 +2256,78 @@ class PeltierControl:
             activeforeground=C['text'])
         self.arch_show_current_chk.pack(side='left', padx=(12, 0))
 
+        atb3 = tk.Frame(cf, bg=C['panel'])
+        atb3.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Label(atb3, text="WYROWNAJ:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        self.arch_align_mode = tk.StringVar(value='none')
+        def _align_btn(text, val):
+            b = tk.Radiobutton(atb3, text=text, variable=self.arch_align_mode, value=val,
+                          command=self._on_align_mode_change, bg=C['panel'], fg=C['dim'],
+                          selectcolor=C['bg2'], font=(FONT, fsz(9)),
+                          activebackground=C['panel'], activeforeground=C['text'],
+                          indicatoron=False, padx=8, pady=3, relief='flat',
+                          bd=1, highlightthickness=0)
+            b.pack(side='left', padx=(0, 4))
+            return b
+        _align_btn("brak (czas od startu)", 'none')
+        self.arch_align_temp_btn = _align_btn("wg temperatury =", 'temp')
+        self.arch_align_cur_btn = _align_btn("wg pradu =", 'current')
+        self.arch_align_entry = tk.Entry(atb3, bg=C['bg2'], fg=C['text'],
+                                        insertbackground=C['text'], relief='flat',
+                                        font=(FONT, fsz(9)), width=10,
+                                        highlightthickness=1, highlightbackground=C['border'])
+        self.arch_align_entry.insert(0, "25.0")
+        self.arch_align_entry.pack(side='left', padx=(2, 2))
+        self.arch_align_entry.bind('<Return>', lambda e: self._redraw_arch())
+        self.arch_align_unit_lbl = tk.Label(atb3, text="°C", bg=C['panel'], fg=C['dim2'],
+                                            font=(FONT, fsz(9)))
+        self.arch_align_unit_lbl.pack(side='left', padx=(0, 4))
+        mk_btn_outline(atb3, "ZASTOSUJ", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
+        self.arch_align_entry.config(state='disabled')
+
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
         self.refresh_arch()
         self._redraw_arch()
+
+    def _on_align_mode_change(self):
+        mode = self.arch_align_mode.get()
+        if mode == 'none':
+            self.arch_align_entry.config(state='disabled')
+        else:
+            self.arch_align_entry.config(state='normal')
+            self.arch_align_unit_lbl.config(text="°C" if mode == 'temp' else "A (mozna np. 50n, 2u, 0.001)")
+        self._redraw_arch()
+
+    def _parse_align_value(self, mode):
+        txt = self.arch_align_entry.get().strip().replace(',', '.')
+        if not txt:
+            return None
+        try:
+            if mode == 'current' and txt and txt[-1] in ('n', 'u', 'µ', 'm', 'p'):
+                mult = {'p': 1e-12, 'n': 1e-9, 'u': 1e-6, 'µ': 1e-6, 'm': 1e-3}[txt[-1]]
+                return float(txt[:-1]) * mult
+            return float(txt)
+        except ValueError:
+            return None
+
+    def _find_threshold_crossing(self, series, target):
+        """Zwraca indeks pierwszego momentu, w ktorym seria (lista wartosci,
+        moze zawierac None) przekracza target - w kierunku wyznaczonym przez
+        pierwsza dostepna probke (rosnaco jesli target > start, malejaco w
+        przeciwnym wypadku). Zwraca None jesli target nigdy nie zostal
+        osiagniety (np. cykl zatrzymal sie wczesniej)."""
+        first = next((v for v in series if v is not None), None)
+        if first is None:
+            return None
+        rising = target >= first
+        for i, v in enumerate(series):
+            if v is None:
+                continue
+            if (rising and v >= target) or (not rising and v <= target):
+                return i
+        return None
 
     def _cycle_display_name(self, path):
         from pathlib import Path as _P
@@ -2486,9 +2608,17 @@ class PeltierControl:
             any_current_data = any_current_data or has_i
             loaded.append((path, t, t1, sp, ki, has_i))
 
-        # checkbox "pokaz prad pod spodem" ma sens tylko w widoku czasowym
+        # checkbox "pokaz prad pod spodem" i wyrownanie maja sens tylko w widoku czasowym
         if hasattr(self, 'arch_show_current_chk'):
             self.arch_show_current_chk.config(state='normal' if mode == 'time' else 'disabled')
+        if hasattr(self, 'arch_align_temp_btn'):
+            align_state = 'normal' if mode == 'time' else 'disabled'
+            self.arch_align_temp_btn.config(state=align_state)
+            self.arch_align_cur_btn.config(state=align_state)
+            if mode != 'time':
+                self.arch_align_entry.config(state='disabled')
+            elif self.arch_align_mode.get() != 'none':
+                self.arch_align_entry.config(state='normal')
 
         if mode == 'iT':
             self._redraw_arch_iT(sel, loaded, forder)
@@ -2518,11 +2648,24 @@ class PeltierControl:
             self.cv_a.draw(); return
 
         hover_series = []
+        align_mode = getattr(self, 'arch_align_mode', None)
+        align_mode = align_mode.get() if align_mode is not None else 'none'
+        align_val = self._parse_align_value(align_mode) if align_mode != 'none' else None
+        align_missed = []  # nazwy cykli ktore nie osiagnely progu - uzyty naturalny start
         for path, t, t1, sp, ki, has_i in loaded:
             ci = forder.get(path,0)%len(self._arch_colors)
             col = self._arch_colors[ci]
-            t0 = t[0]; tx=[x-t0 for x in t]
             nm = self._cycle_display_name(path)
+            t_ref = t[0]
+            if align_mode == 'temp' and align_val is not None:
+                idx = self._find_threshold_crossing(t1, align_val)
+                if idx is not None: t_ref = t[idx]
+                else: align_missed.append(nm)
+            elif align_mode == 'current' and align_val is not None:
+                idx = self._find_threshold_crossing(ki, align_val)
+                if idx is not None: t_ref = t[idx]
+                else: align_missed.append(nm)
+            tx = [x - t_ref for x in t]
             self.ax_a.plot(tx, sp, color=C['orange'], lw=1, ls='--', alpha=0.5)
             self.ax_a.plot(tx, t1, color=col, lw=2, label=nm[:20])
             if ax_i is not None and has_i:
@@ -2532,6 +2675,14 @@ class PeltierControl:
             hover_series.append({'name': nm, 'color': col, 'x': tx, 't': tx,
                                   'temp': t1, 'current': ki, 'sorted': True})
 
+        if align_mode == 'temp' and align_val is not None:
+            xlabel = f"czas wzgledem T={align_val:g}°C [s]"
+        elif align_mode == 'current' and align_val is not None:
+            av, ap = fmt_si(align_val, 2)
+            xlabel = f"czas wzgledem I={av} {ap}A [s]"
+        else:
+            xlabel = "czas [s]"
+
         if ax_i is not None:
             try:
                 from matplotlib.ticker import EngFormatter
@@ -2539,14 +2690,20 @@ class PeltierControl:
             except Exception:
                 pass
             ax_i.set_ylabel('prad Keithley', color=C['dim'], fontsize=9)
-            ax_i.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+            ax_i.set_xlabel(xlabel, color=C['dim'], fontsize=9)
             # ukryj etykiety X gornego wykresu - wspolna os czasu na dole
             self.ax_a.tick_params(labelbottom=False)
         else:
-            self.ax_a.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+            self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
             if show_current and not any_current_data:
                 self.ax_a.text(0.02, 0.02, "brak danych Keithleya w zaznaczonych cyklach",
                                color=C['dim2'], fontsize=8, transform=self.ax_a.transAxes)
+        if align_missed:
+            names = ", ".join(align_missed[:3]) + ("…" if len(align_missed) > 3 else "")
+            self.ax_a.text(0.02, 0.98,
+                           f"⚠ nie osiagnieto progu: {names} (uzyto naturalnego startu)",
+                           color=C['yellow'], fontsize=7, transform=self.ax_a.transAxes,
+                           va='top')
 
         self.ax_a.set_ylabel('temperatura [°C]', color=C['dim'], fontsize=9)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
