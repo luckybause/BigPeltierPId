@@ -7,7 +7,7 @@ Firmware: ItsyBitsy M0 + Cytron MDD10A + 2x MAX31856
 """
 
 import sys, os, time, csv, json, threading, queue, socket, bisect
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -44,6 +44,24 @@ FONT = 'Consolas'
 FS = 1.0
 def fsz(n): return max(6, int(round(n * FS)))
 def px(n): return max(1, int(round(n * FS)))  # skalowanie wymiarow (szerokosci/wysokosci) wg DPI
+
+# ── TWARDE LIMITY SPRZETOWE KEITHLEY 2611B (wg specyfikacji producenta) ──
+# Zrodlo napiecia: max 200V (ciaglo DC, ograniczone termicznie przy wiekszym
+# pradzie - patrz SMU_MAX_POWER). Zrodlo pradu: max 1.5A DC ciagle (10A to
+# TYLKO tryb impulsowy, ktorego ta aplikacja nie uzywa). Min. compliance
+# pradowej wg specyfikacji: 10nA.
+SMU_V_MAX = 200.0      # V - maksymalne napiecie zrodla
+SMU_I_MAX = 1.5         # A - maksymalny prad zrodla (DC ciagly, nie pulse)
+SMU_I_COMPLIANCE_MIN = 10e-9   # A - minimalna sensowna compliance wg specyfikacji
+SMU_MAX_POWER = 30.3    # W - maksymalna moc na kanal (V*I nie moze przekroczyc)
+
+# ── Zakresy sterownika Peltiera (zgodne z limitami firmware SP_MIN/SP_MAX/
+# RAMP_MIN/RAMP_MAX) - uzywane do walidacji krokow PROGRAMATORA po stronie PC,
+# zanim cokolwiek zostanie wyslane do urzadzenia. ──
+SP_MIN_UI = -15.0
+SP_MAX_UI = 100.0
+RAMP_MIN_UI = 0.5
+RAMP_MAX_UI = 80.0
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -211,8 +229,8 @@ class KeithleyClient:
         usb_resources = [r for r in resources if r.startswith('USB')]
         if not usb_resources:
             raise ConnectionError(
-                "Nie znaleziono urzadzenia USB. Sprawdz czy Keithley jest podlaczony "
-                "kablem USB i czy sterownik WinUSB jest zainstalowany (Zadig)."
+                "No USB device found. Check that the Keithley is connected "
+                "via USB cable and that the WinUSB driver is installed (Zadig)."
             )
         return usb_resources[0]
 
@@ -441,10 +459,23 @@ class PeltierControl:
         self.last_setpoint_target = None
 
         self.chart_paused = False
+
+        # ── PROGRAMATOR: sekwencja krokow grzej/trzymaj/schlodz/trzymaj ──
+        self.program_steps = []       # lista dict: {'target':C, 'ramp':C/min lub None, 'hold_min':min}
+        self.program_running = False
+        self.program_state = 'idle'   # 'idle' | 'ramping' | 'holding' | 'done'
+        self.program_step_idx = 0
+        self.program_step_sent = False
+        self.program_stable_since = None
+        self.program_hold_start = None
+        self.program_tolerance = 0.5      # C - tolerancja uznania ze cel osiagniety
+        self.program_stable_needed_s = 5  # s - jak dlugo w tolerancji zanim zaczniemy hold
         self.chart_window = 0
 
         self.log_dir = Path.home() / "BigPeltierPidLogi"
         self.log_dir.mkdir(exist_ok=True)
+        self.programs_dir = self.log_dir / "programy"
+        self.programs_dir.mkdir(exist_ok=True)
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         self.cyc_t0 = None; self.cyc_fn = None; self.cyc_rows = 0
         self.cyc_write_errors = 0
@@ -514,7 +545,7 @@ class PeltierControl:
 
     def disconnect(self):
         self.running = False
-        if self.cyc_on: self.cyc_stop("Rozlaczono")
+        if self.cyc_on: self.cyc_stop("Disconnected")
         with self._lock:
             if self.ser:
                 try: self.ser.close()
@@ -583,6 +614,7 @@ class PeltierControl:
             if 'KFFH' in d: out['kffh'] = float(d['KFFH'])
             if 'KFFR' in d: out['kffr'] = float(d['KFFR'])
             if 'OFFSET' in d: out['offset'] = float(d['OFFSET'])
+            if 'OPPDIR' in d: out['oppdir'] = (d['OPPDIR'].strip() == '1')
             if 'FAN' in d:
                 fv = float(d['FAN'])
                 self.fan_on = fv > 0
@@ -620,7 +652,7 @@ class PeltierControl:
                     time.sleep(0.02)
             except serial.SerialException:
                 self.running = False
-                self.root.after(0, lambda: self.set_status(False, "Utracono polaczenie"))
+                self.root.after(0, lambda: self.set_status(False, "Connection lost"))
                 break
             except Exception as e:
                 if self.running: print(f"reader err: {e}")
@@ -648,6 +680,7 @@ class PeltierControl:
         nb = ttk.Notebook(self.root)
         nb.pack(fill='both', expand=True)
         t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
+        t7 = tk.Frame(nb, bg=C['bg']); nb.add(t7, text='PROGRAM')
         t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
         t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='RAW DATA')
         t6 = tk.Frame(nb, bg=C['bg']); nb.add(t6, text='KEITHLEY')
@@ -658,6 +691,7 @@ class PeltierControl:
         self.raw_tab_visible = False
         nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
         self.build_live(t1)
+        self.build_program(t7)
         self.build_advanced(t2)
         self.build_raw(t5)
         self.build_keithley_tab(t6)
@@ -791,6 +825,31 @@ class PeltierControl:
         self.ax2 = self.fig.add_subplot(gs[1], sharex=self.ax1)
         for ax in [self.ax1, self.ax2]:
             ax.set_facecolor(C['panel2'])
+            ax.tick_params(colors=C['dim'], labelsize=8, length=0)
+            ax.grid(True, axis='y', alpha=0.35, color=C['grid'])
+            for s in ['top', 'right']: ax.spines[s].set_visible(False)
+            for s in ['left', 'bottom']: ax.spines[s].set_color(C['border'])
+
+        # ── Obiekty linii tworzone RAZ, aktualizowane pozniej przez set_data() ──
+        # (zamiast ax.clear()+replot co 250ms - to bylo bardzo kosztowne i
+        # dodatkowo kasowalo kazde przyblizenie/przesuniecie uzytkownika, bo
+        # clear() zawsze resetuje granice osi do autoscale)
+        self.ln_target, = self.ax1.plot([], [], color=C['orange'], lw=1.3, ls='--',
+                                         label='target', alpha=0.7)
+        self.ln_spa, = self.ax1.plot([], [], color=C['cyan'], lw=1.5, ls=':',
+                                      label='setpoint (ramp)')
+        self.ln_t1, = self.ax1.plot([], [], color=C['blue'], lw=2.2, label='T1')
+        self.ln_t2, = self.ax1.plot([], [], color=C['purple'], lw=1.3, ls='--',
+                                     label='T2', alpha=0.6)
+        self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
+        self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
+                        labelcolor=C['dim'], fontsize=8, loc='upper right')
+
+        self.ln_pwm, = self.ax2.plot([], [], color=C['green'], lw=1.5)
+        self.pwm_fill = None  # PolyCollection z fill_between - przebudowywany osobno
+        self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
+        self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
+        self.ax2.set_ylim(-5, 105)
 
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
         self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
@@ -835,7 +894,7 @@ class PeltierControl:
 
         hd = tk.Frame(wrap, bg=C['panel'])
         hd.pack(fill='x', padx=14, pady=(8, 2))
-        tk.Label(hd, text="WYKRES KEITHLEY", bg=C['panel'], fg=C['dim'],
+        tk.Label(hd, text="KEITHLEY CHART", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(side='left')
         self.sweep_mini_status_lbl = tk.Label(hd, text="--", bg=C['panel'], fg=C['dim2'],
                                               font=(FONT, fsz(8)))
@@ -857,8 +916,10 @@ class PeltierControl:
 
     def _live_toolbar_busy(self):
         """True gdy w toolbarze matplotliba aktywny jest tryb ZOOM lub PAN -
-        wtedy wstrzymujemy auto-odswiezanie, zeby przyblizenie nie znikalo.
-        Wylaczenie narzedzia (ponowne klikniecie lupy) wznawia live."""
+        wtedy wstrzymujemy TYLKO autoscale (dopasowanie osi), zeby recznie
+        ustawione przyblizenie nie znikalo. Dane nadal splywaja na biezaco
+        (set_data), wiec po wylaczeniu narzedzia widok od razu dogoni najnowsze
+        probki bez utraty ciaglosci."""
         tb = getattr(self, 'mpl_toolbar', None)
         if tb is None:
             return False
@@ -866,8 +927,8 @@ class PeltierControl:
         busy = bool(mode) and str(mode) != ''
         # wizualna informacja na przycisku pauzy
         if hasattr(self, 'btn_pause') and not self.chart_paused:
-            if busy and self.btn_pause['text'] != "🔍 ZOOM (live wstrzymane)":
-                self.btn_pause.config(text="🔍 ZOOM (live wstrzymane)", fg=C['cyan'],
+            if busy and self.btn_pause['text'] != "🔍 ZOOM (widok zablokowany)":
+                self.btn_pause.config(text="🔍 ZOOM (widok zablokowany)", fg=C['cyan'],
                                       highlightbackground=C['cyan'])
             elif not busy and self.btn_pause['text'] != "⏸ PAUSE":
                 self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'],
@@ -942,7 +1003,7 @@ class PeltierControl:
         auto_lbl = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                             highlightbackground=C['green'])
         auto_lbl.pack(fill='x', pady=(0, 10))
-        tk.Label(auto_lbl, text="AUTO: kierunek wg setpointu", bg=C['bg2'],
+        tk.Label(auto_lbl, text="AUTO: direction based on setpoint", bg=C['bg2'],
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
         tk.Label(inner, text="▶ START uses panel values",
@@ -951,6 +1012,357 @@ class PeltierControl:
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
 
         self._set_panel_enabled(False)
+
+    # ════════════════════════════════════════════════════════════
+    #  PROGRAMATOR: sekwencja krokow grzej->trzymaj->schlodz->trzymaj
+    # ════════════════════════════════════════════════════════════
+    def build_program(self, parent):
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=16, pady=12)
+
+        tk.Label(wrap, text="PROGRAMMER", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(wrap, text="Step sequence: heat/cool to target, hold for a set time, repeat.",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 14))
+
+        body = tk.Frame(wrap, bg=C['bg'])
+        body.pack(fill='both', expand=True)
+
+        # ── LEWY PANEL: formularz dodawania kroku ──
+        left = tk.Frame(body, bg=C['panel'], width=px(280))
+        left.pack(side='left', fill='y', padx=(0, 12))
+        left.pack_propagate(False)
+        tk.Frame(left, bg=C['cyan'], height=3).pack(fill='x')
+        linner = tk.Frame(left, bg=C['panel'])
+        linner.pack(fill='both', expand=True, padx=14, pady=14)
+
+        tk.Label(linner, text="NEW STEP", bg=C['panel'], fg=C['text'],
+                 font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 10))
+
+        def _pfield(label, default, unit=""):
+            row = tk.Frame(linner, bg=C['panel'])
+            row.pack(fill='x', pady=4)
+            tk.Label(row, text=label, bg=C['panel'], fg=C['dim'],
+                     font=(FONT, fsz(9))).pack(anchor='w')
+            r2 = tk.Frame(row, bg=C['panel'])
+            r2.pack(fill='x', pady=(2, 0))
+            e = tk.Entry(r2, bg=C['bg2'], fg=C['text'], insertbackground=C['text'],
+                        relief='flat', font=(FONT, fsz(10)),
+                        highlightthickness=1, highlightbackground=C['border'])
+            e.insert(0, str(default))
+            e.pack(side='left', fill='x', expand=True, ipady=4)
+            if unit:
+                tk.Label(r2, text=unit, bg=C['panel'], fg=C['dim2'],
+                        font=(FONT, fsz(9))).pack(side='left', padx=(6, 0))
+            return e
+
+        self.prog_target_entry = _pfield("TARGET (temperature)", "25.0", "°C")
+
+        ramp_row = tk.Frame(linner, bg=C['panel'])
+        ramp_row.pack(fill='x', pady=(8, 0))
+        self.prog_use_global_ramp = tk.BooleanVar(value=True)
+        tk.Checkbutton(ramp_row, text="use global ramp rate (CONTROL)",
+                      variable=self.prog_use_global_ramp,
+                      command=lambda: self.prog_ramp_entry.config(
+                          state='disabled' if self.prog_use_global_ramp.get() else 'normal'),
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      font=(FONT, fsz(8)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(anchor='w')
+        self.prog_ramp_entry = _pfield("RAMP (custom, optional)", "2.0", "°C/min")
+        self.prog_ramp_entry.config(state='disabled')
+
+        self.prog_hold_entry = _pfield("HOLD FOR", "10.0", "min")
+
+        mk_btn(linner, "+ ADD STEP", self.add_program_step, C['cyan']).pack(fill='x', pady=(14, 0))
+
+        tk.Frame(linner, bg=C['border'], height=1).pack(fill='x', pady=14)
+
+        tk.Label(linner, text="PROGRAM FILE", bg=C['panel'], fg=C['text'],
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 8))
+        mk_btn_outline(linner, "💾 SAVE PROGRAM", self.save_program, C['green']).pack(fill='x', pady=2)
+        mk_btn_outline(linner, "📂 LOAD PROGRAM", self.load_program, C['orange']).pack(fill='x', pady=2)
+        mk_btn_outline(linner, "🗑 CLEAR ALL", self.clear_program, C['red']).pack(fill='x', pady=2)
+
+        # ── PRAWA STRONA: lista krokow + sterowanie ──
+        right = tk.Frame(body, bg=C['bg'])
+        right.pack(side='left', fill='both', expand=True)
+
+        listwrap = tk.Frame(right, bg=C['panel'])
+        listwrap.pack(fill='both', expand=True)
+        tk.Frame(listwrap, bg=C['cyan'], height=3).pack(fill='x')
+        lcanvas = tk.Canvas(listwrap, bg=C['panel'], highlightthickness=0)
+        lsb = tk.Scrollbar(listwrap, orient='vertical', command=lcanvas.yview)
+        lcanvas.configure(yscrollcommand=lsb.set)
+        lsb.pack(side='right', fill='y')
+        lcanvas.pack(side='left', fill='both', expand=True)
+        self.prog_list_inner = tk.Frame(lcanvas, bg=C['panel'])
+        prog_list_id = lcanvas.create_window((0, 0), window=self.prog_list_inner, anchor='nw')
+        self.prog_list_inner.bind('<Configure>',
+            lambda e: lcanvas.configure(scrollregion=lcanvas.bbox('all')))
+        lcanvas.bind('<Configure>', lambda e: lcanvas.itemconfig(prog_list_id, width=e.width))
+        lcanvas.bind('<Enter>', lambda e: lcanvas.bind_all('<MouseWheel>',
+                     lambda ev: lcanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        lcanvas.bind('<Leave>', lambda e: lcanvas.unbind_all('<MouseWheel>'))
+
+        # ── Pasek statusu + sterowanie wykonaniem ──
+        ctrl = tk.Frame(right, bg=C['panel'])
+        ctrl.pack(fill='x', pady=(10, 0))
+        cinner = tk.Frame(ctrl, bg=C['panel'])
+        cinner.pack(fill='x', padx=14, pady=12)
+
+        self.prog_status_lbl = tk.Label(cinner, text="No active program.",
+                                        bg=C['panel'], fg=C['dim'], font=(FONT, fsz(10), 'bold'))
+        self.prog_status_lbl.pack(anchor='w')
+        self.prog_detail_lbl = tk.Label(cinner, text="", bg=C['panel'], fg=C['dim2'],
+                                        font=(FONT, fsz(9)))
+        self.prog_detail_lbl.pack(anchor='w', pady=(2, 10))
+
+        btnrow = tk.Frame(cinner, bg=C['panel'])
+        btnrow.pack(fill='x')
+        self.btn_prog_start = tk.Button(btnrow, text="▶ START PROGRAM", command=self.start_program,
+                                        bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(10), 'bold'),
+                                        relief='flat', cursor='hand2', bd=0, padx=14, pady=8,
+                                        activebackground=_lighten(C['green'], 0.15))
+        self.btn_prog_start.pack(side='left', padx=(0, 8))
+        self.btn_prog_stop = tk.Button(btnrow, text="■ STOP PROGRAM", command=self.stop_program,
+                                       bg=C['bg2'], fg=C['red'], font=(FONT, fsz(10), 'bold'),
+                                       relief='flat', cursor='hand2', bd=0, padx=14, pady=8,
+                                       state='disabled', activebackground=C['panel3'])
+        self.btn_prog_stop.pack(side='left')
+
+        self._refresh_program_list()
+
+    def _fmt_mmss(self, seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds//60:02d}:{seconds%60:02d}"
+
+    def _refresh_program_list(self):
+        for w in self.prog_list_inner.winfo_children():
+            w.destroy()
+        if not self.program_steps:
+            tk.Label(self.prog_list_inner, text="No steps yet - add the first step on the left.",
+                     bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(9))).pack(anchor='w', padx=12, pady=12)
+            return
+        for i, step in enumerate(self.program_steps):
+            active = self.program_running and i == self.program_step_idx
+            row_bg = C['bg2'] if active else C['panel']
+            row = tk.Frame(self.prog_list_inner, bg=row_bg,
+                          highlightthickness=1 if active else 0,
+                          highlightbackground=C['cyan'])
+            row.pack(fill='x', padx=8, pady=3)
+
+            marker = "▶ " if active else ""
+            ramp_txt = f"{step['ramp']:.1f}°C/min" if step['ramp'] is not None else "global ramp"
+            txt = (f"{marker}STEP {i+1}: → {step['target']:.1f}°C  "
+                   f"({ramp_txt})  •  hold {step['hold_min']:.1f} min")
+            tk.Label(row, text=txt, bg=row_bg,
+                    fg=C['cyan'] if active else C['text'],
+                    font=(FONT, fsz(9), 'bold' if active else 'normal')
+                    ).pack(side='left', padx=10, pady=8, fill='x', expand=True)
+
+            btns = tk.Frame(row, bg=row_bg)
+            btns.pack(side='right', padx=6)
+            for txt_b, cmd in [("↑", lambda i=i: self._move_program_step(i, -1)),
+                                ("↓", lambda i=i: self._move_program_step(i, 1)),
+                                ("✕", lambda i=i: self._delete_program_step(i))]:
+                tk.Button(btns, text=txt_b, command=cmd, bg=row_bg,
+                         fg=C['dim'] if txt_b != "✕" else C['red'],
+                         font=(FONT, fsz(9), 'bold'), relief='flat', cursor='hand2',
+                         bd=0, padx=6, activebackground=C['panel3']).pack(side='left')
+
+    def add_program_step(self):
+        try:
+            target = float(self.prog_target_entry.get().replace(',', '.'))
+            hold_min = float(self.prog_hold_entry.get().replace(',', '.'))
+        except ValueError:
+            messagebox.showerror("Error", "Check the numeric values (TARGET, HOLD FOR).")
+            return
+        if not (SP_MIN_UI <= target <= SP_MAX_UI):
+            messagebox.showerror("Error", f"TARGET is out of controller range ({SP_MIN_UI:g}..{SP_MAX_UI:g}°C).")
+            return
+        if hold_min < 0:
+            messagebox.showerror("Error", "Hold time cannot be negative.")
+            return
+        ramp = None
+        if not self.prog_use_global_ramp.get():
+            try:
+                ramp = float(self.prog_ramp_entry.get().replace(',', '.'))
+            except ValueError:
+                messagebox.showerror("Error", "Check the RAMP value.")
+                return
+            if not (RAMP_MIN_UI <= ramp <= RAMP_MAX_UI):
+                messagebox.showerror("Error", f"RAMP is out of controller range ({RAMP_MIN_UI:g}..{RAMP_MAX_UI:g}°C/min).")
+                return
+        self.program_steps.append({'target': target, 'ramp': ramp, 'hold_min': hold_min})
+        self._refresh_program_list()
+
+    def _delete_program_step(self, idx):
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before editing the step list.")
+            return
+        if 0 <= idx < len(self.program_steps):
+            del self.program_steps[idx]
+            self._refresh_program_list()
+
+    def _move_program_step(self, idx, direction):
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before editing the step list.")
+            return
+        j = idx + direction
+        if 0 <= idx < len(self.program_steps) and 0 <= j < len(self.program_steps):
+            self.program_steps[idx], self.program_steps[j] = self.program_steps[j], self.program_steps[idx]
+            self._refresh_program_list()
+
+    def clear_program(self):
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before clearing the list.")
+            return
+        if self.program_steps and not messagebox.askyesno("Confirm", "Delete all program steps?"):
+            return
+        self.program_steps = []
+        self._refresh_program_list()
+
+    def save_program(self):
+        if not self.program_steps:
+            messagebox.showinfo("No steps", "Add at least one step before saving.")
+            return
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(
+            title="Save program", defaultextension=".json",
+            initialdir=str(self.programs_dir), filetypes=[("Program JSON", "*.json")])
+        if not dest:
+            return
+        try:
+            with open(dest, 'w', encoding='utf-8') as f:
+                json.dump({'steps': self.program_steps}, f, indent=2, ensure_ascii=False)
+            messagebox.showinfo("Saved", f"Program saved to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+
+    def load_program(self):
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before loading another one.")
+            return
+        from tkinter import filedialog
+        src = filedialog.askopenfilename(
+            title="Load program", initialdir=str(self.programs_dir),
+            filetypes=[("Program JSON", "*.json")])
+        if not src:
+            return
+        try:
+            with open(src, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            steps = data.get('steps', [])
+            # walidacja podstawowa - odrzuc plik jesli struktura jest nie taka jak oczekiwana
+            clean = []
+            for s in steps:
+                clean.append({'target': float(s['target']),
+                              'ramp': (float(s['ramp']) if s.get('ramp') is not None else None),
+                              'hold_min': float(s['hold_min'])})
+            self.program_steps = clean
+            self._refresh_program_list()
+            messagebox.showinfo("Loaded", f"Loaded {len(clean)} steps from:\n{src}")
+        except Exception as e:
+            messagebox.showerror("Load error", f"Could not load the program:\n{e}")
+
+    def start_program(self):
+        if not self.program_steps:
+            messagebox.showinfo("No steps", "Add at least one step before starting.")
+            return
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        self.program_running = True
+        self.program_state = 'ramping'
+        self.program_step_idx = 0
+        self.program_step_sent = False
+        self.program_stable_since = None
+        self.program_hold_start = None
+        self.btn_prog_start.config(state='disabled')
+        self.btn_prog_stop.config(state='normal')
+        if not self.is_running:
+            self.do_start()
+        self._refresh_program_list()
+
+    def stop_program(self):
+        self.program_running = False
+        self.program_state = 'idle'
+        self.btn_prog_start.config(state='normal')
+        self.btn_prog_stop.config(state='disabled')
+        self.prog_status_lbl.config(text="Program stopped.", fg=C['dim'])
+        self.prog_detail_lbl.config(text="")
+        self._refresh_program_list()
+
+    def _program_tick(self, current_temp):
+        """Maszyna stanow programatora - wywolywana co kazdy tick() (250ms) gdy
+        aktywny jest program. current_temp - biezaca temperatura T1 (moze byc
+        None jesli jeszcze brak danych)."""
+        if not self.program_running or current_temp is None:
+            return
+        if self.program_step_idx >= len(self.program_steps):
+            self.program_running = False
+            self.program_state = 'done'
+            self.btn_prog_start.config(state='normal')
+            self.btn_prog_stop.config(state='disabled')
+            self.prog_status_lbl.config(text="✓ Program complete.", fg=C['green'])
+            self.prog_detail_lbl.config(text=f"Completed {len(self.program_steps)} steps.")
+            self._refresh_program_list()
+            return
+
+        step = self.program_steps[self.program_step_idx]
+
+        if self.program_state == 'ramping':
+            if not self.program_step_sent:
+                ramp = step['ramp'] if step['ramp'] is not None else self.sl_ru.get()
+                self.send(f"SP:{step['target']:.2f}")
+                self.send(f"RU:{ramp:.2f}")
+                self.send(f"RD:{ramp:.2f}")
+                self.program_step_sent = True
+                self.program_stable_since = None
+
+            within_tol = abs(current_temp - step['target']) <= self.program_tolerance
+            if within_tol:
+                if self.program_stable_since is None:
+                    self.program_stable_since = time.time()
+                elif time.time() - self.program_stable_since >= self.program_stable_needed_s:
+                    self.program_state = 'holding'
+                    self.program_hold_start = time.time()
+            else:
+                self.program_stable_since = None
+
+            self.prog_status_lbl.config(
+                text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
+                     f"approaching {step['target']:.1f}°C", fg=C['cyan'])
+            self.prog_detail_lbl.config(
+                text=f"Current temperature: {current_temp:.2f}°C "
+                     f"(tolerance ±{self.program_tolerance:g}°C)")
+
+        elif self.program_state == 'holding':
+            elapsed = time.time() - self.program_hold_start
+            remaining = step['hold_min'] * 60.0 - elapsed
+            self.prog_status_lbl.config(
+                text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
+                     f"holding at {step['target']:.1f}°C", fg=C['green'])
+            self.prog_detail_lbl.config(
+                text=f"Remaining: {self._fmt_mmss(remaining)} / {self._fmt_mmss(step['hold_min']*60)}")
+            if remaining <= 0:
+                self.program_step_idx += 1
+                if self.program_step_idx >= len(self.program_steps):
+                    # to byl ostatni krok - zakoncz program od razu, bez
+                    # czekania na kolejny tick (ktory i tak by to wykryl na
+                    # starcie funkcji, ale to niepotrzebne opoznienie o 250ms
+                    # i dodatkowy, mylacy stan posredni)
+                    self.program_running = False
+                    self.program_state = 'done'
+                    self.btn_prog_start.config(state='normal')
+                    self.btn_prog_stop.config(state='disabled')
+                    self.prog_status_lbl.config(text="✓ Program complete.", fg=C['green'])
+                    self.prog_detail_lbl.config(text=f"Completed {len(self.program_steps)} steps.")
+                else:
+                    self.program_state = 'ramping'
+                    self.program_step_sent = False
+                    self.program_stable_since = None
+                self._refresh_program_list()
 
     def build_advanced(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
@@ -987,7 +1399,7 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
 
         sec2 = self._adv_section(inner, "FEED-FORWARD", C['yellow'])
-        tk.Label(sec2, text="HOLD = moc bazowa na utrzymanie temp\nRAMP = dodatkowa moc na dynamike rampy",
+        tk.Label(sec2, text="HOLD = base power to maintain temperature\nRAMP = extra power for ramp dynamics",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left').pack(anchor='w', pady=(0, 8))
         self.sl_kffh = SliderField(sec2, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/10°C", 2,
@@ -1000,8 +1412,53 @@ class PeltierControl:
                                   C['purple'], "°C", 1,
                                   on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
 
+        sec_dir = self._adv_section(inner, "HEATING / COOLING DIRECTION", C['green'])
+        tk.Label(sec_dir,
+                 text="OFF (default): hard direction lock - when the target is\n"
+                      "below the current temperature, the PID can ONLY cool\n"
+                      "(PWM never goes toward heating, even briefly), and\n"
+                      "vice versa for heating. Fewer direction switches = less\n"
+                      "noise on a sensitive measurement, but on overshoot the\n"
+                      "system can only drop to PWM=0 and wait for the temperature\n"
+                      "to settle on its own - seen as a slow \"drift\" from target.\n\n"
+                      "ON: the PID can use the opposite direction as a brake on\n"
+                      "overshoot (e.g. a brief heat pulse right after cooling\n"
+                      "ends, if the temperature dropped too far) - faster and\n"
+                      "more accurate correction near target, at the cost of\n"
+                      "possible extra direction switches (and related noise).",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=480).pack(anchor='w', pady=(0, 10))
+        self.oppdir_var = tk.BooleanVar(value=False)
+        dir_row = tk.Frame(sec_dir, bg=C['bg2'])
+        dir_row.pack(fill='x')
+        self.btn_oppdir_off = tk.Button(dir_row, text="OFF (lock)",
+                                        command=lambda: self._set_oppdir(False),
+                                        bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
+                                        relief='flat', cursor='hand2', bd=0, padx=4, pady=8)
+        self.btn_oppdir_off.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        self.btn_oppdir_on = tk.Button(dir_row, text="ON (brake)",
+                                       command=lambda: self._set_oppdir(True),
+                                       bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                       relief='flat', cursor='hand2', bd=0, padx=4, pady=8)
+        self.btn_oppdir_on.pack(side='left', fill='x', expand=True)
+
         sec4 = self._adv_section(inner, "RESET", C['red'])
         mk_btn_outline(sec4, "↺ RESET PID GAINS", self.do_reset, C['red']).pack(fill='x')
+
+    def _set_oppdir(self, enabled, send=True):
+        """Przelacza tryb hamowania przeciwnym kierunkiem (firmware: OPPDIR).
+        Wysylane od razu (dziala tez w trakcie pracy PID, nie tylko przy STARCIE).
+        send=False uzywane przy synchronizacji stanu odczytanego z firmware
+        (CFG), zeby nie odsylac komendy z powrotem do urzadzenia bez potrzeby."""
+        self.oppdir_var.set(enabled)
+        if send:
+            self.send(f"OPPDIR:{1 if enabled else 0}")
+        if enabled:
+            self.btn_oppdir_on.config(bg=C['green'], fg='#1a1c1f')
+            self.btn_oppdir_off.config(bg=C['bg2'], fg=C['dim'])
+        else:
+            self.btn_oppdir_off.config(bg=C['green'], fg='#1a1c1f')
+            self.btn_oppdir_on.config(bg=C['bg2'], fg=C['dim'])
 
     def _adv_section(self, parent, title, color):
         tk.Frame(parent, bg=color, height=2).pack(fill='x', pady=(12, 0))
@@ -1056,6 +1513,7 @@ class PeltierControl:
         self.send(f"KFFH:{self.sl_kffh.get():.2f}")
         self.send(f"KFFR:{self.sl_kffr.get():.2f}")
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
+        self.send(f"OPPDIR:{1 if self.oppdir_var.get() else 0}")
         time.sleep(0.05)
         self.send("START")
         self._update_run_button(True)
@@ -1119,7 +1577,7 @@ class PeltierControl:
         hd.pack(fill='x', pady=(0, 10))
         tk.Label(hd, text="RAW THERMOCOUPLE DATA", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
-        tk.Label(hd, text="  surowy strumien T1/T2 z urzadzenia, 10 Hz",
+        tk.Label(hd, text="  raw T1/T2 stream from the device, 10 Hz",
                  bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
 
         self.btn_raw_pause = tk.Button(hd, text="⏸ PAUSE", command=self._toggle_raw_pause,
@@ -1129,9 +1587,9 @@ class PeltierControl:
                                        activebackground=C['panel3'])
         self.btn_raw_pause.pack(side='right', padx=(6, 0))
         mk_btn_outline(hd, "⤓ EXPORT CSV", self.export_raw_csv, C['green']).pack(side='right', padx=(6, 0))
-        mk_btn_outline(hd, "WYCZYSC", self.clear_raw, C['dim']).pack(side='right', padx=(6, 0))
+        mk_btn_outline(hd, "CLEAR", self.clear_raw, C['dim']).pack(side='right', padx=(6, 0))
 
-        self.raw_count_lbl = tk.Label(hd, text="0 probek", bg=C['bg'], fg=C['dim'],
+        self.raw_count_lbl = tk.Label(hd, text="0 samples", bg=C['bg'], fg=C['dim'],
                                       font=(FONT, fsz(9)))
         self.raw_count_lbl.pack(side='right', padx=(6, 12))
 
@@ -1142,10 +1600,10 @@ class PeltierControl:
 
         cols = ('idx', 'czas_fw', 'pc_time', 't1', 't2', 'sp', 'spa', 'pct', 'fan', 'dir', 'k_i', 'k_v', 'state')
         headers = {
-            'idx': '#', 'czas_fw': 'czas FW [s]', 'pc_time': 'czas PC',
-            't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP cel [C]',
-            'spa': 'SP akt [C]', 'pct': 'Peltier %', 'fan': 'Fan %', 'dir': 'Kierunek',
-            'k_i': 'I Keithley', 'k_v': 'V Keithley', 'state': 'stan'
+            'idx': '#', 'czas_fw': 'FW time [s]', 'pc_time': 'PC time',
+            't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP target [C]',
+            'spa': 'SP active [C]', 'pct': 'Peltier %', 'fan': 'Fan %', 'dir': 'Direction',
+            'k_i': 'I Keithley', 'k_v': 'V Keithley', 'state': 'state'
         }
         widths = {
             'idx': 50, 'czas_fw': 90, 'pc_time': 110, 't1': 80, 't2': 80,
@@ -1181,9 +1639,9 @@ class PeltierControl:
         self.raw_tree.bind('<Button-4>', lambda e: setattr(self, 'raw_autoscroll', False))
         self.raw_tree.bind('<Button-5>', lambda e: setattr(self, 'raw_autoscroll', False))
 
-        info = tk.Label(wrap, text="Tabela aktualizuje sie tylko gdy ta zakladka jest otwarta (max 5x/s) - dlatego nie "
-                        "obciaza programu w tle. Bufor (max 2000 probek) zbiera dane zawsze, wiec EXPORT CSV "
-                        "dziala niezaleznie. Pelny zapis surowych danych od START do STOP jest w zakladce ARCHIVE.",
+        info = tk.Label(wrap, text="The table only updates while this tab is open (max 5x/s) - so it doesn't "
+                        "load the program in the background. The buffer (max 2000 samples) always collects data, so EXPORT CSV "
+                        "works independently. The full raw record from START to STOP is in the ARCHIVE tab.",
                         bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), wraplength=900, justify='left')
         info.pack(anchor='w', pady=(8, 0))
 
@@ -1200,7 +1658,7 @@ class PeltierControl:
             for item in self.raw_tree.get_children():
                 self.raw_tree.delete(item)
         if hasattr(self, 'raw_count_lbl'):
-            self.raw_count_lbl.config(text="0 probek")
+            self.raw_count_lbl.config(text="0 samples")
 
     def _raw_row_values(self, row, idx):
         """Formatuje jeden wiersz (krotke danych) na wartosci wyswietlane w Treeview."""
@@ -1236,7 +1694,7 @@ class PeltierControl:
             if children:
                 self.raw_tree.see(children[-1])
         if hasattr(self, 'raw_count_lbl'):
-            self.raw_count_lbl.config(text=f"{len(self.raw_rows)} probek")
+            self.raw_count_lbl.config(text=f"{len(self.raw_rows)} samples")
         self._raw_last_ui_ts = time.time()
 
     def _raw_append(self, row):
@@ -1272,15 +1730,15 @@ class PeltierControl:
             children = self.raw_tree.get_children()
             if children:
                 self.raw_tree.see(children[-1])
-        self.raw_count_lbl.config(text=f"{len(self.raw_rows)} probek")
+        self.raw_count_lbl.config(text=f"{len(self.raw_rows)} samples")
 
     def export_raw_csv(self):
         if not self.raw_rows:
-            messagebox.showinfo("Brak danych", "Brak danych do eksportu.")
+            messagebox.showinfo("No data", "No data to export.")
             return
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(
-            title="Eksportuj surowe dane", defaultextension=".csv",
+            title="Export raw data", defaultextension=".csv",
             initialfile=f"raw_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             filetypes=[("CSV", "*.csv")])
         if not dest:
@@ -1288,10 +1746,10 @@ class PeltierControl:
         try:
             with open(dest, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
-                w.writerow(['czas_firmware_s', 'timestamp_pc', 'temperatura1_C',
-                           'temperatura2_C', 'setpoint_cel_C', 'setpoint_aktywny_C',
-                           'peltier_pct', 'fan_pct', 'kierunek', 'keithley_prad_A',
-                           'keithley_napiecie_V', 'stan'])
+                w.writerow(['firmware_time_s', 'timestamp_pc', 'temperature1_C',
+                           'temperature2_C', 'setpoint_target_C', 'setpoint_active_C',
+                           'peltier_pct', 'fan_pct', 'direction', 'keithley_current_A',
+                           'keithley_voltage_V', 'state'])
                 for row in self.raw_rows:
                     czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
                     spas = "" if state == "MAN" else f"{spa:.3f}"
@@ -1305,9 +1763,9 @@ class PeltierControl:
                         f"{k_v:.9e}" if k_v is not None else "",
                         state
                     ])
-            messagebox.showinfo("Zapisano", f"Wyeksportowano {len(self.raw_rows)} probek do:\n{dest}")
+            messagebox.showinfo("Saved", f"Exported {len(self.raw_rows)} samples to:\n{dest}")
         except Exception as e:
-            messagebox.showerror("Blad eksportu", str(e))
+            messagebox.showerror("Export error", str(e))
 
     # ─── ZAKLADKA KEITHLEY (SWEEP V/I) ───────────────────
     def build_keithley_tab(self, parent):
@@ -1342,23 +1800,46 @@ class PeltierControl:
 
         tk.Label(linner, text="SWEEP V/I", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w', pady=(0, 4))
-        tk.Label(linner, text="Krokowe przemiatanie napiecia lub pradu\nz pomiarem i wykresem I-V",
+        tk.Label(linner, text="Step sweep of voltage or current\nwith measurement and I-V chart",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 wraplength=250, justify='left').pack(anchor='w', pady=(0, 14))
+                 wraplength=250, justify='left').pack(anchor='w', pady=(0, 8))
+
+        units_box = tk.Frame(linner, bg=C['bg2'], highlightthickness=1,
+                             highlightbackground=C['border'])
+        units_box.pack(fill='x', pady=(0, 14))
+        tk.Label(units_box, text="UNITS AND LIMITS (Keithley 2611B)",
+                 bg=C['bg2'], fg=C['orange'], font=(FONT, fsz(8), 'bold'),
+                 wraplength=250, justify='left').pack(anchor='w', padx=8, pady=(6, 2))
+        tk.Label(units_box,
+                 text="VALUE/START/STOP: V (volts) or A (amps),\n"
+                      "depends on MODE. LIMIT: opposite unit -\n"
+                      "compliance (with a V source it limits current in A,\n"
+                      "with an I source it limits voltage in V).\n"
+                      "SETTLE TIME / INTERVAL: ms. NPLC: power line\n"
+                      "cycles (no unit, 1.0=20ms\n"
+                      "at 50Hz). AVERAGING: number of samples (x).\n"
+                      "Measurement results: A and V, with SI prefix (n/µ/m).\n\n"
+                      f"Hard hardware limits: voltage up to ±{SMU_V_MAX:g}V,\n"
+                      f"current up to ±{SMU_I_MAX:g}A (DC continuous, not pulse),\n"
+                      f"power up to {SMU_MAX_POWER:g}W/channel, min. compliance\n"
+                      f"current {SMU_I_COMPLIANCE_MIN*1e9:g}nA. The program checks\n"
+                      "this automatically before starting a sweep/measurement.",
+                 bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(8)),
+                 wraplength=250, justify='left').pack(anchor='w', padx=8, pady=(0, 8))
 
         # Wybor trybu
         mode_row = tk.Frame(linner, bg=C['panel'])
         mode_row.pack(fill='x', pady=(0, 10))
-        tk.Label(mode_row, text="TRYB", bg=C['panel'], fg=C['dim'],
+        tk.Label(mode_row, text="MODE", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(anchor='w', pady=(0, 4))
         self.sweep_mode_var = tk.StringVar(value="V")
         mrow = tk.Frame(mode_row, bg=C['panel'])
         mrow.pack(fill='x')
-        self.btn_mode_v = tk.Button(mrow, text="ZRODLO V", command=lambda: self._set_sweep_mode("V"),
+        self.btn_mode_v = tk.Button(mrow, text="SOURCE V", command=lambda: self._set_sweep_mode("V"),
                                     bg=C['orange'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
                                     relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_v.pack(side='left', fill='x', expand=True, padx=(0, 4))
-        self.btn_mode_i = tk.Button(mrow, text="ZRODLO I", command=lambda: self._set_sweep_mode("I"),
+        self.btn_mode_i = tk.Button(mrow, text="SOURCE I", command=lambda: self._set_sweep_mode("I"),
                                     bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
                                     relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_i.pack(side='left', fill='x', expand=True)
@@ -1367,7 +1848,7 @@ class PeltierControl:
         self.sweep_continuous_var = tk.BooleanVar(value=False)
         cont_row = tk.Frame(linner, bg=C['panel'])
         cont_row.pack(fill='x', pady=(10, 0))
-        tk.Checkbutton(cont_row, text="Tylko pomiar (bez sweepu - stala wartosc)",
+        tk.Checkbutton(cont_row, text="Measurement only (no sweep - constant value)",
                       variable=self.sweep_continuous_var, command=lambda: self._toggle_continuous_mode(),
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
@@ -1396,7 +1877,7 @@ class PeltierControl:
         self.params_expanded = tk.BooleanVar(value=True)
         phd = tk.Frame(linner, bg=C['panel'])
         phd.pack(fill='x', pady=(12, 2))
-        self.btn_params_toggle = tk.Button(phd, text="▼ PARAMETRY", command=self._toggle_params_section,
+        self.btn_params_toggle = tk.Button(phd, text="▼ PARAMETERS", command=self._toggle_params_section,
                                            bg=C['panel'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
                                            relief='flat', cursor='hand2', bd=0, anchor='w')
         self.btn_params_toggle.pack(fill='x')
@@ -1405,15 +1886,15 @@ class PeltierControl:
         self.params_body.pack(fill='x')
 
         self.params_desc_lbl = tk.Label(self.params_body,
-                 text="START/STOP - zakres wartosci zadanej (V lub A,\n"
-                      "zalezy od trybu powyzej). KROKI - ile punktow\n"
-                      "pomiarowych rozlozonych rownomiernie miedzy\n"
-                      "START a STOP. LIMIT - compliance (np. przy\n"
-                      "zrodle V to maks. dopuszczalny prad - chroni\n"
-                      "probke/kontakty). SETTLE TIME - ile ms czekac\n"
-                      "po kazdej zmianie wartosci zadanej, zanim\n"
-                      "instrument zmierzy wynik (czas na ustalenie\n"
-                      "sie sygnalu elektrycznego).",
+                 text="START/STOP - range of the set value (V or A,\n"
+                      "depends on the mode above). STEPS - how many\n"
+                      "measurement points evenly spaced between\n"
+                      "START and STOP. LIMIT - compliance (e.g. with a\n"
+                      "V source, the max allowed current - protects\n"
+                      "the sample/contacts). SETTLE TIME - how many ms to wait\n"
+                      "after each change of the set value, before\n"
+                      "the instrument measures the result (time for the\n"
+                      "electrical signal to settle).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  wraplength=250, justify='left')
         self.params_desc_lbl.pack(anchor='w', pady=(0, 8))
@@ -1425,13 +1906,13 @@ class PeltierControl:
         linner = self._sweep_range_frame
         self.sweep_start_entry = _field("START", "0.000001", "V")
         self.sweep_stop_entry  = _field("STOP", "0.00005", "V")
-        self.sweep_step_entry  = _field("KROKI", "50", "")
+        self.sweep_step_entry  = _field("STEPS", "50", "")
         linner = old_linner
 
         # Pole pojedynczej wartosci - widoczne TYLKO w trybie "tylko pomiar"
         self._single_value_frame = tk.Frame(self.params_body, bg=C['panel'])
         linner = self._single_value_frame
-        self.sweep_value_entry = _field("WARTOSC", "0.000001", "V")
+        self.sweep_value_entry = _field("VALUE", "0.000001", "V")
         linner = old_linner
         self._single_value_frame.pack_forget()  # ukryte domyslnie (tryb sweep aktywny)
 
@@ -1440,14 +1921,14 @@ class PeltierControl:
         self.sweep_limit_entry = _field("LIMIT", "0.0001", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
         self.sweep_nplc_entry = _field("NPLC", "1.0", "")
-        self.sweep_avg_entry = _field("USREDNIANIE", "1", "x")
+        self.sweep_avg_entry = _field("AVERAGING", "1", "x")
         linner = old_linner
 
         # Sweep dwukierunkowy (tam i z powrotem) - przydatne np. do histerezy
         self.sweep_bidir_var = tk.BooleanVar(value=False)
         self._bidir_row = tk.Frame(self.params_body, bg=C['panel'])
         self._bidir_row.pack(fill='x', pady=(6, 0))
-        tk.Checkbutton(self._bidir_row, text="Sweep tam i z powrotem", variable=self.sweep_bidir_var,
+        tk.Checkbutton(self._bidir_row, text="Sweep back and forth", variable=self.sweep_bidir_var,
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
@@ -1457,7 +1938,7 @@ class PeltierControl:
         self.sweep_loop_var = tk.BooleanVar(value=False)
         self._loop_chk_row = tk.Frame(self.params_body, bg=C['panel'])
         self._loop_chk_row.pack(fill='x', pady=(4, 0))
-        self.chk_loop = tk.Checkbutton(self._loop_chk_row, text="Petla (powtarzaj do STOP)",
+        self.chk_loop = tk.Checkbutton(self._loop_chk_row, text="Loop (repeat until STOP)",
                       variable=self.sweep_loop_var,
                       command=lambda: self._toggle_loop_pause_field(),
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
@@ -1467,7 +1948,7 @@ class PeltierControl:
         self.chk_loop.pack(anchor='w')
 
         linner = self.params_body
-        self.sweep_loop_pause_entry = _field("PRZERWA", "0", "ms")
+        self.sweep_loop_pause_entry = _field("PAUSE", "0", "ms")
         linner = old_linner
         self.sweep_loop_pause_entry.master.pack_forget()  # ukryte dopoki petla wylaczona
         self._loop_pause_row = self.sweep_loop_pause_entry.master
@@ -1487,8 +1968,8 @@ class PeltierControl:
 
         exp_row = tk.Frame(linner, bg=C['panel'])
         exp_row.pack(fill='x', pady=(20, 10))
-        mk_btn_outline(exp_row, "⤓ EKSPORTUJ CSV", self.export_sweep_csv, C['green']).pack(fill='x', pady=(0, 4))
-        mk_btn_outline(exp_row, "WYCZYSC WYKRES", self.clear_sweep, C['dim']).pack(fill='x')
+        mk_btn_outline(exp_row, "⤓ EXPORT CSV", self.export_sweep_csv, C['green']).pack(fill='x', pady=(0, 4))
+        mk_btn_outline(exp_row, "CLEAR CHART", self.clear_sweep, C['dim']).pack(fill='x')
 
         # ── PANEL PRAWY: wykres (I-V / V(t) / I(t)) ──
         right = tk.Frame(wrap, bg=C['panel'])
@@ -1497,9 +1978,9 @@ class PeltierControl:
 
         rhd = tk.Frame(right, bg=C['panel'])
         rhd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(rhd, text="WYKRES", bg=C['panel'], fg=C['dim'],
+        tk.Label(rhd, text="CHART", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
-        self.sweep_pts_lbl = tk.Label(rhd, text="0 punktow", bg=C['panel'], fg=C['dim2'],
+        self.sweep_pts_lbl = tk.Label(rhd, text="0 points", bg=C['panel'], fg=C['dim2'],
                                       font=(FONT, fsz(9)))
         self.sweep_pts_lbl.pack(side='right')
 
@@ -1521,7 +2002,7 @@ class PeltierControl:
         self.btn_chart_it.pack(side='left')
 
         self.sweep_autoscale_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(chart_sel, text="Auto-skalowanie", variable=self.sweep_autoscale_var,
+        tk.Checkbutton(chart_sel, text="Auto-scale", variable=self.sweep_autoscale_var,
                       command=lambda: self._redraw_sweep_chart(),
                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
@@ -1531,17 +2012,17 @@ class PeltierControl:
         scards_wrap = tk.Frame(right, bg=C['panel'])
         scards_wrap.pack(fill='x', padx=14, pady=(0, 10))
         self.sweep_cards = {}
-        self.sweep_cards['v'] = self._stat_card(scards_wrap, "NAPIECIE", "V", C['orange'])
-        self.sweep_cards['i'] = self._stat_card(scards_wrap, "PRAD", "A", C['blue'])
-        self.sweep_cards['step'] = self._stat_card(scards_wrap, "KROK", "", C['green'])
+        self.sweep_cards['v'] = self._stat_card(scards_wrap, "VOLTAGE", "V", C['orange'])
+        self.sweep_cards['i'] = self._stat_card(scards_wrap, "CURRENT", "A", C['blue'])
+        self.sweep_cards['step'] = self._stat_card(scards_wrap, "STEP", "", C['green'])
         self.sweep_progress_lbl = self.sweep_cards['step']['val']  # alias - karta pokazuje "X / Y"
         self.sweep_cards['step']['unit_lbl'].config(text="")
 
         self.sweep_fig = Figure(figsize=(7, 5.3), facecolor=C['panel'], dpi=100)
         self.sweep_ax = self.sweep_fig.add_subplot(111)
         self.sweep_ax.set_facecolor(C['panel2'])
-        self.sweep_ax.set_xlabel("Napiecie [V]", color=C['dim'], fontsize=8)
-        self.sweep_ax.set_ylabel("Prad [A]", color=C['dim'], fontsize=8)
+        self.sweep_ax.set_xlabel("Voltage [V]", color=C['dim'], fontsize=8)
+        self.sweep_ax.set_ylabel("Current [A]", color=C['dim'], fontsize=8)
         self.sweep_ax.tick_params(colors=C['dim'], labelsize=7)
         for spine in self.sweep_ax.spines.values():
             spine.set_color(C['border'])
@@ -1589,25 +2070,25 @@ class PeltierControl:
         if self.sweep_chart_view == "IV":
             if self.sweep_mode == "V":
                 xs = [p[1] for p in pts]; ys = [p[2] for p in pts]
-                self.sweep_ax.set_xlabel("Napiecie zadane", color=C['dim'], fontsize=8)
-                self.sweep_ax.set_ylabel("Prad zmierzony", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_xlabel("Set voltage", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_ylabel("Measured current", color=C['dim'], fontsize=8)
                 _fmt(self.sweep_ax, 'V', 'A'); mini_units = ('V', 'A')
             else:
                 xs = [p[1] for p in pts]; ys = [p[3] for p in pts]
-                self.sweep_ax.set_xlabel("Prad zadany", color=C['dim'], fontsize=8)
-                self.sweep_ax.set_ylabel("Napiecie zmierzone", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_xlabel("Set current", color=C['dim'], fontsize=8)
+                self.sweep_ax.set_ylabel("Measured voltage", color=C['dim'], fontsize=8)
                 _fmt(self.sweep_ax, 'A', 'V'); mini_units = ('A', 'V')
             self.sweep_line.set_marker('o')
         elif self.sweep_chart_view == "VT":
             xs = [p[0] for p in pts]; ys = [p[3] for p in pts]
-            self.sweep_ax.set_xlabel("Czas [s]", color=C['dim'], fontsize=8)
-            self.sweep_ax.set_ylabel("Napiecie zmierzone", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_xlabel("Time [s]", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_ylabel("Measured voltage", color=C['dim'], fontsize=8)
             _fmt(self.sweep_ax, '', 'V'); mini_units = ('', 'V')
             self.sweep_line.set_marker('')
         else:  # IT
             xs = [p[0] for p in pts]; ys = [p[2] for p in pts]
-            self.sweep_ax.set_xlabel("Czas [s]", color=C['dim'], fontsize=8)
-            self.sweep_ax.set_ylabel("Prad zmierzony", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_xlabel("Time [s]", color=C['dim'], fontsize=8)
+            self.sweep_ax.set_ylabel("Measured current", color=C['dim'], fontsize=8)
             _fmt(self.sweep_ax, '', 'A'); mini_units = ('', 'A')
             self.sweep_line.set_marker('')
         self.sweep_line.set_data(xs, ys)
@@ -1623,11 +2104,11 @@ class PeltierControl:
     def _toggle_params_section(self):
         if self.params_expanded.get():
             self.params_body.pack_forget()
-            self.btn_params_toggle.config(text="▶ PARAMETRY")
+            self.btn_params_toggle.config(text="▶ PARAMETERS")
             self.params_expanded.set(False)
         else:
             self.params_body.pack(fill='x', after=self.btn_params_toggle)
-            self.btn_params_toggle.config(text="▼ PARAMETRY")
+            self.btn_params_toggle.config(text="▼ PARAMETERS")
             self.params_expanded.set(True)
 
     def _toggle_continuous_mode(self):
@@ -1638,18 +2119,18 @@ class PeltierControl:
             self.sweep_loop_var.set(True)
             self.chk_loop.config(state='disabled')
             self._loop_pause_row.pack(fill='x', pady=4, before=self._sweep_btn_row)
-            self.sweep_loop_pause_entry.field_lbl.config(text="INTERWAL")
+            self.sweep_loop_pause_entry.field_lbl.config(text="INTERVAL")
             self.params_desc_lbl.config(
-                text="WARTOSC - stala wartosc zadana (V lub A,\n"
-                     "zalezy od trybu powyzej), Keithley bedzie ja\n"
-                     "utrzymywal i ciagle mierzyl. LIMIT - compliance\n"
-                     "(chroni probke/kontakty). To DWIE OSOBNE rzeczy:\n"
-                     "SETTLE TIME - czas fizycznego ustalenia sie\n"
-                     "sygnalu PO zmianie wartosci (tu bez znaczenia,\n"
-                     "bo wartosc jest stala - mozna dac 0). INTERWAL -\n"
-                     "odstep miedzy KOLEJNYMI probkami [ms] - TO steruje\n"
-                     "czestotliwoscia zbierania danych (np. 100ms =\n"
-                     "10 probek/s). NPLC/USREDNIANIE - patrz nizej.")
+                text="VALUE - the constant set value (V or A,\n"
+                     "depends on the mode above); the Keithley will\n"
+                     "hold it and measure continuously. LIMIT - compliance\n"
+                     "(protects the sample/contacts). These are TWO SEPARATE things:\n"
+                     "SETTLE TIME - the physical settling time of the\n"
+                     "signal AFTER a value change (not relevant here,\n"
+                     "since the value is constant - can be set to 0). INTERVAL -\n"
+                     "spacing between CONSECUTIVE samples [ms] - THIS controls\n"
+                     "the data-collection rate (e.g. 100ms =\n"
+                     "10 samples/s). NPLC/AVERAGING - see below.")
         else:
             self._single_value_frame.pack_forget()
             self._sweep_range_frame.pack(fill='x', before=self.sweep_limit_entry.master)
@@ -1657,18 +2138,18 @@ class PeltierControl:
             self.chk_loop.config(state='normal')
             self.sweep_loop_var.set(False)
             self._loop_pause_row.pack_forget()
-            self.sweep_loop_pause_entry.field_lbl.config(text="PRZERWA")
+            self.sweep_loop_pause_entry.field_lbl.config(text="PAUSE")
             self.params_desc_lbl.config(
-                text="START/STOP - zakres wartosci zadanej (V lub A,\n"
-                     "zalezy od trybu powyzej). KROKI - ile punktow\n"
-                     "pomiarowych rozlozonych rownomiernie miedzy\n"
-                     "START a STOP. LIMIT - compliance (np. przy\n"
-                     "zrodle V to maks. dopuszczalny prad - chroni\n"
-                     "probke/kontakty). SETTLE TIME - ile ms czekac\n"
-                     "po kazdej zmianie wartosci zadanej, zanim\n"
-                     "instrument zmierzy wynik (czas na ustalenie\n"
-                     "sie sygnalu elektrycznego). NPLC/USREDNIANIE -\n"
-                     "patrz nizej: kontroluja szum pomiaru pradu/napiecia.")
+                text="START/STOP - range of the set value (V or A,\n"
+                     "depends on the mode above). STEPS - how many\n"
+                     "measurement points evenly spaced between\n"
+                     "START and STOP. LIMIT - compliance (e.g. with a\n"
+                     "V source, the max allowed current - protects\n"
+                     "the sample/contacts). SETTLE TIME - how many ms to wait\n"
+                     "after each change of the set value, before\n"
+                     "the instrument measures the result (time for the\n"
+                     "electrical signal to settle). NPLC/AVERAGING -\n"
+                     "see below: control the noise of the current/voltage measurement.")
 
     def _toggle_loop_pause_field(self):
         if self.sweep_loop_var.get():
@@ -1720,7 +2201,7 @@ class PeltierControl:
         self.sweep_line.set_data([], [])
         self.sweep_ax.relim(); self.sweep_ax.autoscale_view()
         self.sweep_cv.draw_idle()
-        self.sweep_pts_lbl.config(text="0 punktow")
+        self.sweep_pts_lbl.config(text="0 points")
         self.sweep_cards['v']['val'].config(text="--")
         self.sweep_cards['i']['val'].config(text="--")
         self.sweep_progress_lbl.config(text="--", fg=C['dim2'])
@@ -1729,8 +2210,8 @@ class PeltierControl:
         if self.sweep_running:
             return
         if self.keithley_running:
-            messagebox.showwarning("Keithley zajety",
-                "Pomiar ciagly PID uzywa teraz Keithleya. Zatrzymaj PID (STOP) przed sweepem.")
+            messagebox.showwarning("Keithley busy",
+                "The PID continuous measurement is currently using the Keithley. Stop the PID (STOP) before sweeping.")
             return
 
         continuous = self.sweep_continuous_var.get()
@@ -1750,11 +2231,50 @@ class PeltierControl:
             if nplc <= 0: nplc = 1.0
             if avg_count < 1: avg_count = 1
         except ValueError:
-            messagebox.showerror("Blad", "Sprawdz wartosci liczbowe pol sweep.")
+            messagebox.showerror("Error", "Check the numeric values in the sweep fields.")
             return
         if not continuous and n_steps < 2:
-            messagebox.showerror("Blad", "Liczba krokow musi byc co najmniej 2.")
+            messagebox.showerror("Error", "The number of steps must be at least 2.")
             return
+
+        # ── Walidacja wzgledem twardych limitow sprzetowych Keithley 2611B ──
+        # Zapobiega wpisaniu wartosci ktorej instrument fizycznie nie obsluzy
+        # (np. pomylka rzedu wielkosci przy braku sufiksu n/u/m) zanim cokolwiek
+        # zostanie wyslane do SMU.
+        mode = self.sweep_mode
+        src_max = SMU_V_MAX if mode == "V" else SMU_I_MAX
+        lim_max = SMU_I_MAX if mode == "V" else SMU_V_MAX
+        src_unit = "V" if mode == "V" else "A"
+        lim_unit = "A" if mode == "V" else "V"
+        for val, label in ((v0, "START/VALUE"), (v1, "STOP")):
+            if abs(val) > src_max:
+                messagebox.showerror("SMU limit exceeded",
+                    f"{label} = {val:g} {src_unit} exceeds the Keithley 2611B maximum "
+                    f"({src_max:g} {src_unit} {'voltage source' if mode=='V' else 'current source (DC continuous)'}).")
+                return
+        if abs(limit) > lim_max:
+            messagebox.showerror("SMU limit exceeded",
+                f"LIMIT (compliance) = {limit:g} {lim_unit} exceeds the "
+                f"Keithley 2611B maximum ({lim_max:g} {lim_unit}).")
+            return
+        if mode == "V" and 0 < abs(limit) < SMU_I_COMPLIANCE_MIN:
+            messagebox.showerror("Compliance too low",
+                f"LIMIT (current compliance) = {limit:g} A is below the "
+                f"Keithley 2611B hardware minimum ({SMU_I_COMPLIANCE_MIN:g} A = 10nA). "
+                f"The instrument may not accept this.")
+            return
+        # Moc: P = V*I nie moze przekroczyc SMU_MAX_POWER na kanal (ograniczenie
+        # termiczne) - sprawdzamy najgorszy przypadek (najwieksza wartosc zrodlowa
+        # razem z limitem compliance, bo to iloczyn ktory faktycznie moze wystapic).
+        worst_v = max(abs(v0), abs(v1)) if mode == "V" else limit
+        worst_i = limit if mode == "V" else max(abs(v0), abs(v1))
+        est_power = worst_v * worst_i
+        if est_power > SMU_MAX_POWER:
+            if not messagebox.askyesno("Possible power limit exceeded",
+                f"Estimated power {est_power:.1f} W (at {worst_v:g} V x {worst_i:g} A) "
+                f"exceeds the {SMU_MAX_POWER:g} W/channel maximum for the Keithley 2611B - "
+                f"the instrument may thermally limit its output. Continue anyway?"):
+                return
 
         loop = True if continuous else self.sweep_loop_var.get()
         loop_pause_ms = 0.0
@@ -1790,7 +2310,7 @@ class PeltierControl:
         ])
         sweep_log_file.flush()
         self.root.after(0, lambda: self.sweep_mini_status_lbl.config(
-            text=f"zapis: {sweep_log_path.name}", fg=C['dim2']))
+            text=f"saving: {sweep_log_path.name}", fg=C['dim2']))
 
         def worker():
             try:
@@ -1798,7 +2318,7 @@ class PeltierControl:
                     idn = self.keithley.connect()
                     self.keithley_connected = True
                     self.root.after(0, lambda: self.keithley_status_lbl.config(
-                        text=f"● polaczono: {idn[:40]}", fg=C['green']))
+                        text=f"● connected: {idn[:40]}", fg=C['green']))
 
                 # zbuduj liste punktow - n_steps to LICZBA punktow, nie wielkosc kroku.
                 # W trybie ciaglym (continuous) jest to zawsze jeden, staly punkt.
@@ -1879,7 +2399,7 @@ class PeltierControl:
 
                 self.keithley.output_off("a")
             except Exception as e:
-                self.root.after(0, lambda e=e: messagebox.showerror("Blad sweep", str(e)))
+                self.root.after(0, lambda e=e: messagebox.showerror("Sweep error", str(e)))
             finally:
                 self.sweep_running = False
                 try:
@@ -1914,7 +2434,7 @@ class PeltierControl:
 
         if got_new:
             self._redraw_sweep_chart()
-            self.sweep_pts_lbl.config(text=f"{len(self.sweep_points)} punktow")
+            self.sweep_pts_lbl.config(text=f"{len(self.sweep_points)} points")
 
             if last_pt is not None:
                 _, p_val, i_meas, v_meas = last_pt
@@ -1933,7 +2453,7 @@ class PeltierControl:
                 self.sweep_mini_status_lbl.config(
                     text=f"{loop_prefix}{self.sweep_done}/{self.sweep_total}", fg=C['orange'])
             elif self.sweep_points:
-                self.sweep_mini_status_lbl.config(text="koniec", fg=C['green'])
+                self.sweep_mini_status_lbl.config(text="done", fg=C['green'])
             else:
                 self.sweep_mini_status_lbl.config(text="--", fg=C['dim2'])
 
@@ -1941,7 +2461,7 @@ class PeltierControl:
             self.sweep_progress_lbl.config(
                 text=f"{loop_prefix}{self.sweep_done}/{self.sweep_total}", fg=C['green'])
         elif self.sweep_points:
-            self.sweep_progress_lbl.config(text="Koniec", fg=C['green'])
+            self.sweep_progress_lbl.config(text="Done", fg=C['green'])
         else:
             self.sweep_progress_lbl.config(text="--", fg=C['dim2'])
 
@@ -1949,13 +2469,13 @@ class PeltierControl:
 
     def export_sweep_csv(self):
         if not self.sweep_points:
-            messagebox.showinfo("Brak danych", "Brak punktow sweep do eksportu.\n\n"
-                "Uwaga: pelny, ciagly zapis WSZYSTKICH petli z korelacja czasowa/temperatura\n"
-                "jest juz automatycznie zapisywany w ~/BigPeltierPidLogi/ podczas kazdego sweepu.")
+            messagebox.showinfo("No data", "No sweep points to export.\n\n"
+                "Note: a full, continuous record of ALL loops with time/temperature correlation\n"
+                "is already saved automatically in ~/BigPeltierPidLogi/ during every sweep.")
             return
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(
-            title="Eksportuj biezacy widok sweep", defaultextension=".csv",
+            title="Export current sweep view", defaultextension=".csv",
             initialfile=f"sweep_widok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             filetypes=[("CSV", "*.csv")])
         if not dest:
@@ -1969,11 +2489,11 @@ class PeltierControl:
                     w.writerow(['czas_s', 'prad_zadany_A', 'prad_zmierzony_A', 'napiecie_zmierzone_V'])
                 for t, p, i_m, v_m in self.sweep_points:
                     w.writerow([f"{t:.3f}", f"{p:.9f}", f"{i_m:.12e}", f"{v_m:.9f}"])
-            messagebox.showinfo("Zapisano",
-                f"Wyeksportowano {len(self.sweep_points)} punktow (biezaca petla) do:\n{dest}\n\n"
-                f"Pelny zapis wszystkich petli z korelacja czasowa jest w ~/BigPeltierPidLogi/")
+            messagebox.showinfo("Saved",
+                f"Exported {len(self.sweep_points)} points (current loop) to:\n{dest}\n\n"
+                f"A full record of all loops with time correlation is in ~/BigPeltierPidLogi/")
         except Exception as e:
-            messagebox.showerror("Blad eksportu", str(e))
+            messagebox.showerror("Export error", str(e))
 
     def build_conn(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
@@ -2029,10 +2549,10 @@ class PeltierControl:
             side='left', padx=(0, 8))
         mk_btn_outline(kbr, "DISCONNECT", self.keithley_disconnect, C['red']).pack(side='left')
 
-        tk.Label(kinner, text="Ta zakladka sluzy TYLKO do sprawdzenia polaczenia USB z instrumentem.\n"
-                 "Napiecie/prad, zakres sweepu i limity ustawiasz w zakladce KEITHLEY.\n"
-                 "START na CONTROL uruchamia jednoczesnie PID i sweep skonfigurowany tam.\n"
-                 "Polaczenie przez USB (protokol TMC488) - wymaga sterownika WinUSB (Zadig).",
+        tk.Label(kinner, text="This tab is ONLY for checking the USB connection to the instrument.\n"
+                 "You set voltage/current, sweep range and limits in the KEITHLEY tab.\n"
+                 "START on CONTROL launches the PID and the sweep configured there at the same time.\n"
+                 "USB connection (TMC488 protocol) - requires the WinUSB driver (Zadig).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left').pack(anchor='w', pady=(10, 0))
 
@@ -2044,11 +2564,11 @@ class PeltierControl:
         tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
         for line in [
-            "1. Wgraj firmware PeltierPID.ino na ItsyBitsy M0 (Arduino IDE)",
-            "2. Polacz przez USB, wybierz port COM, kliknij CONNECT",
-            "3. Suwaki synchronizuja sie automatycznie po polaczeniu",
-            "4. Ustaw TARGET i RATE, kliknij START",
-            "5. Wykres na zywo + zapis CSV w ~/BigPeltierPidLogi",
+            "1. Flash the PeltierPID.ino firmware to the ItsyBitsy M0 (Arduino IDE)",
+            "2. Connect via USB, select the COM port, click CONNECT",
+            "3. The sliders sync automatically after connecting",
+            "4. Set TARGET and RATE, click START",
+            "5. Live chart + CSV log in ~/BigPeltierPidLogi",
         ]:
             tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
                      font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
@@ -2069,7 +2589,7 @@ class PeltierControl:
 
     # ─── KEITHLEY 2611B ──────────────────────────────────
     def keithley_test_connect(self):
-        self.keithley_status_lbl.config(text="● szukam urzadzenia USB...", fg=C['yellow'])
+        self.keithley_status_lbl.config(text="● searching for USB device...", fg=C['yellow'])
         self.root.update_idletasks()
 
         def worker():
@@ -2077,11 +2597,11 @@ class PeltierControl:
                 idn = self.keithley.connect()
                 self.keithley_connected = True
                 self.root.after(0, lambda: self.keithley_status_lbl.config(
-                    text=f"● polaczono: {idn[:40]}", fg=C['green']))
+                    text=f"● connected: {idn[:40]}", fg=C['green']))
             except Exception as e:
                 self.keithley_connected = False
                 self.root.after(0, lambda: self.keithley_status_lbl.config(
-                    text=f"● blad: {e}", fg=C['red']))
+                    text=f"● error: {e}", fg=C['red']))
         threading.Thread(target=worker, daemon=True).start()
 
     def keithley_disconnect(self):
@@ -2100,7 +2620,7 @@ class PeltierControl:
                 except Exception:
                     pass
                 self.root.after(0, lambda: self.keithley_status_lbl.config(
-                    text="● polaczono (output OFF)", fg=C['dim']))
+                    text="● connected (output OFF)", fg=C['dim']))
             threading.Thread(target=worker, daemon=True).start()
 
     def _keithley_poll_loop(self):
@@ -2120,7 +2640,7 @@ class PeltierControl:
             except Exception as e:
                 consecutive_errors += 1
                 self.root.after(0, lambda e=e: self.keithley_status_lbl.config(
-                    text=f"● blad pomiaru: {e}", fg=C['red']))
+                    text=f"● measurement error: {e}", fg=C['red']))
                 # Backoff rosnie z liczba kolejnych bledow - zapobiega zalewaniu
                 # adaptera USB-Ethernet ciaglymi probami reconnect (co powodowalo
                 # fizyczne odlaczanie/podlaczanie adaptera w Windows)
@@ -2201,7 +2721,8 @@ class PeltierControl:
         # ─── HOVER: kursor pokazujacy czas/temperature/prad w punkcie ───
         self._arch_hover_series = []
         self._arch_hover_mode = 'time'
-        self._arch_annot = None
+        self._arch_annot_top = None
+        self._arch_annot_bottom = None
         self._arch_vline_top = None
         self._arch_vline_bottom = None
         self._arch_marker_top = None
@@ -2226,14 +2747,14 @@ class PeltierControl:
         atb.pack(fill='x', padx=8, pady=(2, 8))
         mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(side='right', padx=(4, 0))
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(side='right', padx=(4, 0))
-        mk_btn(atb, "⤓ POBIERZ CSV (zaznaczony cykl)", self.export_selected_cycle_csv, C['green']).pack(
+        mk_btn(atb, "⤓ DOWNLOAD CSV (selected cycle)", self.export_selected_cycle_csv, C['green']).pack(
             side='right', padx=(4, 0))
-        mk_btn_outline(atb, "❓ CSV w Excelu", self._show_excel_help, C['yellow']).pack(
+        mk_btn_outline(atb, "❓ CSV in Excel", self._show_excel_help, C['yellow']).pack(
             side='right', padx=(4, 0))
 
         atb2 = tk.Frame(cf, bg=C['panel'])
         atb2.pack(fill='x', padx=8, pady=(0, 8))
-        tk.Label(atb2, text="WYKRES:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(atb2, text="CHART:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
         self.arch_chart_mode = tk.StringVar(value='time')
         def _mode_btn(text, val):
@@ -2245,11 +2766,11 @@ class PeltierControl:
                           bd=1, highlightthickness=0)
             b.pack(side='left', padx=(0, 4))
             return b
-        _mode_btn("temperatura / czas", 'time')
-        _mode_btn("prad Keithley / temperatura", 'iT')
+        _mode_btn("temperature / time", 'time')
+        _mode_btn("Keithley current / temperature", 'iT')
         self.arch_show_current_var = tk.BooleanVar(value=True)
         self.arch_show_current_chk = tk.Checkbutton(
-            atb2, text="Pokaz prad Keithley (wykres pod temperatura)",
+            atb2, text="Show Keithley current (chart below temperature)",
             variable=self.arch_show_current_var, command=lambda: self._redraw_arch(),
             bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
             font=(FONT, fsz(9)), activebackground=C['panel'],
@@ -2258,7 +2779,7 @@ class PeltierControl:
 
         atb3 = tk.Frame(cf, bg=C['panel'])
         atb3.pack(fill='x', padx=8, pady=(0, 8))
-        tk.Label(atb3, text="WYROWNAJ:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(atb3, text="ALIGN:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
         self.arch_align_mode = tk.StringVar(value='none')
         def _align_btn(text, val):
@@ -2270,9 +2791,9 @@ class PeltierControl:
                           bd=1, highlightthickness=0)
             b.pack(side='left', padx=(0, 4))
             return b
-        _align_btn("brak (czas od startu)", 'none')
-        self.arch_align_temp_btn = _align_btn("wg temperatury =", 'temp')
-        self.arch_align_cur_btn = _align_btn("wg pradu =", 'current')
+        _align_btn("none (time since start)", 'none')
+        self.arch_align_temp_btn = _align_btn("by temperature =", 'temp')
+        self.arch_align_cur_btn = _align_btn("by current =", 'current')
         self.arch_align_entry = tk.Entry(atb3, bg=C['bg2'], fg=C['text'],
                                         insertbackground=C['text'], relief='flat',
                                         font=(FONT, fsz(9)), width=10,
@@ -2283,7 +2804,7 @@ class PeltierControl:
         self.arch_align_unit_lbl = tk.Label(atb3, text="°C", bg=C['panel'], fg=C['dim2'],
                                             font=(FONT, fsz(9)))
         self.arch_align_unit_lbl.pack(side='left', padx=(0, 4))
-        mk_btn_outline(atb3, "ZASTOSUJ", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
+        mk_btn_outline(atb3, "APPLY", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
         self.arch_align_entry.config(state='disabled')
 
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
@@ -2297,7 +2818,7 @@ class PeltierControl:
             self.arch_align_entry.config(state='disabled')
         else:
             self.arch_align_entry.config(state='normal')
-            self.arch_align_unit_lbl.config(text="°C" if mode == 'temp' else "A (mozna np. 50n, 2u, 0.001)")
+            self.arch_align_unit_lbl.config(text="°C" if mode == 'temp' else "A (e.g. 50n, 2u, 0.001)")
         self._redraw_arch()
 
     def _parse_align_value(self, mode):
@@ -2336,19 +2857,53 @@ class PeltierControl:
         elif s.startswith('c_'): s = s[2:]
         return s.replace('_', ' ')
 
+    def _arch_list_files(self):
+        """Lista plikow cykli w JEDNYM, spojnym porzadku (wg daty modyfikacji,
+        najnowsze pierwsze) - uzywana zarowno przy budowaniu listy checkboxow
+        (refresh_arch) jak i przy przypisywaniu kolorow na wykresie (_redraw_arch).
+        Wczesniej obie funkcje sortowaly NIEZALEZNIE i RÓŻNYMI kluczami (mtime vs
+        alfabetycznie), wiec ten sam plik mial inny indeks/kolor na liscie niz na
+        wykresie. Jedno wspolne zrodlo prawdy eliminuje to na stale."""
+        return sorted(
+            [f for f in self.log_dir.glob("*.csv")
+             if (f.name.startswith("cykl_") or f.name.startswith("c_"))
+             and not f.name.startswith("_tmp")],
+            key=lambda f: f.stat().st_mtime, reverse=True)
+
+    def _arch_date_header_text(self, d):
+        """Zwraca czytelny naglowek daty: DZISIAJ / WCZORAJ / pelna data dla starszych."""
+        today = datetime.now().date()
+        if d == today:
+            return "TODAY"
+        if d == today - timedelta(days=1):
+            return "YESTERDAY"
+        return d.strftime("%A, %d %B %Y").upper()
+
     def refresh_arch(self):
         for w in self.arch_items.winfo_children(): w.destroy()
         self.arch_vars = {}
-        files = sorted([f for f in self.log_dir.glob("*.csv")
-                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
-                        and not f.name.startswith("_tmp")],
-                       key=lambda f: f.stat().st_mtime, reverse=True)
+        files = self._arch_list_files()
         if not files:
             tk.Label(self.arch_items, text="No saved cycles yet.",
                      bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9))).pack(
                      anchor='w', padx=12, pady=12)
             return
+        # Grupowanie po dacie WYKONANIA (data modyfikacji pliku = koniec cyklu).
+        # Lista jest juz posortowana od najnowszych (_arch_list_files), wiec
+        # kolejne pliki o tej samej dacie tworza naturalnie ciagly blok - nie
+        # trzeba nic dodatkowo sortowac, tylko wykryc zmiane dnia w przebiegu.
+        last_date = None
         for i, f in enumerate(files):
+            mtime = f.stat().st_mtime
+            this_date = datetime.fromtimestamp(mtime).date()
+            if this_date != last_date:
+                last_date = this_date
+                hdr = tk.Frame(self.arch_items, bg=C['panel3'])
+                hdr.pack(fill='x', pady=(8 if i > 0 else 2, 2))
+                tk.Label(hdr, text=self._arch_date_header_text(this_date),
+                         bg=C['panel3'], fg=C['dim'], font=(FONT, fsz(8), 'bold')
+                         ).pack(anchor='w', padx=10, pady=3)
+
             col = self._arch_colors[i % len(self._arch_colors)]
             row = tk.Frame(self.arch_items, bg=C['bg2'])
             row.pack(fill='x', pady=1)
@@ -2365,8 +2920,11 @@ class PeltierControl:
                             activebackground=C['green'], activeforeground='#fff')
             dlb.pack(side='right', padx=(2, 4))
             tk.Frame(row, bg=col, width=8).pack(side='left', fill='y')
+            time_str = datetime.fromtimestamp(mtime).strftime("%H:%M")
+            tk.Label(row, text=time_str, bg=C['bg2'], fg=C['dim2'],
+                     font=(FONT, fsz(8)), width=6, anchor='w').pack(side='left', padx=(6, 0))
             name = self._cycle_display_name(f)
-            disp = name if len(name) <= 24 else name[:22]+"…"
+            disp = name if len(name) <= 22 else name[:20]+"…"
             tk.Checkbutton(row, text=disp, variable=var, command=self._redraw_arch,
                            bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
                            activebackground=C['bg2'], activeforeground=col,
@@ -2413,7 +2971,8 @@ class PeltierControl:
         """Czysci stan hover przy pustym wykresie (brak zaznaczonych cykli) -
         stare artysty (linie/adnotacja) zostaly juz usuniete przez fig.clear()."""
         self._arch_hover_series = []
-        self._arch_annot = None
+        self._arch_annot_top = None
+        self._arch_annot_bottom = None
         self._arch_vline_top = None
         self._arch_vline_bottom = None
         self._arch_marker_top = None
@@ -2424,35 +2983,46 @@ class PeltierControl:
     def _arch_setup_hover(self, mode, hover_series):
         """Tworzy niewidoczne na starcie artysty (linia pionowa + kropka +
         dymek z tekstem) uzywane przez _on_arch_hover. Wywolywane po kazdym
-        przebudowaniu wykresu (fig.clear() kasuje poprzednie artysty)."""
+        przebudowaniu wykresu (fig.clear() kasuje poprzednie artysty).
+
+        WAZNE: kazdy panel (gorny=temperatura, dolny=prad) dostaje WLASNA
+        adnotacje, bo matplotlib interpretuje xy adnotacji we wspolrzednych
+        danych OSI do ktorej nalezy - jedna wspolna adnotacja przypisana do
+        gornej osi wyswietlalaby sie w zlym miejscu (przy wartosciach pradu
+        rzedu 1e-8 rzutowanych na skale temperatury 0-100 C) gdy kursor jest
+        nad dolnym panelem."""
         self._arch_hover_mode = mode
         self._arch_hover_series = hover_series
         self._arch_hover_last_key = None
+        annot_kw = dict(xy=(0, 0), xytext=(14, 14), textcoords='offset points',
+                        bbox=dict(boxstyle='round,pad=0.4', fc=C['panel2'], ec=C['border'], alpha=0.95),
+                        fontsize=fsz(8), color=C['text'], family=FONT, visible=False, zorder=10)
         if mode == 'time':
             self._arch_vline_top = self.ax_a.axvline(
                 0, color=C['text'], lw=0.8, ls=':', alpha=0)
             self._arch_marker_top, = self.ax_a.plot(
                 [], [], 'o', ms=5, alpha=0, zorder=9)
+            self._arch_annot_top = self.ax_a.annotate('', **annot_kw)
             if self.ax_a_current is not None:
                 self._arch_vline_bottom = self.ax_a_current.axvline(
                     0, color=C['text'], lw=0.8, ls=':', alpha=0)
                 self._arch_marker_bottom, = self.ax_a_current.plot(
                     [], [], 'o', ms=5, alpha=0, zorder=9)
+                self._arch_annot_bottom = self.ax_a_current.annotate('', **annot_kw)
             else:
                 self._arch_vline_bottom = None
                 self._arch_marker_bottom = None
+                self._arch_annot_bottom = None
             self._arch_marker_main = None
         else:  # iT
             self._arch_marker_main, = self.ax_a.plot(
                 [], [], 'o', ms=7, alpha=0, zorder=9)
+            self._arch_annot_top = self.ax_a.annotate('', **annot_kw)
+            self._arch_annot_bottom = None
             self._arch_vline_top = None
             self._arch_vline_bottom = None
             self._arch_marker_top = None
             self._arch_marker_bottom = None
-        self._arch_annot = self.ax_a.annotate(
-            '', xy=(0, 0), xytext=(14, 14), textcoords='offset points',
-            bbox=dict(boxstyle='round,pad=0.4', fc=C['panel2'], ec=C['border'], alpha=0.95),
-            fontsize=fsz(8), color=C['text'], family=FONT, visible=False, zorder=10)
 
     def _arch_hover_axes(self):
         if getattr(self, '_arch_hover_mode', 'time') == 'time':
@@ -2479,8 +3049,16 @@ class PeltierControl:
         return min(range(n), key=lambda i: abs(xs[i] - target))
 
     def _on_arch_hover(self, event):
+        # Gdy uzytkownik aktywnie przybliza/przesuwa wykres (toolbar zoom/pan),
+        # NIE liczymy hover ani nie rysujemy dymka - to konkurowalo z wlasnym
+        # rysowaniem toolbara przy kazdym ruchu myszy podczas przeciagania i
+        # powodowalo zacinanie sie calej interakcji. Hover wraca automatycznie
+        # gdy tylko narzedzie zostanie wylaczone.
+        tb = getattr(self, 'mpl_toolbar_a', None)
+        if tb is not None and getattr(tb, 'mode', ''):
+            return
         series = getattr(self, '_arch_hover_series', None)
-        if not series or getattr(self, '_arch_annot', None) is None:
+        if not series or getattr(self, '_arch_annot_top', None) is None:
             return
         if event.inaxes not in self._arch_hover_axes() or event.xdata is None:
             self._arch_hide_hover()
@@ -2488,13 +3066,13 @@ class PeltierControl:
 
         mode = self._arch_hover_mode
         # Dopasowanie do panelu pod kursorem: gorny = temperatura, dolny = prad
-        # (dla trybu iT jest tylko jeden panel = prad vs temperatura).
-        if mode == 'time' and event.inaxes is self.ax_a_current:
-            field = 'current'
-        elif mode == 'time':
-            field = 'temp'
-        else:
-            field = 'current'
+        # (dla trybu iT jest tylko jeden panel = prad vs temperatura). Kazdy
+        # panel ma WLASNA adnotacje (annot_top/annot_bottom), bo xy adnotacji
+        # jest interpretowane we wspolrzednych danych jej wlasnej osi.
+        on_bottom = (mode == 'time' and event.inaxes is self.ax_a_current)
+        field = 'current' if (on_bottom or mode == 'iT') else 'temp'
+        active_annot = self._arch_annot_bottom if on_bottom else self._arch_annot_top
+        other_annot = self._arch_annot_top if on_bottom else self._arch_annot_bottom
 
         xlo, xhi = event.inaxes.get_xlim()
         ylo, yhi = event.inaxes.get_ylim()
@@ -2522,7 +3100,11 @@ class PeltierControl:
             self._arch_hide_hover()
             return
         _, s, idx = best
-        key = (s['name'], idx)
+        key = (s['name'], idx, on_bottom)
+        # Druga (nieaktywna) adnotacja chowana zawsze przy zmianie panelu,
+        # nawet jesli najblizszy punkt danych sie nie zmienil.
+        if other_annot is not None and other_annot.get_visible():
+            other_annot.set_visible(False)
         if key == self._arch_hover_last_key:
             return
         self._arch_hover_last_key = key
@@ -2532,7 +3114,7 @@ class PeltierControl:
         cur_val = s['current'][idx] if idx < len(s['current']) else None
 
         lines = [s['name']]
-        lines.append(f"czas: {t_val:.2f} s")
+        lines.append(f"time: {t_val:.2f} s")
         if temp_val is not None:
             lines.append(f"T1: {temp_val:.3f} °C")
         if cur_val is not None:
@@ -2542,13 +3124,14 @@ class PeltierControl:
             lines.append("I: --")
         text = "\n".join(lines)
 
-        self._arch_annot.set_text(text)
-        self._arch_annot.set_visible(True)
-        self._arch_annot.get_bbox_patch().set_edgecolor(s['color'])
+        active_annot.set_text(text)
+        active_annot.set_visible(True)
+        active_annot.get_bbox_patch().set_edgecolor(s['color'])
 
+        xv = s['x'][idx]
         if mode == 'time':
-            xv = s['x'][idx]
-            self._arch_annot.xy = (xv, temp_val if event.inaxes is self.ax_a else (cur_val or 0))
+            panel_val = cur_val if on_bottom else temp_val
+            active_annot.xy = (xv, panel_val if panel_val is not None else 0)
             self._arch_vline_top.set_xdata([xv, xv]); self._arch_vline_top.set_alpha(0.6)
             if temp_val is not None:
                 self._arch_marker_top.set_data([xv], [temp_val])
@@ -2561,8 +3144,7 @@ class PeltierControl:
                 else:
                     self._arch_marker_bottom.set_alpha(0)
         else:
-            xv = s['x'][idx]
-            self._arch_annot.xy = (xv, cur_val if cur_val is not None else 0)
+            active_annot.xy = (xv, cur_val if cur_val is not None else 0)
             if cur_val is not None:
                 self._arch_marker_main.set_data([xv], [cur_val])
                 self._arch_marker_main.set_color(s['color']); self._arch_marker_main.set_alpha(1)
@@ -2570,12 +3152,14 @@ class PeltierControl:
         self.cv_a.draw_idle()
 
     def _arch_hide_hover(self):
-        if getattr(self, '_arch_annot', None) is None:
+        if getattr(self, '_arch_annot_top', None) is None:
             return
         if self._arch_hover_last_key is None:
             return
         self._arch_hover_last_key = None
-        self._arch_annot.set_visible(False)
+        self._arch_annot_top.set_visible(False)
+        if self._arch_annot_bottom is not None:
+            self._arch_annot_bottom.set_visible(False)
         if self._arch_hover_mode == 'time':
             self._arch_vline_top.set_alpha(0)
             self._arch_marker_top.set_alpha(0)
@@ -2594,9 +3178,7 @@ class PeltierControl:
         mode = mode.get() if mode is not None else 'time'
 
         # Najpierw wczytaj dane - dopiero potem decyduj o ukladzie osi
-        files = sorted([f for f in self.log_dir.glob("*.csv")
-                        if (f.name.startswith("cykl_") or f.name.startswith("c_"))
-                        and not f.name.startswith("_tmp")], reverse=True)
+        files = self._arch_list_files()
         forder = {str(f):i for i,f in enumerate(files)}
         loaded = []
         any_current_data = False
@@ -2676,12 +3258,12 @@ class PeltierControl:
                                   'temp': t1, 'current': ki, 'sorted': True})
 
         if align_mode == 'temp' and align_val is not None:
-            xlabel = f"czas wzgledem T={align_val:g}°C [s]"
+            xlabel = f"time relative to T={align_val:g}°C [s]"
         elif align_mode == 'current' and align_val is not None:
             av, ap = fmt_si(align_val, 2)
-            xlabel = f"czas wzgledem I={av} {ap}A [s]"
+            xlabel = f"time relative to I={av} {ap}A [s]"
         else:
-            xlabel = "czas [s]"
+            xlabel = "time [s]"
 
         if ax_i is not None:
             try:
@@ -2689,23 +3271,23 @@ class PeltierControl:
                 ax_i.yaxis.set_major_formatter(EngFormatter(unit='A'))
             except Exception:
                 pass
-            ax_i.set_ylabel('prad Keithley', color=C['dim'], fontsize=9)
+            ax_i.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
             ax_i.set_xlabel(xlabel, color=C['dim'], fontsize=9)
             # ukryj etykiety X gornego wykresu - wspolna os czasu na dole
             self.ax_a.tick_params(labelbottom=False)
         else:
             self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
             if show_current and not any_current_data:
-                self.ax_a.text(0.02, 0.02, "brak danych Keithleya w zaznaczonych cyklach",
+                self.ax_a.text(0.02, 0.02, "no Keithley data in the selected cycles",
                                color=C['dim2'], fontsize=8, transform=self.ax_a.transAxes)
         if align_missed:
             names = ", ".join(align_missed[:3]) + ("…" if len(align_missed) > 3 else "")
             self.ax_a.text(0.02, 0.98,
-                           f"⚠ nie osiagnieto progu: {names} (uzyto naturalnego startu)",
+                           f"⚠ threshold not reached: {names} (used natural start)",
                            color=C['yellow'], fontsize=7, transform=self.ax_a.transAxes,
                            va='top')
 
-        self.ax_a.set_ylabel('temperatura [°C]', color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel('temperature [°C]', color=C['dim'], fontsize=9)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                          labelcolor=C['dim'], fontsize=8)
         # zresetuj stos nawigacji toolbara (HOME wraca do nowego widoku, nie starego)
@@ -2757,7 +3339,7 @@ class PeltierControl:
                                   'temp': xs, 'current': ys, 'sorted': False})
 
         if not any_i:
-            self.ax_a.text(0.5, 0.5, "brak danych Keithleya w zaznaczonych cyklach",
+            self.ax_a.text(0.5, 0.5, "no Keithley data in the selected cycles",
                            ha='center', va='center', color=C['dim2'],
                            fontsize=10, transform=self.ax_a.transAxes)
             self._arch_reset_hover()
@@ -2768,8 +3350,8 @@ class PeltierControl:
             self.ax_a.yaxis.set_major_formatter(EngFormatter(unit='A'))
         except Exception:
             pass
-        self.ax_a.set_xlabel('temperatura T1 [°C]', color=C['dim'], fontsize=9)
-        self.ax_a.set_ylabel('prad Keithley', color=C['dim'], fontsize=9)
+        self.ax_a.set_xlabel('temperature T1 [°C]', color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                          labelcolor=C['dim'], fontsize=8)
         if hasattr(self, 'mpl_toolbar_a'):
@@ -2783,7 +3365,7 @@ class PeltierControl:
             messagebox.showinfo("No selection", "Tick a cycle first."); return
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(title="Save chart",
-               defaultextension=".png", initialfile="wykres.png",
+               defaultextension=".png", initialfile="chart.png",
                filetypes=[("PNG","*.png")])
         if dest:
             self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'], bbox_inches='tight')
@@ -2799,14 +3381,14 @@ class PeltierControl:
         from pathlib import Path as _P
         selected = [_P(p) for p, v in self.arch_vars.items() if v.get()]
         if not selected:
-            messagebox.showinfo("Brak zaznaczenia", "Zaznacz cykl (checkbox) na liscie po lewej, "
-                                "albo uzyj przycisku ⤓ bezposrednio przy wybranej pozycji.")
+            messagebox.showinfo("Nothing selected", "Tick a cycle (checkbox) on the list to the left, "
+                                "or use the ⤓ button directly next to the item.")
             return
         if len(selected) == 1:
             self._export_single_cycle_csv(selected[0])
             return
         from tkinter import filedialog
-        dest_dir = filedialog.askdirectory(title="Wybierz folder docelowy dla CSV")
+        dest_dir = filedialog.askdirectory(title="Choose destination folder for CSV")
         if not dest_dir:
             return
         ok = 0
@@ -2816,7 +3398,7 @@ class PeltierControl:
                 ok += 1
             except Exception:
                 pass
-        messagebox.showinfo("Zapisano", f"Skopiowano {ok}/{len(selected)} plikow do:\n{dest_dir}")
+        messagebox.showinfo("Saved", f"Copied {ok}/{len(selected)} files to:\n{dest_dir}")
 
     def _export_single_cycle_csv(self, src):
         """Zapisuje jeden konkretny plik cyklu (przycisk ⤓ przy pozycji na liscie -
@@ -2826,22 +3408,22 @@ class PeltierControl:
         src = _P(src)
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(
-            title="Zapisz raw dane cyklu", defaultextension=".csv",
+            title="Save cycle raw data", defaultextension=".csv",
             initialfile=src.name, filetypes=[("CSV", "*.csv")])
         if not dest:
             return
         try:
             shutil.copy(src, dest)
-            messagebox.showinfo("Zapisano", f"Raw dane cyklu zapisane do:\n{dest}")
+            messagebox.showinfo("Saved", f"Cycle raw data saved to:\n{dest}")
         except Exception as e:
-            messagebox.showerror("Blad", str(e))
+            messagebox.showerror("Error", str(e))
 
     def _show_excel_help(self):
         """Instrukcja: dlaczego Excel czesto psuje ten CSV przy zwyklym
         dwuklikni?ciu, i jak poprawnie zaimportowac dane (osobne kolumny,
         poprawny separator dziesietny), zeby dalsza obrobka byla latwa."""
         win = tk.Toplevel(self.root)
-        win.title("Jak otworzyc CSV w Excelu")
+        win.title("How to open CSV in Excel")
         win.configure(bg=C['bg'])
         w, h = px(620), px(560)
         try:
@@ -2854,7 +3436,7 @@ class PeltierControl:
         win.minsize(w, h)
         win.transient(self.root)
 
-        tk.Label(win, text="Import CSV do Excela", bg=C['bg'], fg=C['text'],
+        tk.Label(win, text="Importing CSV into Excel", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w', padx=16, pady=(14, 4))
 
         body = tk.Frame(win, bg=C['bg'])
@@ -2868,63 +3450,64 @@ class PeltierControl:
         txt.pack(side='left', fill='both', expand=True)
 
         content = (
-            "PROBLEM: nasz plik CSV rozdziela kolumny PRZECINKIEM, a liczby "
-            "dziesietne maja KROPKE (np. 48.30, nie 48,30). Polski Excel domyslnie "
-            "oczekuje odwrotnie: srednika jako separatora kolumn i przecinka jako "
-            "separatora dziesietnego. Dlatego zwykle dwuklikniecie na plik CSV czesto "
-            "wrzuca WSZYSTKO do jednej kolumny albo zamienia liczby na tekst.\n\n"
-            "NAJLEPSZY SPOSOB (Excel 2016+, zawsze dziala poprawnie):\n"
-            "1. Otworz PUSTY skoroszyt Excela (nie klikaj CSV dwa razy).\n"
-            "2. Zakladka DANE -> \"Z tekstu/CSV\" (Get Data From Text/CSV).\n"
-            "3. Wskaz nasz plik cykl_....csv.\n"
-            "4. W oknie podgladu ustaw:\n"
-            "     Ogranicznik (Delimiter): Przecinek\n"
-            "     Pochodzenie pliku: UTF-8\n"
-            "5. Kliknij \"Przeksztalc dane\" (Transform Data) albo od razu \"Zaladuj\".\n"
-            "6. Jesli liczby wyjda jako tekst (wyrownane do lewej), zaznacz kolumny "
-            "z liczbami -> DANE -> Tekst jako kolumny -> Dalej -> Dalej -> w kroku 3 "
-            "wybierz \"Kropka\" jako separator dziesietny (przycisk Zaawansowane) "
-            "-> Zakoncz.\n\n"
-            "SZYBSZY SPOSOB (dwuklik na plik, gdy nie chce sie robic importu):\n"
-            "1. Otworz plik zwyklym dwuklikiem - dane wpadna w jedna kolumne.\n"
-            "2. Zaznacz cala kolumne A.\n"
-            "3. DANE -> Tekst jako kolumny.\n"
-            "4. Wybierz \"Rozdzielany\" -> Dalej.\n"
-            "5. Zaznacz ogranicznik \"Przecinek\" (odznacz inne) -> Dalej.\n"
-            "6. Kliknij \"Zaawansowane\" (Advanced) w prawym dolnym rogu -> ustaw "
-            "\"Separator dziesietny: kropka\", \"Separator tysiecy: (puste)\" -> OK.\n"
-            "7. Zakoncz.\n\n"
-            "KOLUMNY W PLIKU CYKLU (cykl_*.csv / c_*.csv):\n"
-            "  timestamp_pc          - znacznik czasu komputera (ISO 8601)\n"
-            "  czas_firmware_s       - czas wg zegara mikrokontrolera [s]\n"
-            "  czas_od_startu_s      - czas od poczatku cyklu [s] (najwygodniejszy do wykresow)\n"
-            "  temperatura1_C        - temperatura z czujnika 1 [°C]\n"
-            "  temperatura2_C        - temperatura z czujnika 2 [°C]\n"
-            "  setpoint_aktywny_C    - biezacy punkt zadany (w trakcie rampy) [°C]\n"
-            "  setpoint_cel_C        - docelowy punkt zadany [°C]\n"
-            "  peltier_pct           - moc Peltiera [%]\n"
-            "  fan_pct               - moc wentylatora [%]\n"
+            "PROBLEM: our CSV file separates columns with a COMMA, and decimal "
+            "numbers use a PERIOD (e.g. 48.30, not 48,30). Some regional Excel "
+            "settings (e.g. many European locales) expect the opposite by default: "
+            "semicolon as the column separator and comma as the decimal separator. "
+            "Because of this, simply double-clicking the CSV file can dump "
+            "EVERYTHING into one column or turn numbers into text.\n\n"
+            "BEST METHOD (Excel 2016+, always works correctly):\n"
+            "1. Open a BLANK Excel workbook (don't double-click the CSV).\n"
+            "2. DATA tab -> \"From Text/CSV\" (Get Data From Text/CSV).\n"
+            "3. Point it at our cykl_....csv file.\n"
+            "4. In the preview window set:\n"
+            "     Delimiter: Comma\n"
+            "     File origin: UTF-8\n"
+            "5. Click \"Transform Data\" or just \"Load\".\n"
+            "6. If numbers come out as text (left-aligned), select the numeric "
+            "columns -> DATA -> Text to Columns -> Next -> Next -> in step 3 "
+            "choose \"Period\" as the decimal separator (Advanced button) "
+            "-> Finish.\n\n"
+            "QUICKER METHOD (double-click the file, when you don't want to import):\n"
+            "1. Open the file with a normal double-click - the data lands in one column.\n"
+            "2. Select the entire column A.\n"
+            "3. DATA -> Text to Columns.\n"
+            "4. Choose \"Delimited\" -> Next.\n"
+            "5. Check the \"Comma\" delimiter (uncheck others) -> Next.\n"
+            "6. Click \"Advanced\" in the bottom-right corner -> set "
+            "\"Decimal separator: period\", \"Thousands separator: (blank)\" -> OK.\n"
+            "7. Finish.\n\n"
+            "COLUMNS IN THE CYCLE FILE (cykl_*.csv / c_*.csv):\n"
+            "  timestamp_pc          - computer timestamp (ISO 8601)\n"
+            "  czas_firmware_s       - time from the microcontroller clock [s]\n"
+            "  czas_od_startu_s      - time since the cycle started [s] (most convenient for charts)\n"
+            "  temperatura1_C        - temperature from sensor 1 [°C]\n"
+            "  temperatura2_C        - temperature from sensor 2 [°C]\n"
+            "  setpoint_aktywny_C    - current setpoint (during the ramp) [°C]\n"
+            "  setpoint_cel_C        - target setpoint [°C]\n"
+            "  peltier_pct           - Peltier power [%]\n"
+            "  fan_pct               - fan power [%]\n"
             "  kierunek              - HEAT / COOL\n"
-            "  Kp, Ki, Kd            - nastawy regulatora PID\n"
-            "  stan                  - stan automatu (RUN / IDLE / itp.)\n"
-            "  keithley_prad_A       - prad zmierzony przez SMU [A], notacja naukowa np. 4.83e-08\n"
-            "  keithley_napiecie_V   - napiecie zmierzone przez SMU [V]\n\n"
-            "UWAGA na notacje naukowa (np. 4.83e-08): Excel poprawnie ja rozumie jako "
-            "liczbe, o ile format kolumny to \"Ogolny\" lub \"Naukowy\" - NIE formatuj "
-            "tych kolumn jako \"Tekst\" przed importem, bo zostana zamienione na string "
-            "i nie da sie ich uzyc w wykresach/formulach.\n\n"
-            "SZYBKI WYKRES W EXCELU (I vs T albo I vs czas):\n"
-            "1. Po poprawnym imporcie zaznacz dwie kolumny, np. temperatura1_C i "
-            "keithley_prad_A (przytrzymaj Ctrl, zeby zaznaczyc niesasiadujace kolumny).\n"
-            "2. WSTAWIANIE -> Wykres punktowy (XY Scatter) -> \"Punktowy z liniami "
-            "prostymi\" jesli chcesz zachowac kolejnosc czasowa (widac wtedy petle "
-            "histerezy grzanie/chlodzenie), albo zwykly \"Punktowy\" dla samej chmury "
-            "punktow."
+            "  Kp, Ki, Kd            - PID controller gains\n"
+            "  stan                  - state machine state (RUN / IDLE / etc.)\n"
+            "  keithley_prad_A       - current measured by the SMU [A], scientific notation e.g. 4.83e-08\n"
+            "  keithley_napiecie_V   - voltage measured by the SMU [V]\n\n"
+            "NOTE on scientific notation (e.g. 4.83e-08): Excel correctly reads it as "
+            "a number as long as the column format is \"General\" or \"Scientific\" - do NOT format "
+            "these columns as \"Text\" before importing, or they'll be turned into strings "
+            "and won't work in charts/formulas.\n\n"
+            "QUICK CHART IN EXCEL (I vs T or I vs time):\n"
+            "1. After a correct import, select two columns, e.g. temperatura1_C and "
+            "keithley_prad_A (hold Ctrl to select non-adjacent columns).\n"
+            "2. INSERT -> Scatter chart (XY Scatter) -> \"Scatter with Straight "
+            "Lines\" if you want to preserve the time order (this shows the "
+            "heating/cooling hysteresis loop), or plain \"Scatter\" for just the "
+            "point cloud."
         )
         txt.insert('1.0', content)
         txt.config(state='disabled')
 
-        mk_btn(win, "ZAMKNIJ", win.destroy, C['cyan']).pack(pady=(0, 14))
+        mk_btn(win, "CLOSE", win.destroy, C['cyan']).pack(pady=(0, 14))
 
     def open_log_folder(self):
         import subprocess
@@ -3070,10 +3653,16 @@ class PeltierControl:
                 elif not pid_on:
                     self.reach_lbl.config(text="")
 
-            # Nie przerysowuj gdy uzytkownik ma aktywne narzedzie ZOOM/PAN z
-            # toolbara - inaczej ax.clear() co 250 ms kasowalby przyblizenie
-            # i zoom na wykresie live nigdy nie dzialal.
-            if self.t and not self.chart_paused and not self._live_toolbar_busy():
+            # Programator: maszyna stanow krokow (grzej/trzymaj/schlodz/trzymaj)
+            # dziala na najswiezszej znanej temperaturze, niezaleznie czy w tym
+            # ticku przyszly nowe dane z urzadzenia.
+            if self.program_running:
+                self._program_tick(self.last_known_t1)
+
+            # Wykres aktualizuje dane zawsze (set_data, tanie) - ochrona przed
+            # "wyrywaniem" recznego przyblizenia jest teraz wewnatrz _draw_chart
+            # (pomija tam tylko autoscale, gdy aktywne narzedzie ZOOM/PAN).
+            if self.t and not self.chart_paused:
                 self._draw_chart()
 
         except Exception as e:
@@ -3091,6 +3680,7 @@ class PeltierControl:
                 if 'kffh' in d and hasattr(self,'sl_kffh'): self.sl_kffh.set(float(d['kffh']))
                 if 'kffr' in d and hasattr(self,'sl_kffr'): self.sl_kffr.set(float(d['kffr']))
                 if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
+                if 'oppdir' in d and hasattr(self,'oppdir_var'): self._set_oppdir(bool(d['oppdir']), send=False)
                 self._cfg_synced = True
         except Exception as e: print(f"cfg err: {e}")
 
@@ -3103,29 +3693,32 @@ class PeltierControl:
 
         def safe(lst): return [v if v is not None else float('nan') for v in lst]
 
-        self.ax1.clear(); self.ax1.set_facecolor(C['panel2'])
-        self.ax1.plot(t, sp, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
-        self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
-        self.ax1.plot(t, safe(t1), color=C['blue'], lw=2.2, label='T1')
-        self.ax1.plot(t, safe(t2), color=C['purple'], lw=1.3, ls='--', label='T2', alpha=0.6)
-        self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
-        self.ax1.tick_params(colors=C['dim'], labelsize=8, length=0)
-        self.ax1.grid(True, axis='y', alpha=0.35, color=C['grid'])
-        for s in ['top','right']: self.ax1.spines[s].set_visible(False)
-        for s in ['left','bottom']: self.ax1.spines[s].set_color(C['border'])
-        self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
-                        labelcolor=C['dim'], fontsize=8, loc='upper right')
+        # Aktualizacja ISTNIEJACYCH linii (set_data) zamiast ax.clear()+replot -
+        # duzo tansze (bez rekonstrukcji legendy/siatki/spines co 250ms) i NIE
+        # resetuje aktualnego przyblizenia/przesuniecia widoku uzytkownika.
+        self.ln_target.set_data(t, sp)
+        self.ln_spa.set_data(t, spa)
+        self.ln_t1.set_data(t, safe(t1))
+        self.ln_t2.set_data(t, safe(t2))
+        self.ln_pwm.set_data(t, pw)
 
-        self.ax2.clear(); self.ax2.set_facecolor(C['panel2'])
-        self.ax2.fill_between(t, 0, pw, color=C['green'], alpha=0.3)
-        self.ax2.plot(t, pw, color=C['green'], lw=1.5)
-        self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
-        self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
-        self.ax2.set_ylim(-5, 105)
-        self.ax2.tick_params(colors=C['dim'], labelsize=8, length=0)
-        self.ax2.grid(True, axis='y', alpha=0.35, color=C['grid'])
-        for s in ['top','right']: self.ax2.spines[s].set_visible(False)
-        for s in ['left','bottom']: self.ax2.spines[s].set_color(C['border'])
+        # fill_between nie ma set_data - trzeba przebudowac sam ten jeden artysta
+        # (wciaz duzo tansze niz pelny ax.clear() calego wykresu)
+        if self.pwm_fill is not None:
+            try: self.pwm_fill.remove()
+            except Exception: pass
+        self.pwm_fill = self.ax2.fill_between(t, 0, pw, color=C['green'], alpha=0.3)
+
+        # Autoscale TYLKO gdy uzytkownik nie ma aktywnego zoom/pan z toolbara -
+        # inaczej co 250ms wyrywalibysmy mu widok z powrotem do pelnego zakresu.
+        # UWAGA: toolbar zoom wewnetrznie wywoluje set_xlim/set_ylim, co w
+        # matplotlib SAMO wylacza autoscale dla danej osi na stale - trzeba je
+        # jawnie wlaczyc ponownie, inaczej po wylaczeniu narzedzia zoom widok
+        # zostalby zamrozony na zawsze zamiast wrocic do sledzenia danych.
+        if not self._live_toolbar_busy():
+            self.ax1.set_autoscale_on(True); self.ax2.set_autoscale_on(True)
+            self.ax1.relim(); self.ax1.autoscale_view()
+            self.ax2.relim(); self.ax2.autoscale_view(scaley=False)  # Y stale -5..105
 
         self.cv.draw_idle()
 
@@ -3199,7 +3792,7 @@ class PeltierControl:
                 print(f"cyc_log write err #{self.cyc_write_errors}: {e}")
                 if self.cyc_write_errors == 1 and hasattr(self, 's_lbl'):
                     try:
-                        self.s_lbl.config(text="UWAGA: blad zapisu CSV cyklu!", fg=C['red'])
+                        self.s_lbl.config(text="WARNING: cycle CSV write error!", fg=C['red'])
                     except Exception:
                         pass
 
@@ -3210,7 +3803,7 @@ class PeltierControl:
         had = self.cyc_on and self.cyc_rows > 0
         tmp = self.cyc_fn
         self.cyc_on=False; self.cyc_file=None; self.cyc_wr=None
-        print(f"CYC STOP: {reason} ({self.cyc_rows} probek)")
+        print(f"CYC STOP: {reason} ({self.cyc_rows} samples)")
         if had and tmp and tmp.exists():
             self.root.after(0, lambda: self._ask_save_name(tmp))
         elif tmp and tmp.exists():
@@ -3230,7 +3823,7 @@ class PeltierControl:
             dest = self.log_dir / f"c_{safe}_{ts}.csv"
         try:
             tmp_path.rename(dest)
-            print(f"Zapisano: {dest.name}")
+            print(f"Saved: {dest.name}")
         except Exception as e: print(f"err: {e}")
         if hasattr(self, 'refresh_arch'):
             try: self.refresh_arch()
