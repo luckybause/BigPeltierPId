@@ -66,7 +66,7 @@ RAMP_MAX_UI = 80.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-10.1"
+BUILD_VERSION = "2026-07-10.5"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -616,6 +616,8 @@ class PeltierControl:
             if 'KD' in d:   out['kd'] = float(d['KD'])
             if 'KFFH' in d: out['kffh'] = float(d['KFFH'])
             if 'KFFR' in d: out['kffr'] = float(d['KFFR'])
+            if 'KFFHC' in d: out['kffhc'] = float(d['KFFHC'])
+            if 'KFFRC' in d: out['kffrc'] = float(d['KFFRC'])
             if 'OFFSET' in d: out['offset'] = float(d['OFFSET'])
             if 'OPPDIR' in d: out['oppdir'] = (d['OPPDIR'].strip() == '1')
             if 'FAN' in d:
@@ -850,11 +852,22 @@ class PeltierControl:
         self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
                         labelcolor=C['dim'], fontsize=8, loc='upper right')
 
-        self.ln_pwm, = self.ax2.plot([], [], color=C['green'], lw=1.5)
-        self.pwm_fill = None  # PolyCollection z fill_between - przebudowywany osobno
-        self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
+        # PWM ze znakiem: dodatni = grzanie (pomaranczowy), ujemny = chlodzenie
+        # (niebieski/cyan) - dwie osobne linie + wypelnienia, kazda widoczna
+        # TYLKO po swojej stronie zera (patrz _draw_chart: maskowanie przez
+        # NaN dla drugiej polowy), zeby przejscie grzanie<->chlodzenie bylo
+        # od razu czytelne jako zmiana koloru, bez osobnego wskaznika obok.
+        self.ln_pwm_heat, = self.ax2.plot([], [], color=C['orange'], lw=1.6)
+        self.ln_pwm_cool, = self.ax2.plot([], [], color=C['cyan'], lw=1.6)
+        self.pwm_fill_heat = None  # PolyCollection - przebudowywane co odswiezenie
+        self.pwm_fill_cool = None
+        self.ax2.axhline(0, color=C['border2'], lw=0.8, zorder=1)
+        self.ax2.set_ylabel('PWM %  (heat / cool)', color=C['dim'], fontsize=9)
         self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
-        self.ax2.set_ylim(-5, 105)
+        self.ax2.set_ylim(-105, 105)
+        self.ax2.legend([self.ln_pwm_heat, self.ln_pwm_cool], ['heat', 'cool'],
+                        facecolor=C['panel'], edgecolor=C['border'],
+                        labelcolor=C['dim'], fontsize=8, loc='upper right')
 
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
         self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
@@ -888,6 +901,9 @@ class PeltierControl:
             self.mpl_toolbar.pack(side='right')
         except Exception as e:
             print(f"toolbar err: {e}")
+            self.mpl_toolbar = None
+        self._setup_scroll_drag_zoom(self.cv, self.mpl_toolbar,
+                                     '_live_chart_frozen', '_live_chart_dragging')
 
     def _build_sweep_mini_chart(self, parent):
         """Kompaktowy wykres I-V na ekranie CONTROL, obok wykresu temperatury -
@@ -920,16 +936,16 @@ class PeltierControl:
         self.sweep_cv_mini.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 8))
 
     def _live_toolbar_busy(self):
-        """True gdy w toolbarze matplotliba aktywny jest tryb ZOOM lub PAN -
-        wtedy wstrzymujemy TYLKO autoscale (dopasowanie osi), zeby recznie
-        ustawione przyblizenie nie znikalo. Dane nadal splywaja na biezaco
-        (set_data), wiec po wylaczeniu narzedzia widok od razu dogoni najnowsze
-        probki bez utraty ciaglosci."""
+        """True gdy w toolbarze matplotliba aktywny jest tryb ZOOM/PAN, LUB
+        uzytkownik przyblizyl wykres recznie (scroll/przeciagniecie prostokata)
+        - w obu przypadkach wstrzymujemy TYLKO autoscale (dopasowanie osi),
+        zeby recznie ustawione przyblizenie nie znikalo. Dane nadal splywaja
+        na biezaco (set_data), wiec po przywroceniu (przycisk HOME w toolbarze)
+        widok od razu dogoni najnowsze probki bez utraty ciaglosci."""
         tb = getattr(self, 'mpl_toolbar', None)
-        if tb is None:
-            return False
-        mode = getattr(tb, 'mode', '')
-        busy = bool(mode) and str(mode) != ''
+        tb_mode_busy = bool(tb is not None and getattr(tb, 'mode', '') and str(tb.mode) != '')
+        manual_zoom = getattr(self, '_live_chart_frozen', False)
+        busy = tb_mode_busy or manual_zoom
         # wizualna informacja na przycisku pauzy
         if hasattr(self, 'btn_pause') and not self.chart_paused:
             if busy and self.btn_pause['text'] != "🔍 ZOOM (widok zablokowany)":
@@ -939,6 +955,129 @@ class PeltierControl:
                 self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'],
                                       highlightbackground=C['yellow'])
         return busy
+
+    def _setup_scroll_drag_zoom(self, canvas, toolbar, frozen_attr, dragging_attr):
+        """Dodaje do wykresu dwa sposoby przyblizania, ktore dzialaja ZAWSZE
+        (bez klikania ikony lupy w toolbarze):
+          1) scroll kolkiem myszy - przyblizenie/oddalenie wycentrowane na
+             pozycji kursora, dziala na osi ktora jest akurat pod kursorem.
+          2) przeciagniecie lewym przyciskiem myszy - zaznaczony prostokat
+             ZAWSZE przybliza widok do tego obszaru po puszczeniu przycisku.
+        Jesli w toolbarze aktywne jest natywne narzedzie PAN, ustepujemy mu
+        miejsca (nie przechwytujemy przeciagniecia) zeby nie kolidowac.
+        frozen_attr / dragging_attr - nazwy atrybutow self uzywanych do
+        sledzenia stanu (rozne dla kazdego wykresu, zeby sie nie mieszaly)."""
+        from matplotlib.patches import Rectangle
+        setattr(self, frozen_attr, False)
+        setattr(self, dragging_attr, False)
+        drag = {'ax': None, 'x0': None, 'y0': None, 'px0': 0, 'py0': 0, 'rect': None}
+
+        def on_scroll(event):
+            if event.inaxes is None or event.xdata is None or event.ydata is None:
+                return
+            ax = event.inaxes
+            if event.button == 'up':
+                scale = 0.85   # scroll w gore = przyblizenie
+            elif event.button == 'down':
+                scale = 1/0.85  # scroll w dol = oddalenie
+            else:
+                return
+            xlo, xhi = ax.get_xlim(); ylo, yhi = ax.get_ylim()
+            xd, yd = event.xdata, event.ydata
+            ax.set_xlim(xd - (xd - xlo) * scale, xd + (xhi - xd) * scale)
+            ax.set_ylim(yd - (yd - ylo) * scale, yd + (yhi - yd) * scale)
+            setattr(self, frozen_attr, True)
+            canvas.draw_idle()
+
+        def on_press(event):
+            if event.inaxes is None:
+                return
+            if event.button == 3:
+                # PRAWY przycisk = reset przyblizenia do pelnego zakresu danych,
+                # na WSZYSTKICH osiach tej figury na raz (zeby np. panel
+                # temperatury i panel pradu, ktore wspoldziela os X, zresetowaly
+                # sie razem, niezaleznie na ktory z nich kliknieto).
+                for a in canvas.figure.get_axes():
+                    a.set_autoscale_on(True)
+                    a.relim()
+                    a.autoscale_view()
+                setattr(self, frozen_attr, False)
+                canvas.draw_idle()
+                return
+            tb_mode = str(getattr(toolbar, 'mode', '')) if toolbar is not None else ''
+            if tb_mode == 'pan/zoom':
+                return  # oddaj kontrole natywnemu narzedziu PAN z toolbara
+            if event.button != 1:
+                return
+            drag['ax'] = event.inaxes
+            drag['x0'] = event.xdata; drag['y0'] = event.ydata
+            drag['px0'] = event.x; drag['py0'] = event.y
+            setattr(self, dragging_attr, False)
+
+        def on_motion(event):
+            if drag['ax'] is None or event.inaxes is not drag['ax'] or event.xdata is None:
+                return
+            # prog kilku pikseli - zwykle klikniecie (bez ruchu) nie ma sie
+            # zamieniac w zoom do zerowego prostokata
+            if abs(event.x - drag['px0']) < 4 and abs(event.y - drag['py0']) < 4:
+                return
+            setattr(self, dragging_attr, True)
+            ax = drag['ax']
+            x0, x1 = sorted([drag['x0'], event.xdata])
+            y0, y1 = sorted([drag['y0'], event.ydata])
+            if drag['rect'] is None:
+                drag['rect'] = Rectangle((x0, y0), x1 - x0, y1 - y0, fill=True,
+                                         facecolor=C['cyan'], alpha=0.15,
+                                         edgecolor=C['cyan'], linewidth=1, zorder=20)
+                ax.add_patch(drag['rect'])
+            else:
+                drag['rect'].set_bounds(x0, y0, x1 - x0, y1 - y0)
+            canvas.draw_idle()
+
+        def on_release(event):
+            if drag['ax'] is None:
+                return
+            ax = drag['ax']
+            was_dragging = getattr(self, dragging_attr, False)
+            if drag['rect'] is not None:
+                try: drag['rect'].remove()
+                except Exception: pass
+                drag['rect'] = None
+            if was_dragging and event.xdata is not None and event.ydata is not None:
+                x0, x1 = sorted([drag['x0'], event.xdata])
+                y0, y1 = sorted([drag['y0'], event.ydata])
+                if x1 - x0 > 1e-12 and y1 - y0 > 1e-12:
+                    ax.set_xlim(x0, x1)
+                    ax.set_ylim(y0, y1)
+                    setattr(self, frozen_attr, True)
+            drag['ax'] = None
+            setattr(self, dragging_attr, False)
+            canvas.draw_idle()
+
+        canvas.mpl_connect('scroll_event', on_scroll)
+        canvas.mpl_connect('button_press_event', on_press)
+        canvas.mpl_connect('motion_notify_event', on_motion)
+        canvas.mpl_connect('button_release_event', on_release)
+
+        # Zapamietane pod przewidywalna nazwa - przydatne do testow (wywolanie
+        # bezposrednie, bez przechodzenia przez pelny dispatcher matplotlib
+        # ktory wymagalby pelnego obiektu zdarzenia z atrybutem .name itp).
+        if not hasattr(self, '_zoom_handlers'):
+            self._zoom_handlers = {}
+        self._zoom_handlers[frozen_attr] = {
+            'scroll': on_scroll, 'press': on_press,
+            'motion': on_motion, 'release': on_release,
+        }
+
+        # HOME w toolbarze resetuje widok do domyslnego - niech przy okazji
+        # tez odmrozi autoscale, inaczej po powrocie do "calosci" wykres by
+        # sie zablokowal na tym co pokazal HOME zamiast wrocic do zywego trybu.
+        if toolbar is not None:
+            orig_home = toolbar.home
+            def wrapped_home(*a, **kw):
+                setattr(self, frozen_attr, False)
+                return orig_home(*a, **kw)
+            toolbar.home = wrapped_home
 
     def toggle_pause(self):
         self.chart_paused = not self.chart_paused
@@ -1507,13 +1646,25 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
 
         sec2 = self._adv_section(inner, "FEED-FORWARD", C['yellow'])
-        tk.Label(sec2, text="HOLD = base power to maintain temperature\nRAMP = extra power for ramp dynamics",
+        tk.Label(sec2, text="HOLD = base power to maintain temperature\nRAMP = extra power for ramp dynamics\n"
+                      "Symmetric: heating and cooling each have their own\n"
+                      "HOLD/RAMP gains, so both track the set ramp rate\n"
+                      "with predictive power instead of cooling relying\n"
+                      "only on reactive PID correction.",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left').pack(anchor='w', pady=(0, 8))
+        tk.Label(sec2, text="HEATING", bg=C['bg2'], fg=C['orange'],
+                 font=(FONT, fsz(8), 'bold')).pack(anchor='w', pady=(0, 2))
         self.sl_kffh = SliderField(sec2, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/10°C", 2,
                                    on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
         self.sl_kffr = SliderField(sec2, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
                                    on_change=lambda v: self.send(f"KFFR:{v:.2f}"))
+        tk.Label(sec2, text="COOLING", bg=C['bg2'], fg=C['cyan'],
+                 font=(FONT, fsz(8), 'bold')).pack(anchor='w', pady=(10, 2))
+        self.sl_kffhc = SliderField(sec2, "FF HOLD COOL (KFFHC)", 0, 8, 2.5, C['cyan'], "PWM/10°C", 2,
+                                    on_change=lambda v: self.send(f"KFFHC:{v:.2f}"))
+        self.sl_kffrc = SliderField(sec2, "FF RAMP COOL (KFFRC)", 0, 4, 1.0, C['cyan'], "PWM/(°C/min)", 2,
+                                    on_change=lambda v: self.send(f"KFFRC:{v:.2f}"))
 
         sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
         self.sl_off = SliderField(sec3, "CAL OFFSET", -20, 20, 0.0,
@@ -1579,7 +1730,8 @@ class PeltierControl:
         return inner
 
     def _set_panel_enabled(self, en):
-        for sl in ['sl_sp', 'sl_ru', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_kffh', 'sl_kffr', 'sl_off', 'sl_fan']:
+        for sl in ['sl_sp', 'sl_ru', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_kffh', 'sl_kffr',
+                   'sl_kffhc', 'sl_kffrc', 'sl_off', 'sl_fan']:
             if hasattr(self, sl): getattr(self, sl).set_enabled(True)
         for b in ['btn_run', 'btn_estop', 'btn_fan']:
             if hasattr(self, b): getattr(self, b).config(state='normal')
@@ -1705,6 +1857,8 @@ class PeltierControl:
         self.send(f"KD:{self.sl_kd.get():.2f}")
         self.send(f"KFFH:{self.sl_kffh.get():.2f}")
         self.send(f"KFFR:{self.sl_kffr.get():.2f}")
+        self.send(f"KFFHC:{self.sl_kffhc.get():.2f}")
+        self.send(f"KFFRC:{self.sl_kffrc.get():.2f}")
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
         self.send(f"OPPDIR:{1 if self.oppdir_var.get() else 0}")
         time.sleep(0.05)
@@ -2225,6 +2379,9 @@ class PeltierControl:
             self.mpl_toolbar_sweep.pack(side='left', fill='x')
         except Exception as e:
             print(f"sweep toolbar err: {e}")
+            self.mpl_toolbar_sweep = None
+        self._setup_scroll_drag_zoom(self.sweep_cv, self.mpl_toolbar_sweep,
+                                     '_sweep_chart_frozen', '_sweep_chart_dragging')
 
         self._sweep_tick()  # startuje petle odswiezania wykresu/tabeli
 
@@ -2274,7 +2431,9 @@ class PeltierControl:
             _fmt(self.sweep_ax, '', 'A'); mini_units = ('', 'A')
             self.sweep_line.set_marker('')
         self.sweep_line.set_data(xs, ys)
-        if getattr(self, 'sweep_autoscale_var', None) is None or self.sweep_autoscale_var.get():
+        manual_zoom = getattr(self, '_sweep_chart_frozen', False)
+        if not manual_zoom and (getattr(self, 'sweep_autoscale_var', None) is None or self.sweep_autoscale_var.get()):
+            self.sweep_ax.set_autoscale_on(True)
             self.sweep_ax.relim(); self.sweep_ax.autoscale_view()
         self.sweep_cv.draw_idle()
         if hasattr(self, 'sweep_line_mini'):
@@ -2906,6 +3065,7 @@ class PeltierControl:
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
         self.ax_a_current = None
+        self.ax_a_voltage = None
         # WAZNE: tworzymy obiekt FigureCanvasTkAgg TERAZ (potrzebny nizej przez
         # toolbar/hover), ale JEGO WIDGET PAKUJEMY NA SAMYM KONCU funkcji -
         # patrz komentarz przy .pack() ponizej. Wczesniej wykres byl pakowany
@@ -2941,6 +3101,9 @@ class PeltierControl:
             self.mpl_toolbar_a.pack(side='left', fill='x')
         except Exception as e:
             print(f"arch toolbar err: {e}")
+            self.mpl_toolbar_a = None
+        self._setup_scroll_drag_zoom(self.cv_a, self.mpl_toolbar_a,
+                                     '_arch_chart_frozen', '_arch_chart_dragging')
 
         atb = tk.Frame(cf, bg=C['panel'])
         atb.pack(fill='x', padx=8, pady=(2, 8))
@@ -2967,14 +3130,27 @@ class PeltierControl:
             return b
         _mode_btn("temperature / time", 'time')
         _mode_btn("Keithley current / temperature", 'iT')
+
+        atb2b = tk.Frame(cf, bg=C['panel'])
+        atb2b.pack(fill='x', padx=8, pady=(0, 8))
         self.arch_show_current_var = tk.BooleanVar(value=True)
+        tk.Label(atb2b, text="KEITHLEY (below temperature):", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 4))
         self.arch_show_current_chk = tk.Checkbutton(
-            atb2, text="Show Keithley current (chart below temperature)",
-            variable=self.arch_show_current_var, command=lambda: self._redraw_arch(),
+            atb2b, text="Current", variable=self.arch_show_current_var,
+            command=lambda: self._redraw_arch(),
             bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
             font=(FONT, fsz(9)), activebackground=C['panel'],
             activeforeground=C['text'])
-        self.arch_show_current_chk.pack(side='left', padx=(12, 0))
+        self.arch_show_current_chk.pack(side='left', padx=(4, 0))
+        self.arch_show_voltage_var = tk.BooleanVar(value=False)
+        self.arch_show_voltage_chk = tk.Checkbutton(
+            atb2b, text="Voltage (same panel, together)", variable=self.arch_show_voltage_var,
+            command=lambda: self._redraw_arch(),
+            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+            font=(FONT, fsz(9)), activebackground=C['panel'],
+            activeforeground=C['text'])
+        self.arch_show_voltage_chk.pack(side='left', padx=(6, 0))
 
         atb3 = tk.Frame(cf, bg=C['panel'])
         atb3.pack(fill='x', padx=8, pady=(0, 8))
@@ -3003,8 +3179,20 @@ class PeltierControl:
         self.arch_align_unit_lbl = tk.Label(atb3, text="°C", bg=C['panel'], fg=C['dim2'],
                                             font=(FONT, fsz(9)))
         self.arch_align_unit_lbl.pack(side='left', padx=(0, 4))
+        self.arch_align_auto_btn = _align_btn("auto: match cycle →", 'auto')
         mk_btn_outline(atb3, "APPLY", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
         self.arch_align_entry.config(state='disabled')
+
+        atb4 = tk.Frame(cf, bg=C['panel'])
+        atb4.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Label(atb4, text="  ↳ reference cycle (starting temperature is matched):",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(0, 6))
+        self.arch_align_ref_var = tk.StringVar(value="")
+        self.arch_align_ref_combo = ttk.Combobox(
+            atb4, textvariable=self.arch_align_ref_var, state='disabled',
+            style='Dark.TCombobox', font=(FONT, fsz(9)), width=28)
+        self.arch_align_ref_combo.pack(side='left')
+        self.arch_align_ref_combo.bind('<<ComboboxSelected>>', lambda e: self._redraw_arch())
 
         # Wykres pakowany DOPIERO TERAZ, na samym koncu - wszystkie paski nad
         # nim (toolbar, pobieranie/PNG, tryb wykresu, ALIGN) maja juz
@@ -3022,10 +3210,52 @@ class PeltierControl:
         mode = self.arch_align_mode.get()
         if mode == 'none':
             self.arch_align_entry.config(state='disabled')
+            self.arch_align_ref_combo.config(state='disabled')
+        elif mode == 'auto':
+            self.arch_align_entry.config(state='disabled')
+            self._refresh_align_ref_combo()
+            self.arch_align_ref_combo.config(state='readonly')
         else:
             self.arch_align_entry.config(state='normal')
+            self.arch_align_ref_combo.config(state='disabled')
             self.arch_align_unit_lbl.config(text="°C" if mode == 'temp' else "A (e.g. 50n, 2u, 0.001)")
         self._redraw_arch()
+
+    def _refresh_align_ref_combo(self):
+        """Wypelnia liste wyboru cyklu-referencji nazwami aktualnie ZAZNACZONYCH
+        cykli (checkbox po lewej) - tylko sposrod nich ma sens wybierac, bo tylko
+        te sa w ogole rysowane na wykresie."""
+        names = [self._cycle_display_name(p) for p, v in self.arch_vars.items() if v.get()]
+        self.arch_align_ref_combo.config(values=names)
+        if self.arch_align_ref_var.get() not in names:
+            self.arch_align_ref_var.set(names[0] if names else "")
+
+    def _align_ref_name(self):
+        return self.arch_align_ref_var.get() if hasattr(self, 'arch_align_ref_var') else None
+
+    def _resolve_align_value(self, align_mode):
+        """Zwraca liczbowa wartosc progu wyrownania dla biezacego trybu:
+        - 'temp'/'current': wpisana recznie w pole (jak dotychczas)
+        - 'auto': WYLICZONA automatycznie jako temperatura POCZATKOWA
+          wybranego cyklu-referencji - reszta zaznaczonych cykli zostanie
+          przesunieta tak, zeby zaczynac (przekraczac ta temperature) w tym
+          samym punkcie co cykl referencyjny, bez recznego wpisywania liczby."""
+        if align_mode in ('temp', 'current'):
+            return self._parse_align_value(align_mode)
+        if align_mode == 'auto':
+            ref_name = self._align_ref_name()
+            if not ref_name:
+                return None
+            for p, v in self.arch_vars.items():
+                if self._cycle_display_name(p) == ref_name:
+                    d = self._load_cycle(p)
+                    if not d:
+                        return None
+                    t1 = d[1]
+                    first = next((x for x in t1 if x is not None), None)
+                    return first
+            return None
+        return None
 
     def _parse_align_value(self, mode):
         txt = self.arch_align_entry.get().strip().replace(',', '.')
@@ -3150,7 +3380,7 @@ class PeltierControl:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 rows = list(csv.DictReader(f))
-            t,t1,t2,sp,pwm,ki = [],[],[],[],[],[]
+            t,t1,t2,sp,pwm,ki,kv = [],[],[],[],[],[],[]
             for r in rows:
                 try:
                     t.append(float(r.get('czas_od_startu_s',0)))
@@ -3162,8 +3392,10 @@ class PeltierControl:
                     pwm.append(float(r.get('peltier_pct',0)))
                     vki = r.get('keithley_prad_A','')
                     ki.append(float(vki) if vki else None)
+                    vkv = r.get('keithley_napiecie_V','')
+                    kv.append(float(vkv) if vkv else None)
                 except: continue
-            return (t,t1,t2,sp,pwm,ki) if t else None
+            return (t,t1,t2,sp,pwm,ki,kv) if t else None
         except: return None
 
     def _style_arch_ax(self, ax):
@@ -3183,6 +3415,7 @@ class PeltierControl:
         self._arch_vline_bottom = None
         self._arch_marker_top = None
         self._arch_marker_bottom = None
+        self._arch_marker_bottom_v = None
         self._arch_marker_main = None
         self._arch_hover_last_key = None
 
@@ -3215,9 +3448,15 @@ class PeltierControl:
                 self._arch_marker_bottom, = self.ax_a_current.plot(
                     [], [], 'o', ms=5, alpha=0, zorder=9)
                 self._arch_annot_bottom = self.ax_a_current.annotate('', **annot_kw)
+                if getattr(self, 'ax_a_voltage', None) is not None:
+                    self._arch_marker_bottom_v, = self.ax_a_voltage.plot(
+                        [], [], 's', ms=5, alpha=0, zorder=9)
+                else:
+                    self._arch_marker_bottom_v = None
             else:
                 self._arch_vline_bottom = None
                 self._arch_marker_bottom = None
+                self._arch_marker_bottom_v = None
                 self._arch_annot_bottom = None
             self._arch_marker_main = None
         else:  # iT
@@ -3235,6 +3474,8 @@ class PeltierControl:
             axes = [self.ax_a]
             if self.ax_a_current is not None:
                 axes.append(self.ax_a_current)
+            if getattr(self, 'ax_a_voltage', None) is not None:
+                axes.append(self.ax_a_voltage)
             return axes
         return [self.ax_a]
 
@@ -3255,11 +3496,13 @@ class PeltierControl:
         return min(range(n), key=lambda i: abs(xs[i] - target))
 
     def _on_arch_hover(self, event):
-        # Gdy uzytkownik aktywnie przybliza/przesuwa wykres (toolbar zoom/pan),
-        # NIE liczymy hover ani nie rysujemy dymka - to konkurowalo z wlasnym
-        # rysowaniem toolbara przy kazdym ruchu myszy podczas przeciagania i
-        # powodowalo zacinanie sie calej interakcji. Hover wraca automatycznie
-        # gdy tylko narzedzie zostanie wylaczone.
+        # Gdy uzytkownik aktywnie przybliza/przesuwa wykres (toolbar zoom/pan,
+        # albo nasze wlasne przeciagniecie prostokata zoom) - NIE liczymy
+        # hover ani nie rysujemy dymka, bo to konkurowalo o rysowanie przy
+        # kazdym ruchu myszy podczas przeciagania i powodowalo zacinanie sie
+        # calej interakcji. Hover wraca automatycznie po puszczeniu przycisku.
+        if getattr(self, '_arch_chart_dragging', False):
+            return
         tb = getattr(self, 'mpl_toolbar_a', None)
         if tb is not None and getattr(tb, 'mode', ''):
             return
@@ -3271,12 +3514,18 @@ class PeltierControl:
             return
 
         mode = self._arch_hover_mode
-        # Dopasowanie do panelu pod kursorem: gorny = temperatura, dolny = prad
-        # (dla trybu iT jest tylko jeden panel = prad vs temperatura). Kazdy
-        # panel ma WLASNA adnotacje (annot_top/annot_bottom), bo xy adnotacji
-        # jest interpretowane we wspolrzednych danych jej wlasnej osi.
-        on_bottom = (mode == 'time' and event.inaxes is self.ax_a_current)
-        field = 'current' if (on_bottom or mode == 'iT') else 'temp'
+        # Dopasowanie do panelu pod kursorem: gorny = temperatura, dolny =
+        # prad/napiecie razem (oba moga byc na jednym, wspoldzielonym panelu
+        # dzieki twin-axis). Kazdy panel ma WLASNA adnotacje (annot_top/bottom),
+        # bo xy adnotacji jest interpretowane we wspolrzednych danych jej wlasnej osi.
+        on_bottom = (mode == 'time' and event.inaxes in
+                     (self.ax_a_current, getattr(self, 'ax_a_voltage', None)))
+        # W dolnym panelu prad i napiecie moga miec zupelnie rozne skale (dwie
+        # osie na jednym miejscu) - dopasowanie po Y do jednego z nich
+        # faworyzowaloby arbitralnie ta krzywa, wiec tam liczy sie TYLKO
+        # odleglosc w X (czas). Gorny panel (temperatura) nadal dopasowuje
+        # po X i Y normalnie.
+        field = 'temp' if not on_bottom and mode != 'iT' else ('current' if mode == 'iT' else None)
         active_annot = self._arch_annot_bottom if on_bottom else self._arch_annot_top
         other_annot = self._arch_annot_top if on_bottom else self._arch_annot_bottom
 
@@ -3290,13 +3539,16 @@ class PeltierControl:
             idx = self._arch_nearest_index(s['x'], event.xdata, s['sorted'])
             if idx is None:
                 continue
-            yv = s.get(field, [None]*len(s['x']))[idx]
-            if yv is None:
-                # brak wartosci Keithleya w tym punkcie (np. sweep byl wylaczony) -
-                # ciagle liczy sie jako kandydat po samym X, tylko z gorszym scorem
-                dy = yr
+            if field is None:
+                dy = 0.0  # dolny panel w trybie 'time' - dopasowanie tylko po X
             else:
-                dy = abs(yv - (event.ydata if event.ydata is not None else yv))
+                yv = s.get(field, [None]*len(s['x']))[idx]
+                if yv is None:
+                    # brak wartosci Keithleya w tym punkcie (np. sweep byl wylaczony) -
+                    # ciagle liczy sie jako kandydat po samym X, tylko z gorszym scorem
+                    dy = yr
+                else:
+                    dy = abs(yv - (event.ydata if event.ydata is not None else yv))
             dx = abs(s['x'][idx] - event.xdata)
             score = (dx / xr) ** 2 + (dy / yr) ** 2
             if best is None or score < best[0]:
@@ -3318,6 +3570,8 @@ class PeltierControl:
         t_val = s['t'][idx]
         temp_val = s['temp'][idx] if idx < len(s['temp']) else None
         cur_val = s['current'][idx] if idx < len(s['current']) else None
+        volt_val = s.get('voltage', [])
+        volt_val = volt_val[idx] if idx < len(volt_val) else None
 
         lines = [s['name']]
         lines.append(f"time: {t_val:.2f} s")
@@ -3328,6 +3582,9 @@ class PeltierControl:
             lines.append(f"I: {v} {p}A")
         else:
             lines.append("I: --")
+        if volt_val is not None:
+            v, p = fmt_si(volt_val, 3)
+            lines.append(f"V: {v} {p}V")
         text = "\n".join(lines)
 
         active_annot.set_text(text)
@@ -3349,6 +3606,12 @@ class PeltierControl:
                     self._arch_marker_bottom.set_color(s['color']); self._arch_marker_bottom.set_alpha(1)
                 else:
                     self._arch_marker_bottom.set_alpha(0)
+                if self._arch_marker_bottom_v is not None:
+                    if volt_val is not None:
+                        self._arch_marker_bottom_v.set_data([xv], [volt_val])
+                        self._arch_marker_bottom_v.set_color(s['color']); self._arch_marker_bottom_v.set_alpha(1)
+                    else:
+                        self._arch_marker_bottom_v.set_alpha(0)
         else:
             active_annot.xy = (xv, cur_val if cur_val is not None else 0)
             if cur_val is not None:
@@ -3372,6 +3635,8 @@ class PeltierControl:
             if self._arch_vline_bottom is not None:
                 self._arch_vline_bottom.set_alpha(0)
                 self._arch_marker_bottom.set_alpha(0)
+                if getattr(self, '_arch_marker_bottom_v', None) is not None:
+                    self._arch_marker_bottom_v.set_alpha(0)
         elif self._arch_marker_main is not None:
             self._arch_marker_main.set_alpha(0)
         self.cv_a.draw_idle()
@@ -3380,6 +3645,8 @@ class PeltierControl:
         sel = [(p,v) for p,v in self.arch_vars.items() if v.get()]
         show_current = getattr(self, 'arch_show_current_var', None) is not None \
                        and self.arch_show_current_var.get()
+        show_voltage = getattr(self, 'arch_show_voltage_var', None) is not None \
+                       and self.arch_show_voltage_var.get()
         mode = getattr(self, 'arch_chart_mode', None)
         mode = mode.get() if mode is not None else 'time'
 
@@ -3388,45 +3655,63 @@ class PeltierControl:
         forder = {str(f):i for i,f in enumerate(files)}
         loaded = []
         any_current_data = False
+        any_voltage_data = False
         for path,_ in sel:
             d = self._load_cycle(path)
             if not d: continue
-            t,t1,t2,sp,pwm,ki = d
+            t,t1,t2,sp,pwm,ki,kv = d
             has_i = any(v is not None for v in ki)
+            has_v = any(v is not None for v in kv)
             any_current_data = any_current_data or has_i
-            loaded.append((path, t, t1, sp, ki, has_i))
+            any_voltage_data = any_voltage_data or has_v
+            loaded.append((path, t, t1, sp, ki, kv, has_i, has_v))
 
-        # checkbox "pokaz prad pod spodem" i wyrownanie maja sens tylko w widoku czasowym
+        # checkboxy prad/napiecie i wyrownanie maja sens tylko w widoku czasowym
         if hasattr(self, 'arch_show_current_chk'):
-            self.arch_show_current_chk.config(state='normal' if mode == 'time' else 'disabled')
+            st = 'normal' if mode == 'time' else 'disabled'
+            self.arch_show_current_chk.config(state=st)
+            self.arch_show_voltage_chk.config(state=st)
         if hasattr(self, 'arch_align_temp_btn'):
             align_state = 'normal' if mode == 'time' else 'disabled'
             self.arch_align_temp_btn.config(state=align_state)
             self.arch_align_cur_btn.config(state=align_state)
+            self.arch_align_auto_btn.config(state=align_state)
             if mode != 'time':
                 self.arch_align_entry.config(state='disabled')
+                self.arch_align_ref_combo.config(state='disabled')
+            elif self.arch_align_mode.get() == 'auto':
+                self.arch_align_ref_combo.config(state='readonly')
             elif self.arch_align_mode.get() != 'none':
                 self.arch_align_entry.config(state='normal')
 
         if mode == 'iT':
-            self._redraw_arch_iT(sel, loaded, forder)
+            self._redraw_arch_iT(sel, [(p,t,t1,s,ki,hi) for p,t,t1,s,ki,kv,hi,hv in loaded], forder)
             return
 
-        # Przebuduj uklad figury od zera (jedna os lub dwie jedna pod druga)
+        # Przebuduj uklad figury od zera (jedna os lub dwie jedna pod druga).
+        # Dolny panel (jesli pokazany) moze zawierac PRAD i NAPIECIE razem -
+        # prad na lewej osi, napiecie na prawej (twin), oba widoczne naraz
+        # zamiast osobnych, przelaczanych wykresow.
         self.fig_a.clear()
-        two_panels = show_current and any_current_data
-        if two_panels:
+        want_bottom = (show_current and any_current_data) or (show_voltage and any_voltage_data)
+        if want_bottom:
             gs = self.fig_a.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.12,
-                                         left=0.1, right=0.97, top=0.96, bottom=0.09)
+                                         left=0.1, right=0.9, top=0.96, bottom=0.09)
             self.ax_a = self.fig_a.add_subplot(gs[0])
             ax_i = self.fig_a.add_subplot(gs[1], sharex=self.ax_a)
+            ax_v = ax_i.twinx() if (show_voltage and any_voltage_data) else None
         else:
             self.ax_a = self.fig_a.add_subplot(111)
             self.fig_a.subplots_adjust(left=0.1, right=0.97, top=0.96, bottom=0.09)
             ax_i = None
+            ax_v = None
         self.ax_a_current = ax_i
+        self.ax_a_voltage = ax_v
         self._style_arch_ax(self.ax_a)
         if ax_i is not None: self._style_arch_ax(ax_i)
+        if ax_v is not None:
+            ax_v.tick_params(colors=C['orange'], labelsize=8)
+            for sp2 in ax_v.spines.values(): sp2.set_visible(False)
 
         if not sel:
             self.ax_a.text(0.5,0.5,"Tick a cycle to display",
@@ -3438,14 +3723,18 @@ class PeltierControl:
         hover_series = []
         align_mode = getattr(self, 'arch_align_mode', None)
         align_mode = align_mode.get() if align_mode is not None else 'none'
-        align_val = self._parse_align_value(align_mode) if align_mode != 'none' else None
+        if align_mode == 'auto' and hasattr(self, 'arch_align_ref_combo'):
+            self._refresh_align_ref_combo()
+        align_val = self._resolve_align_value(align_mode)
         align_missed = []  # nazwy cykli ktore nie osiagnely progu - uzyty naturalny start
-        for path, t, t1, sp, ki, has_i in loaded:
+        show_i_curve = show_current and any_current_data
+        show_v_curve = show_voltage and any_voltage_data
+        for path, t, t1, sp, ki, kv, has_i, has_v in loaded:
             ci = forder.get(path,0)%len(self._arch_colors)
             col = self._arch_colors[ci]
             nm = self._cycle_display_name(path)
             t_ref = t[0]
-            if align_mode == 'temp' and align_val is not None:
+            if align_mode in ('temp', 'auto') and align_val is not None:
                 idx = self._find_threshold_crossing(t1, align_val)
                 if idx is not None: t_ref = t[idx]
                 else: align_missed.append(nm)
@@ -3456,15 +3745,22 @@ class PeltierControl:
             tx = [x - t_ref for x in t]
             self.ax_a.plot(tx, sp, color=C['orange'], lw=1, ls='--', alpha=0.5)
             self.ax_a.plot(tx, t1, color=col, lw=2, label=nm[:20])
-            if ax_i is not None and has_i:
-                # ten sam kolor co T1 danego cyklu - latwo skojarzyc pary krzywych
-                ax_i.plot(tx, ki, color=col, lw=1.4)
+            if ax_i is not None and show_i_curve and has_i:
+                # ten sam kolor co T1 danego cyklu - latwo skojarzyc pary krzywych.
+                # Linia CIAGLA = prad, zeby odroznic od napiecia (przerywana) gdy
+                # oba sa pokazane naraz na tym samym panelu.
+                ax_i.plot(tx, ki, color=col, lw=1.4, ls='-')
+            if ax_v is not None and show_v_curve and has_v:
+                ax_v.plot(tx, kv, color=col, lw=1.2, ls=':', alpha=0.85)
             # dane do hover-kursora: tx jest chronologicznie rosnace (bisect OK)
             hover_series.append({'name': nm, 'color': col, 'x': tx, 't': tx,
-                                  'temp': t1, 'current': ki, 'sorted': True})
+                                  'temp': t1, 'current': ki, 'voltage': kv, 'sorted': True})
 
         if align_mode == 'temp' and align_val is not None:
             xlabel = f"time relative to T={align_val:g}°C [s]"
+        elif align_mode == 'auto' and align_val is not None:
+            ref_name = self._align_ref_name() or "reference"
+            xlabel = f"time relative to T={align_val:g}°C (matched to '{ref_name}') [s]"
         elif align_mode == 'current' and align_val is not None:
             av, ap = fmt_si(align_val, 2)
             xlabel = f"time relative to I={av} {ap}A [s]"
@@ -3475,16 +3771,30 @@ class PeltierControl:
             try:
                 from matplotlib.ticker import EngFormatter
                 ax_i.yaxis.set_major_formatter(EngFormatter(unit='A'))
+                if ax_v is not None:
+                    ax_v.yaxis.set_major_formatter(EngFormatter(unit='V'))
             except Exception:
                 pass
-            ax_i.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
+            if show_i_curve and show_v_curve:
+                ax_i.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
+                ax_v.set_ylabel('Keithley voltage', color=C['orange'], fontsize=9)
+            elif show_v_curve:
+                ax_i.set_ylabel('')
+                ax_i.tick_params(labelleft=False, left=False)
+                ax_v.set_ylabel('Keithley voltage', color=C['orange'], fontsize=9)
+            else:
+                ax_i.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
+                if ax_v is not None: ax_v.set_visible(False)
             ax_i.set_xlabel(xlabel, color=C['dim'], fontsize=9)
             # ukryj etykiety X gornego wykresu - wspolna os czasu na dole
             self.ax_a.tick_params(labelbottom=False)
         else:
             self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
-            if show_current and not any_current_data:
-                self.ax_a.text(0.02, 0.02, "no Keithley data in the selected cycles",
+            missing = []
+            if show_current and not any_current_data: missing.append("current")
+            if show_voltage and not any_voltage_data: missing.append("voltage")
+            if missing:
+                self.ax_a.text(0.02, 0.02, f"no Keithley {'/'.join(missing)} data in the selected cycles",
                                color=C['dim2'], fontsize=8, transform=self.ax_a.transAxes)
         if align_missed:
             names = ", ".join(align_missed[:3]) + ("…" if len(align_missed) > 3 else "")
@@ -3512,6 +3822,7 @@ class PeltierControl:
         self.ax_a = self.fig_a.add_subplot(111)
         self.fig_a.subplots_adjust(left=0.12, right=0.97, top=0.96, bottom=0.11)
         self.ax_a_current = None
+        self.ax_a_voltage = None
         self._style_arch_ax(self.ax_a)
 
         if not sel:
@@ -3747,13 +4058,19 @@ class PeltierControl:
                 pct = d.get('pct', 0)
                 fn  = d.get('fan', 0)
                 tsr = d.get('ts', 0) / 1000.0
+                heat_dir = d.get('heat', True)
 
                 if self.t0 is None: self.t0 = tsr
                 rel = tsr - self.t0
 
                 self.t.append(rel); self.temp1.append(t1); self.temp2.append(t2)
                 self.spt.append(sp); self.spa.append(spa)
-                self.pwm.append(pct); self.fanv.append(fn)
+                # PWM zapisywany ZE ZNAKIEM: dodatni = grzanie, ujemny =
+                # chlodzenie - dzieki temu wykres pokazuje kierunek bez
+                # potrzeby osobnego wskaznika HEAT/COOL obok (patrz _draw_chart:
+                # dwukolorowe wypelnienie ponad/ponizej zera).
+                self.pwm.append(pct if heat_dir else -pct)
+                self.fanv.append(fn)
 
                 # Ostatnia znana temp/czas - do odczytu przez watek sweep (korelacja
                 # kazdego punktu I-V z temperatura w momencie pomiaru)
@@ -3783,7 +4100,6 @@ class PeltierControl:
                 # (log cyklu, RAW DATA, karta na zywo), zeby wykluczyc jakakolwiek
                 # niespojnosc miedzy oddzielnymi odczytami w tej samej iteracji.
                 k_i, k_v = self._keithley_latest()
-                heat_dir = d.get('heat', True)
 
                 if self.cyc_on:
                     self.cyc_log(rel, t1, t2, sp, pct, fn,
@@ -3885,6 +4201,8 @@ class PeltierControl:
                 if 'kd' in d and hasattr(self,'sl_kd'): self.sl_kd.set(float(d['kd']))
                 if 'kffh' in d and hasattr(self,'sl_kffh'): self.sl_kffh.set(float(d['kffh']))
                 if 'kffr' in d and hasattr(self,'sl_kffr'): self.sl_kffr.set(float(d['kffr']))
+                if 'kffhc' in d and hasattr(self,'sl_kffhc'): self.sl_kffhc.set(float(d['kffhc']))
+                if 'kffrc' in d and hasattr(self,'sl_kffrc'): self.sl_kffrc.set(float(d['kffrc']))
                 if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
                 if 'oppdir' in d and hasattr(self,'oppdir_var'): self._set_oppdir(bool(d['oppdir']), send=False)
                 self._cfg_synced = True
@@ -3906,14 +4224,24 @@ class PeltierControl:
         self.ln_spa.set_data(t, spa)
         self.ln_t1.set_data(t, safe(t1))
         self.ln_t2.set_data(t, safe(t2))
-        self.ln_pwm.set_data(t, pw)
 
-        # fill_between nie ma set_data - trzeba przebudowac sam ten jeden artysta
+        # PWM ze znakiem rozbity na dwie maskowane serie - tam gdzie grzanie
+        # (dodatnie), krzywa chlodzenia ma NaN (przerwa) i odwrotnie. Dzieki
+        # temu kolor przechodzi ostro na zerze bez zadnej dodatkowej logiki.
+        pw_heat = [v if (v is not None and v > 0) else float('nan') for v in pw]
+        pw_cool = [v if (v is not None and v < 0) else float('nan') for v in pw]
+        self.ln_pwm_heat.set_data(t, pw_heat)
+        self.ln_pwm_cool.set_data(t, pw_cool)
+
+        # fill_between nie ma set_data - trzeba przebudowac te dwa artysty
         # (wciaz duzo tansze niz pelny ax.clear() calego wykresu)
-        if self.pwm_fill is not None:
-            try: self.pwm_fill.remove()
-            except Exception: pass
-        self.pwm_fill = self.ax2.fill_between(t, 0, pw, color=C['green'], alpha=0.3)
+        for attr in ('pwm_fill_heat', 'pwm_fill_cool'):
+            old = getattr(self, attr, None)
+            if old is not None:
+                try: old.remove()
+                except Exception: pass
+        self.pwm_fill_heat = self.ax2.fill_between(t, 0, pw_heat, color=C['orange'], alpha=0.3)
+        self.pwm_fill_cool = self.ax2.fill_between(t, 0, pw_cool, color=C['cyan'], alpha=0.3)
 
         # Autoscale TYLKO gdy uzytkownik nie ma aktywnego zoom/pan z toolbara -
         # inaczej co 250ms wyrywalibysmy mu widok z powrotem do pelnego zakresu.
@@ -3924,7 +4252,7 @@ class PeltierControl:
         if not self._live_toolbar_busy():
             self.ax1.set_autoscale_on(True); self.ax2.set_autoscale_on(True)
             self.ax1.relim(); self.ax1.autoscale_view()
-            self.ax2.relim(); self.ax2.autoscale_view(scaley=False)  # Y stale -5..105
+            self.ax2.relim(); self.ax2.autoscale_view(scaley=False)  # Y stale -105..105 (symetryczne wzgledem zera)
 
         self.cv.draw_idle()
 
