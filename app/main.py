@@ -408,7 +408,7 @@ class PeltierControl:
         self.t0 = None
         self.data_queue = queue.Queue()
 
-        self.raw_maxrows = 2000
+        self.raw_maxrows = 100
         self.raw_rows = []
         self.raw_paused = False
         self.raw_autoscroll = True
@@ -999,6 +999,53 @@ class PeltierControl:
 
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
+        # ── Wybor programu uzywanego po klikni?ciu START ──
+        # "Manual" = zwykle zachowanie (TARGET/RATE ze suwakow powyzej).
+        # Wybranie zapisanego programu sprawia, ze START uruchamia CALA
+        # sekwencje krokow (jak przycisk START PROGRAM w zakladce PROGRAM),
+        # zamiast pojedynczego, stalego celu.
+        prog_hd = tk.Frame(inner, bg=C['bg2'])
+        prog_hd.pack(fill='x', pady=(0, 4))
+        tk.Label(prog_hd, text="PROGRAM ON START", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        tk.Button(prog_hd, text="⟳", command=self._refresh_control_program_list,
+                 bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10), 'bold'),
+                 relief='flat', cursor='hand2', bd=0, padx=6,
+                 activebackground=C['panel3']).pack(side='right')
+
+        style = ttk.Style()
+        style.theme_use(style.theme_use())  # zachowaj biezacy motyw bazowy
+        style.configure('Dark.TCombobox', fieldbackground=C['bg2'], background=C['bg2'],
+                        foreground=C['text'], arrowcolor=C['dim'], bordercolor=C['border'],
+                        lightcolor=C['bg2'], darkcolor=C['bg2'])
+        style.map('Dark.TCombobox', fieldbackground=[('readonly', C['bg2'])],
+                  foreground=[('readonly', C['text'])])
+
+        self.CONTROL_PROGRAM_MANUAL = "Manual (TARGET/RATE)"
+        self.control_program_var = tk.StringVar(value=self.CONTROL_PROGRAM_MANUAL)
+        self.control_program_combo = ttk.Combobox(
+            inner, textvariable=self.control_program_var, state='readonly',
+            style='Dark.TCombobox', font=(FONT, fsz(9)))
+        self.control_program_combo.pack(fill='x', pady=(0, 4))
+        self.control_program_hint = tk.Label(
+            inner, text="", bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+            wraplength=260, justify='left')
+        self.control_program_hint.pack(anchor='w', pady=(0, 4))
+
+        # Zywy podglad postepu (widoczny tylko gdy program faktycznie dziala) -
+        # dokladnie to samo co widac w zakladce PROGRAM, zeby nie trzeba bylo
+        # przelaczac zakladek zeby sprawdzic ile zostalo do konca kroku.
+        self.control_prog_status_lbl = tk.Label(
+            inner, text="", bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'))
+        self.control_prog_status_lbl.pack(anchor='w', pady=(0, 1))
+        self.control_prog_detail_lbl = tk.Label(
+            inner, text="", bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+            wraplength=260, justify='left')
+        self.control_prog_detail_lbl.pack(anchor='w', pady=(0, 10))
+        self.control_program_var.trace_add('write', lambda *a: self._on_control_program_pick())
+
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+
         # Tryb grzania/chlodzenia
         auto_lbl = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                             highlightbackground=C['green'])
@@ -1006,12 +1053,14 @@ class PeltierControl:
         tk.Label(auto_lbl, text="AUTO: direction based on setpoint", bg=C['bg2'],
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
-        tk.Label(inner, text="▶ START uses panel values",
-                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
+        self.control_start_hint_lbl = tk.Label(inner, text="▶ START uses panel values",
+                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8)))
+        self.control_start_hint_lbl.pack(anchor='w', pady=(4, 0))
         tk.Label(inner, text="PID + Feed-Forward tuning → ADVANCED tab",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
 
         self._set_panel_enabled(False)
+        self._refresh_control_program_list()
 
     # ════════════════════════════════════════════════════════════
     #  PROGRAMATOR: sekwencja krokow grzej->trzymaj->schlodz->trzymaj
@@ -1235,9 +1284,25 @@ class PeltierControl:
         try:
             with open(dest, 'w', encoding='utf-8') as f:
                 json.dump({'steps': self.program_steps}, f, indent=2, ensure_ascii=False)
+            self._refresh_control_program_list()
             messagebox.showinfo("Saved", f"Program saved to:\n{dest}")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
+
+    def _parse_program_json(self, path):
+        """Wczytuje i waliduje plik programu (.json) - zwraca liste czystych
+        krokow albo rzuca wyjatek z czytelnym opisem bledu. Wspoldzielone przez
+        load_program() (dialog wyboru pliku) i selektor programu w CONTROL
+        (wybor z listy rozwijanej, bez dialogu)."""
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        steps = data.get('steps', [])
+        clean = []
+        for s in steps:
+            clean.append({'target': float(s['target']),
+                          'ramp': (float(s['ramp']) if s.get('ramp') is not None else None),
+                          'hold_min': float(s['hold_min'])})
+        return clean
 
     def load_program(self):
         if self.program_running:
@@ -1250,15 +1315,7 @@ class PeltierControl:
         if not src:
             return
         try:
-            with open(src, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            steps = data.get('steps', [])
-            # walidacja podstawowa - odrzuc plik jesli struktura jest nie taka jak oczekiwana
-            clean = []
-            for s in steps:
-                clean.append({'target': float(s['target']),
-                              'ramp': (float(s['ramp']) if s.get('ramp') is not None else None),
-                              'hold_min': float(s['hold_min'])})
+            clean = self._parse_program_json(src)
             self.program_steps = clean
             self._refresh_program_list()
             messagebox.showinfo("Loaded", f"Loaded {len(clean)} steps from:\n{src}")
@@ -1289,9 +1346,46 @@ class PeltierControl:
         self.program_state = 'idle'
         self.btn_prog_start.config(state='normal')
         self.btn_prog_stop.config(state='disabled')
-        self.prog_status_lbl.config(text="Program stopped.", fg=C['dim'])
-        self.prog_detail_lbl.config(text="")
+        self._set_program_status("Program stopped.", C['dim'], "")
         self._refresh_program_list()
+
+    def _fmt_duration_min(self, minutes):
+        """Formatuje czas trwania w minutach na czytelny tekst (Xh Ym albo Ym)."""
+        if minutes < 0: minutes = 0
+        total_s = int(round(minutes * 60))
+        h, rem = divmod(total_s, 3600)
+        mn, _s = divmod(rem, 60)
+        if h > 0:
+            return f"~{h}h {mn}m"
+        return f"~{mn} min" if mn > 0 else "<1 min"
+
+    def _estimate_program_duration(self, steps, start_temp=None):
+        """Szacuje CALKOWITY czas trwania programu (rampy + przytrzymania), w
+        minutach. To tylko PRZYBLIZENIE dla rampy: liczy dystans/tempo, bez
+        uwzgledniania rzeczywistej bezwladnosci cieplnej ukladu (opoznienia,
+        overshoot) - realny czas dojazdu moze byc dluzszy. Przytrzymanie jest
+        dokladne (to zwykla stala z kroku)."""
+        if not steps:
+            return 0.0
+        total = 0.0
+        cur = start_temp if start_temp is not None else steps[0]['target']
+        for s in steps:
+            rate = s['ramp'] if s['ramp'] is not None else self.sl_ru.get()
+            rate = max(rate, 0.1)  # unikaj dzielenia przez 0 przy nietypowej rampie
+            dist = abs(s['target'] - cur)
+            total += dist / rate + s['hold_min']
+            cur = s['target']
+        return total
+
+    def _set_program_status(self, text, color, detail=""):
+        """Aktualizuje status programu w OBU miejscach na raz: w zakladce
+        PROGRAM i na CONTROL (jesli tam uruchomiono) - zeby uzytkownik widzial
+        postep niezaleznie na ktorej zakladce akurat jest."""
+        self.prog_status_lbl.config(text=text, fg=color)
+        self.prog_detail_lbl.config(text=detail)
+        if hasattr(self, 'control_prog_status_lbl'):
+            self.control_prog_status_lbl.config(text=text, fg=color)
+            self.control_prog_detail_lbl.config(text=detail)
 
     def _program_tick(self, current_temp):
         """Maszyna stanow programatora - wywolywana co kazdy tick() (250ms) gdy
@@ -1304,8 +1398,7 @@ class PeltierControl:
             self.program_state = 'done'
             self.btn_prog_start.config(state='normal')
             self.btn_prog_stop.config(state='disabled')
-            self.prog_status_lbl.config(text="✓ Program complete.", fg=C['green'])
-            self.prog_detail_lbl.config(text=f"Completed {len(self.program_steps)} steps.")
+            self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
             self._refresh_program_list()
             return
 
@@ -1330,21 +1423,32 @@ class PeltierControl:
             else:
                 self.program_stable_since = None
 
-            self.prog_status_lbl.config(
+            ramp_rate = step['ramp'] if step['ramp'] is not None else self.sl_ru.get()
+            ramp_rate = max(ramp_rate, 0.1)
+            eta_s = abs(current_temp - step['target']) / ramp_rate * 60.0
+            self._set_program_status(
                 text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
-                     f"approaching {step['target']:.1f}°C", fg=C['cyan'])
-            self.prog_detail_lbl.config(
-                text=f"Current temperature: {current_temp:.2f}°C "
-                     f"(tolerance ±{self.program_tolerance:g}°C)")
+                     f"approaching {step['target']:.1f}°C",
+                color=C['cyan'],
+                detail=f"Now: {current_temp:.2f}°C (±{self.program_tolerance:g}°C tol.) · "
+                       f"ETA to target: ~{self._fmt_mmss(eta_s)} · "
+                       f"then hold {self._fmt_mmss(step['hold_min']*60)}")
 
         elif self.program_state == 'holding':
             elapsed = time.time() - self.program_hold_start
             remaining = step['hold_min'] * 60.0 - elapsed
-            self.prog_status_lbl.config(
+            next_hint = ""
+            if self.program_step_idx + 1 < len(self.program_steps):
+                nxt = self.program_steps[self.program_step_idx + 1]
+                next_hint = f" · next: → {nxt['target']:.1f}°C"
+            else:
+                next_hint = " · last step"
+            self._set_program_status(
                 text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
-                     f"holding at {step['target']:.1f}°C", fg=C['green'])
-            self.prog_detail_lbl.config(
-                text=f"Remaining: {self._fmt_mmss(remaining)} / {self._fmt_mmss(step['hold_min']*60)}")
+                     f"holding at {step['target']:.1f}°C",
+                color=C['green'],
+                detail=f"Remaining: {self._fmt_mmss(remaining)} / "
+                       f"{self._fmt_mmss(step['hold_min']*60)}{next_hint}")
             if remaining <= 0:
                 self.program_step_idx += 1
                 if self.program_step_idx >= len(self.program_steps):
@@ -1356,8 +1460,7 @@ class PeltierControl:
                     self.program_state = 'done'
                     self.btn_prog_start.config(state='normal')
                     self.btn_prog_stop.config(state='disabled')
-                    self.prog_status_lbl.config(text="✓ Program complete.", fg=C['green'])
-                    self.prog_detail_lbl.config(text=f"Completed {len(self.program_steps)} steps.")
+                    self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
                 else:
                     self.program_state = 'ramping'
                     self.program_step_sent = False
@@ -1477,9 +1580,94 @@ class PeltierControl:
             if hasattr(self, b): getattr(self, b).config(state='normal')
 
     # ─── AKCJE ───────────────────────────────────────────
+    def _refresh_control_program_list(self):
+        """Skanuje katalog programow i wypelnia liste rozwijana w CONTROL.
+        Wywolywane przy starcie aplikacji, po zapisie nowego programu (PROGRAM
+        tab) i recznie przyciskiem odswiezania (⟳) obok listy."""
+        if not hasattr(self, 'control_program_combo'):
+            return
+        names = sorted(p.name for p in self.programs_dir.glob("*.json"))
+        values = [self.CONTROL_PROGRAM_MANUAL] + names
+        current = self.control_program_var.get()
+        self.control_program_combo.config(values=values)
+        if current not in values:
+            self.control_program_var.set(self.CONTROL_PROGRAM_MANUAL)
+        self._on_control_program_pick()
+
+    def _on_control_program_pick(self):
+        """Aktualizuje podpowiedz pod lista zaleznie od wyboru - jasno mowi co
+        zrobi przycisk START zanim uzytkownik go nacisnie, wraz z przyblizonym
+        szacowanym czasem trwania calego programu."""
+        if not hasattr(self, 'control_start_hint_lbl'):
+            return
+        sel = self.control_program_var.get()
+        if sel == self.CONTROL_PROGRAM_MANUAL:
+            self.control_program_hint.config(text="")
+            self.control_start_hint_lbl.config(
+                text="▶ START uses panel values", fg=C['green'])
+        else:
+            n_steps = None
+            est_txt = ""
+            try:
+                steps = self._parse_program_json(self.programs_dir / sel)
+                n_steps = len(steps)
+                est_min = self._estimate_program_duration(steps, self.last_known_t1)
+                est_txt = f", {self._fmt_duration_min(est_min)} estimated"
+            except Exception:
+                pass
+            steps_txt = f"{n_steps} steps" if n_steps is not None else "?"
+            self.control_program_hint.config(
+                text=f"Runs the full step sequence from '{sel}' ({steps_txt}{est_txt}) "
+                     f"instead of a single fixed target. Estimate assumes ideal "
+                     f"ramp rates - actual time may vary with thermal load.")
+            self.control_start_hint_lbl.config(
+                text="▶ START runs the selected PROGRAM", fg=C['orange'])
+        # gdy program aktualnie nie dziala, wyczysc podglad postepu (zeby nie
+        # zostawal "przyklejony" stary status po zmianie wyboru na liscie)
+        if not self.program_running and hasattr(self, 'control_prog_status_lbl'):
+            self.control_prog_status_lbl.config(text="")
+            self.control_prog_detail_lbl.config(text="")
+
+    def _stop_active_program(self):
+        """Zatrzymuje aktywna sekwencje programu (jesli byla wlaczona) - wolane
+        przy STOP/E-STOP z CONTROL, zeby zatrzymanie PID zatrzymywalo tez
+        automatyczne przejscia do kolejnych krokow, a nie tylko biezace grzanie."""
+        if getattr(self, 'program_running', False):
+            self.program_running = False
+            self.program_state = 'idle'
+            if hasattr(self, 'btn_prog_start'): self.btn_prog_start.config(state='normal')
+            if hasattr(self, 'btn_prog_stop'): self.btn_prog_stop.config(state='disabled')
+            if hasattr(self, '_refresh_program_list'): self._refresh_program_list()
+
     def toggle_run(self):
         if self.is_running: self.do_stop()
-        else: self.do_start()
+        else:
+            sel = getattr(self, 'control_program_var', None)
+            sel = sel.get() if sel is not None else self.CONTROL_PROGRAM_MANUAL
+            if sel != getattr(self, 'CONTROL_PROGRAM_MANUAL', None):
+                self._start_control_program(sel)
+            else:
+                self.do_start()
+
+    def _start_control_program(self, name):
+        """START na CONTROL, gdy wybrany jest zapisany program (nie 'Manual') -
+        wczytuje kroki z pliku i uruchamia cala sekwencje (jak START PROGRAM
+        w zakladce PROGRAM), zamiast pojedynczego, stalego celu z suwakow."""
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        try:
+            steps = self._parse_program_json(self.programs_dir / name)
+        except Exception as e:
+            messagebox.showerror("Program load error", f"Could not load program '{name}':\n{e}")
+            return
+        if not steps:
+            messagebox.showinfo("Empty program", f"Program '{name}' has no steps.")
+            return
+        self.program_steps = steps
+        if hasattr(self, '_refresh_program_list'):
+            self._refresh_program_list()
+        self.start_program()
 
     def _update_run_button(self, running):
         self.is_running = running
@@ -1524,17 +1712,20 @@ class PeltierControl:
         self._update_run_button(False)
         self.sweep_abort = True
         self.keithley_stop_measurement()
+        self._stop_active_program()
 
     def do_stop_peltier_only(self):
         """Zatrzymuje TYLKO PID Peltiera, nie ruszajac sweepu/pomiaru Keithleya."""
         self.send("STOP")
         self._update_run_button(False)
+        self._stop_active_program()
 
     def do_estop(self):
         self.send("STOP")
         self._update_run_button(False)
         self.sweep_abort = True
         self.keithley_stop_measurement()
+        self._stop_active_program()
 
     def toggle_fan(self):
         if not self.connected:
@@ -1640,7 +1831,7 @@ class PeltierControl:
         self.raw_tree.bind('<Button-5>', lambda e: setattr(self, 'raw_autoscroll', False))
 
         info = tk.Label(wrap, text="The table only updates while this tab is open (max 5x/s) - so it doesn't "
-                        "load the program in the background. The buffer (max 2000 samples) always collects data, so EXPORT CSV "
+                        f"load the program in the background. The buffer (max {self.raw_maxrows} samples) always collects data, so EXPORT CSV "
                         "works independently. The full raw record from START to STOP is in the ARCHIVE tab.",
                         bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), wraplength=900, justify='left')
         info.pack(anchor='w', pady=(8, 0))
@@ -1804,13 +1995,20 @@ class PeltierControl:
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  wraplength=250, justify='left').pack(anchor='w', pady=(0, 8))
 
-        units_box = tk.Frame(linner, bg=C['bg2'], highlightthickness=1,
+        # Jednostki sa teraz pokazane bezposrednio przy kazdym polu (V/A/ms/PLC/x/pts),
+        # wiec ten blok to tylko DODATKOWY szczegol (twarde limity sprzetu) -
+        # zwijany, domyslnie schowany, zeby nie zajmowal miejsca ktore realnie
+        # potrzebne jest na same pola.
+        self.units_expanded = tk.BooleanVar(value=False)
+        self.btn_units_toggle = tk.Button(linner, text="▶ units & hardware limits",
+                                          command=self._toggle_units_section,
+                                          bg=C['panel'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                          relief='flat', cursor='hand2', bd=0, anchor='w')
+        self.btn_units_toggle.pack(fill='x', pady=(0, 2))
+        self.units_box = tk.Frame(linner, bg=C['bg2'], highlightthickness=1,
                              highlightbackground=C['border'])
-        units_box.pack(fill='x', pady=(0, 14))
-        tk.Label(units_box, text="UNITS AND LIMITS (Keithley 2611B)",
-                 bg=C['bg2'], fg=C['orange'], font=(FONT, fsz(8), 'bold'),
-                 wraplength=250, justify='left').pack(anchor='w', padx=8, pady=(6, 2))
-        tk.Label(units_box,
+        # nie pakujemy od razu - domyslnie zwiniete
+        tk.Label(self.units_box,
                  text="VALUE/START/STOP: V (volts) or A (amps),\n"
                       "depends on MODE. LIMIT: opposite unit -\n"
                       "compliance (with a V source it limits current in A,\n"
@@ -1825,7 +2023,7 @@ class PeltierControl:
                       f"current {SMU_I_COMPLIANCE_MIN*1e9:g}nA. The program checks\n"
                       "this automatically before starting a sweep/measurement.",
                  bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(8)),
-                 wraplength=250, justify='left').pack(anchor='w', padx=8, pady=(0, 8))
+                 wraplength=250, justify='left').pack(anchor='w', padx=8, pady=8)
 
         # Wybor trybu
         mode_row = tk.Frame(linner, bg=C['panel'])
@@ -1861,31 +2059,41 @@ class PeltierControl:
             lbl = tk.Label(row, text=label, bg=C['panel'], fg=C['dim'],
                      font=(FONT, fsz(9)), width=13, anchor='w')
             lbl.pack(side='left')
+            # WAZNE: jednostka pakowana side='right' PRZED polem tekstowym -
+            # to gwarantuje ze zawsze dostaje swoja naturalna szerokosc i jest
+            # widoczna, niezaleznie od szerokosci panelu. Wczesniej etykieta
+            # jednostki byla pakowana PO polu z expand=True/fill='x', ktore
+            # przy waskim panelu potrafilo zabrac cala dostepna przestrzen i
+            # wypchnac jednostke poza widoczny obszar (V/A/ms/x nigdy sie nie
+            # pokazywaly).
+            ulbl = tk.Label(row, text=unit, bg=C['panel'],
+                            fg=C['orange'] if unit else C['dim2'],
+                            font=(FONT, fsz(9), 'bold' if unit else 'normal'),
+                            width=4, anchor='w')
+            ulbl.pack(side='right', padx=(4, 0))
             e = tk.Entry(row, bg=C['bg2'], fg=C['text'], font=(FONT, fsz(10)),
                         relief='flat', bd=0, insertbackground=C['orange'],
                         highlightthickness=1, highlightbackground=C['border'])
             e.pack(side='left', fill='x', expand=True, ipady=4)
             e.insert(0, str(default))
-            ulbl = tk.Label(row, text=unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(8)), width=3, anchor='w')
-            ulbl.pack(side='left', padx=(4, 0))
             e.unit_lbl = ulbl
             e.field_lbl = lbl
             return e
 
-        # ── PARAMETRY - zwijana sekcja (oszczedza miejsce) ──
-        self.params_expanded = tk.BooleanVar(value=True)
+        # ── Opis pol - ZWIJANY, domyslnie ZWINIETY (sama tresc pomocnicza,
+        # nie zawiera pol - te sa zawsze widoczne nizej, bez wzgledu na stan) ──
+        self.params_expanded = tk.BooleanVar(value=False)
         phd = tk.Frame(linner, bg=C['panel'])
         phd.pack(fill='x', pady=(12, 2))
-        self.btn_params_toggle = tk.Button(phd, text="▼ PARAMETERS", command=self._toggle_params_section,
+        self.btn_params_toggle = tk.Button(phd, text="▶ field descriptions", command=self._toggle_params_section,
                                            bg=C['panel'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
                                            relief='flat', cursor='hand2', bd=0, anchor='w')
         self.btn_params_toggle.pack(fill='x')
 
-        self.params_body = tk.Frame(linner, bg=C['panel'])
-        self.params_body.pack(fill='x')
+        self.params_help_body = tk.Frame(linner, bg=C['panel'])
+        # nie pakujemy od razu - domyslnie zwiniete (patrz params_expanded=False)
 
-        self.params_desc_lbl = tk.Label(self.params_body,
+        self.params_desc_lbl = tk.Label(self.params_help_body,
                  text="START/STOP - range of the set value (V or A,\n"
                       "depends on the mode above). STEPS - how many\n"
                       "measurement points evenly spaced between\n"
@@ -1899,6 +2107,10 @@ class PeltierControl:
                  wraplength=250, justify='left')
         self.params_desc_lbl.pack(anchor='w', pady=(0, 8))
 
+        # ── Pola - ZAWSZE WIDOCZNE, niezaleznie od stanu opisu powyzej ──
+        self.params_body = tk.Frame(linner, bg=C['panel'])
+        self.params_body.pack(fill='x')
+
         # Pola sweepu (zakres) - ukrywane w trybie "tylko pomiar"
         self._sweep_range_frame = tk.Frame(self.params_body, bg=C['panel'])
         self._sweep_range_frame.pack(fill='x')
@@ -1906,7 +2118,7 @@ class PeltierControl:
         linner = self._sweep_range_frame
         self.sweep_start_entry = _field("START", "0.000001", "V")
         self.sweep_stop_entry  = _field("STOP", "0.00005", "V")
-        self.sweep_step_entry  = _field("STEPS", "50", "")
+        self.sweep_step_entry  = _field("STEPS", "50", "pts")
         linner = old_linner
 
         # Pole pojedynczej wartosci - widoczne TYLKO w trybie "tylko pomiar"
@@ -1920,7 +2132,7 @@ class PeltierControl:
         linner = self.params_body
         self.sweep_limit_entry = _field("LIMIT", "0.0001", "A")
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
-        self.sweep_nplc_entry = _field("NPLC", "1.0", "")
+        self.sweep_nplc_entry = _field("NPLC", "1.0", "PLC")
         self.sweep_avg_entry = _field("AVERAGING", "1", "x")
         linner = old_linner
 
@@ -2101,14 +2313,24 @@ class PeltierControl:
             self.sweep_ax_mini.relim(); self.sweep_ax_mini.autoscale_view()
             self.sweep_cv_mini.draw_idle()
 
+    def _toggle_units_section(self):
+        if self.units_expanded.get():
+            self.units_box.pack_forget()
+            self.btn_units_toggle.config(text="▶ units & hardware limits")
+            self.units_expanded.set(False)
+        else:
+            self.units_box.pack(fill='x', pady=(0, 14), after=self.btn_units_toggle)
+            self.btn_units_toggle.config(text="▼ units & hardware limits")
+            self.units_expanded.set(True)
+
     def _toggle_params_section(self):
         if self.params_expanded.get():
-            self.params_body.pack_forget()
-            self.btn_params_toggle.config(text="▶ PARAMETERS")
+            self.params_help_body.pack_forget()
+            self.btn_params_toggle.config(text="▶ field descriptions")
             self.params_expanded.set(False)
         else:
-            self.params_body.pack(fill='x', after=self.btn_params_toggle)
-            self.btn_params_toggle.config(text="▼ PARAMETERS")
+            self.params_help_body.pack(fill='x', after=self.btn_params_toggle, before=self.params_body)
+            self.btn_params_toggle.config(text="▼ field descriptions")
             self.params_expanded.set(True)
 
     def _toggle_continuous_mode(self):
@@ -2714,8 +2936,15 @@ class PeltierControl:
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
         self.ax_a_current = None
+        # WAZNE: tworzymy obiekt FigureCanvasTkAgg TERAZ (potrzebny nizej przez
+        # toolbar/hover), ale JEGO WIDGET PAKUJEMY NA SAMYM KONCU funkcji -
+        # patrz komentarz przy .pack() ponizej. Wczesniej wykres byl pakowany
+        # PIERWSZY z fill='both', expand=True i zabieral cala dostepna wysokosc
+        # zanim paski przyciskow (w tym wiersz ALIGN) zdazyly zarezerwowac
+        # sobie miejsce - przy nizszym oknie te paski byly wypychane calkowicie
+        # poza widoczny obszar (brak scrollbara w tej czesci ekranu, wiec nie
+        # dalo sie do nich dojechac).
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
-        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
         self.cv_a.draw()
 
         # ─── HOVER: kursor pokazujacy czas/temperature/prad w punkcie ───
@@ -2806,6 +3035,13 @@ class PeltierControl:
         self.arch_align_unit_lbl.pack(side='left', padx=(0, 4))
         mk_btn_outline(atb3, "APPLY", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
         self.arch_align_entry.config(state='disabled')
+
+        # Wykres pakowany DOPIERO TERAZ, na samym koncu - wszystkie paski nad
+        # nim (toolbar, pobieranie/PNG, tryb wykresu, ALIGN) maja juz
+        # zarezerwowane miejsce, wiec sa zawsze widoczne. Wykres wypelnia
+        # tylko to co zostalo (kurczy sie w razie potrzeby, zamiast wypychac
+        # cokolwiek poza ekran).
+        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
 
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
