@@ -66,7 +66,7 @@ RAMP_MAX_UI = 80.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-10.5"
+BUILD_VERSION = "2026-07-10.8"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -384,6 +384,21 @@ class KeithleyClient:
         parts = resp.replace(",", " ").split()
         return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
 
+    def measure_iv(self, channel="a"):
+        """Mierzy I i V BEZ dotykania source.levelv i BEZ delay(settle) - do
+        uzycia w trybie ciaglym/'tylko pomiar' po PIERWSZEJ probce, kiedy
+        wartosc zrodlowa juz jest ustawiona i sie nie zmienia. Ponowne
+        ustawianie tej samej wartosci i czekanie na settle_s przy KAZDEJ
+        probce (jak robi set_voltage_and_measure) to zbedny narzut - to on
+        ograniczal tempo pomiaru w trybie ciaglym do SETTLE_TIME+NPLC+narzut
+        USB na kazda probke, mimo ze fizycznie nic sie nie zmienialo miedzy
+        pomiarami. Ta metoda pomija oba te elementy, zostawiajac tylko czas
+        integracji NPLC + komunikacje USB."""
+        ch = f"smu{channel}"
+        resp = self._query(f"print({ch}.measure.i(), {ch}.measure.v())")
+        parts = resp.replace(",", " ").split()
+        return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
+
     def measure_i(self, channel="a"):
         resp = self._query(f"print(smu{channel}.measure.i())")
         return float(resp)
@@ -414,6 +429,8 @@ class PeltierControl:
         self.data_queue = queue.Queue()
 
         self.raw_maxrows = 100  # bufor w pamieci dla EXPORT CSV (live-wiersz pokazuje tylko ostatnia probke)
+        self.selftune_running = False
+        self.selftune_start_ts = 0.0
         self.raw_rows = []
         self.raw_paused = False
         self._raw_last_ui_ts = 0.0
@@ -447,6 +464,7 @@ class PeltierControl:
         self.sweep_done = 0
         self.sweep_loop_count = 0
         self.sweep_t0 = None
+        self.SWEEP_SETTLE_SKIP_S = 3.0  # pomijane na wykresie po starcie/nowej petli
         self.last_known_rel = 0.0
         self.last_known_t1 = None
         self.last_known_t2 = None
@@ -622,7 +640,8 @@ class PeltierControl:
             if 'OPPDIR' in d: out['oppdir'] = (d['OPPDIR'].strip() == '1')
             if 'FAN' in d:
                 fv = float(d['FAN'])
-                self.fan_on = fv > 0
+                out['fan_on'] = fv > 0
+                out['fan_speed'] = fv
         except ValueError:
             pass
         self.data_queue.put(out)
@@ -1701,8 +1720,87 @@ class PeltierControl:
                                        relief='flat', cursor='hand2', bd=0, padx=4, pady=8)
         self.btn_oppdir_on.pack(side='left', fill='x', expand=True)
 
+        sec_at = self._adv_section(inner, "AUTO-TUNE (LIVE)", C['orange'])
+        tk.Label(sec_at,
+                 text="Runs for ~2 minutes (60 cycles, one every 2s) while the PID\n"
+                      "is already running (AUTO). Watches for oscillation and slowly\n"
+                      "nudges Kp/Ki/Kd toward more stable values - and, new: if it\n"
+                      "sees oscillation WHILE HOLDING (not during an active ramp),\n"
+                      "it also reduces the FEED-FORWARD HOLD gain (KFFH/KFFHC),\n"
+                      "since that kind of steady, regular oscillation right at the\n"
+                      "target often comes from a feed-forward value thats too\n"
+                      "strong for the system's real thermal inertia, not from the\n"
+                      "PID gains themselves - lowering Kp/Kd alone doesn't always\n"
+                      "fully fix it. Adjustments happen live; nothing is saved to\n"
+                      "the device permanently until you press SAVE elsewhere.",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=480).pack(anchor='w', pady=(0, 10))
+        self.selftune_status_lbl = tk.Label(sec_at, text="Not running.",
+                                            bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'))
+        self.selftune_status_lbl.pack(anchor='w', pady=(0, 8))
+        at_row = tk.Frame(sec_at, bg=C['bg2'])
+        at_row.pack(fill='x')
+        self.btn_selftune_start = tk.Button(at_row, text="▶ START AUTO-TUNE",
+                                            command=self.start_selftune,
+                                            bg=C['orange'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
+                                            relief='flat', cursor='hand2', bd=0, padx=4, pady=8)
+        self.btn_selftune_start.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        self.btn_selftune_stop = tk.Button(at_row, text="■ STOP AUTO-TUNE",
+                                           command=self.stop_selftune,
+                                           bg=C['bg2'], fg=C['red'], font=(FONT, fsz(9), 'bold'),
+                                           relief='flat', cursor='hand2', bd=0, padx=4, pady=8,
+                                           state='disabled')
+        self.btn_selftune_stop.pack(side='left', fill='x', expand=True)
+
         sec4 = self._adv_section(inner, "RESET", C['red'])
         mk_btn_outline(sec4, "↺ RESET PID GAINS", self.do_reset, C['red']).pack(fill='x')
+
+    def start_selftune(self):
+        if not self.is_running:
+            messagebox.showwarning("PID not running",
+                "Auto-tune adjusts gains while the PID is actively holding/ramping - "
+                "start the PID (CONTROL tab) first, then start auto-tune.")
+            return
+        self.selftune_running = True
+        self.selftune_start_ts = time.time()
+        self.btn_selftune_start.config(state='disabled')
+        self.btn_selftune_stop.config(state='normal')
+        self.selftune_status_lbl.config(text="Starting…", fg=C['orange'])
+        self.send("SELFTUNE")
+
+    def stop_selftune(self):
+        self.selftune_running = False
+        self.btn_selftune_start.config(state='normal')
+        self.btn_selftune_stop.config(state='disabled')
+        self.selftune_status_lbl.config(text="Stopped.", fg=C['dim'])
+        self.send("SELFTUNESTOP")
+
+    def _on_selftune_status(self, state_str, kp, ki, kd):
+        """Wywolywane z tick() przy kazdym wierszu CSV ktorego 'state' zaczyna
+        sie od 'ST' - to firmware co 2s raportuje postep auto-tune (patrz
+        runST() w PeltierPID.ino). Rozne sufiksy: OK / OSC- / OSC-FF (feed-
+        forward tez skorygowany) / SAT (nasycenie PWM) / SLOW++ / WORSE / Ki+."""
+        if not getattr(self, 'selftune_running', False) or not hasattr(self, 'selftune_status_lbl'):
+            return
+        suffix = state_str[3:] if len(state_str) > 3 else ""
+        elapsed = time.time() - getattr(self, 'selftune_start_ts', time.time())
+        label_map = {
+            'OK': ('tracking well', C['green']),
+            'OSC-': ('oscillation detected - reducing Kp/Ki/Kd', C['yellow']),
+            'OSC-FF': ('oscillation while holding - reducing Kp/Ki/Kd AND feed-forward HOLD', C['orange']),
+            'SAT': ('PWM saturated - waiting', C['dim']),
+            'SLOW++': ('response too slow - increasing Kp', C['cyan']),
+            'WORSE': ('getting worse - increasing Kp', C['yellow']),
+            'Ki+': ('steady-state error - increasing Ki', C['cyan']),
+        }
+        desc, col = label_map.get(suffix, (suffix, C['dim']))
+        self.selftune_status_lbl.config(
+            text=f"{elapsed:.0f}s: {desc}  (Kp={kp:.2f} Ki={ki:.3f} Kd={kd:.2f})",
+            fg=col)
+        # sync suwaki na biezaco, zeby bylo widac zmiany bez czekania na koniec
+        if hasattr(self, 'sl_kp'): self.sl_kp.set(kp)
+        if hasattr(self, 'sl_ki'): self.sl_ki.set(ki)
+        if hasattr(self, 'sl_kd'): self.sl_kd.set(kd)
 
     def _set_oppdir(self, enabled, send=True):
         """Przelacza tryb hamowania przeciwnym kierunkiem (firmware: OPPDIR).
@@ -2688,6 +2786,7 @@ class PeltierControl:
                 self.keithley.output_on("a")
 
                 first_pass = True
+                first_pass_value_set = False  # gate dla measure_iv() - patrz petla for p in points
                 while True:
                     if self.sweep_abort:
                         break
@@ -2706,10 +2805,21 @@ class PeltierControl:
                         if self.sweep_abort:
                             break
                         settle_s = max(0.0, settle_ms / 1000.0)
-                        if mode == "V":
+                        # W trybie ciaglym wartosc zrodlowa jest ustawiana RAZ
+                        # (przy setup_source_*_measure_* powyzej + pierwsza
+                        # probka ponizej) - kolejne probki NIE musza jej znow
+                        # ustawiac ani czekac na settle, bo nic sie fizycznie
+                        # nie zmienilo. To realnie przyspiesza tempo pomiaru
+                        # (usuwa SETTLE_TIME+ponowny zapis z kazdej kolejnej
+                        # probki, zostawiajac tylko czas integracji NPLC).
+                        use_fast_path = continuous and first_pass_value_set
+                        if use_fast_path:
+                            i_meas, v_meas = self.keithley.measure_iv("a")
+                        elif mode == "V":
                             i_meas, v_meas = self.keithley.set_voltage_and_measure("a", p, settle_s)
                         else:
                             i_meas, v_meas = self.keithley.set_current_and_measure("a", p, settle_s)
+                        first_pass_value_set = True
                         self.sweep_done += 1
                         t_elapsed = time.time() - self.sweep_t0
                         self.sweep_queue.put((t_elapsed, p, i_meas, v_meas))
@@ -2777,6 +2887,18 @@ class PeltierControl:
             if pt[0] == "__NEW_LOOP__":
                 # nowa iteracja petli - wyczysc wykres, zacznij od nowa
                 self.sweep_points = []
+                got_new = True
+                continue
+            # Pomijamy na WYKRESIE pierwsze SWEEP_SETTLE_SKIP_S sekund po
+            # starcie/nowej petli - SMU (i czesto sama probka/kontakty)
+            # potrzebuje chwili zeby sie ustabilizowac po zalaczeniu wyjscia
+            # (ladowanie pojemnosci kabli, autozero, mechaniczne osiadanie
+            # kontaktow), wiec pierwsze odczyty potrafia byc bezsensowne
+            # (skoki o rzedy wielkosci). Pelne surowe dane (WLACZNIE z tymi
+            # pierwszymi probkami) nadal trafiaja bez zmian do pliku
+            # sweep_*.csv w ~/BigPeltierPidLogi - filtrujemy TYLKO widok na
+            # wykresie/karcie, zeby nic z surowego zapisu nie zgineło.
+            if pt[0] < self.SWEEP_SETTLE_SKIP_S:
                 got_new = True
                 continue
             self.sweep_points.append(pt)
@@ -4060,6 +4182,19 @@ class PeltierControl:
                 tsr = d.get('ts', 0) / 1000.0
                 heat_dir = d.get('heat', True)
 
+                st_state = d.get('state', '')
+                if st_state.startswith('ST'):
+                    self._on_selftune_status(st_state, d.get('kp', 0), d.get('ki', 0), d.get('kd', 0))
+                elif self.selftune_running and st_state == 'AUTO':
+                    # firmware wrocilo do zwyklego stanu AUTO - auto-tune sam
+                    # sie zakonczyl (60 cykli = ~2 min) albo ktos go zatrzymal
+                    # z innego miejsca; zsynchronizuj przyciski/status w UI.
+                    self.selftune_running = False
+                    if hasattr(self, 'btn_selftune_start'):
+                        self.btn_selftune_start.config(state='normal')
+                        self.btn_selftune_stop.config(state='disabled')
+                        self.selftune_status_lbl.config(text="Complete.", fg=C['green'])
+
                 if self.t0 is None: self.t0 = tsr
                 rel = tsr - self.t0
 
@@ -4206,7 +4341,29 @@ class PeltierControl:
                 if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
                 if 'oppdir' in d and hasattr(self,'oppdir_var'): self._set_oppdir(bool(d['oppdir']), send=False)
                 self._cfg_synced = True
+            # Stan wentylatora synchronizowany ZAWSZE (nie tylko raz przy
+            # pierwszym polaczeniu) - w przeciwienstwie do Kp/Ki/SP itp. moze
+            # sie zmienic AUTONOMICZNIE w firmware bez udzialu uzytkownika
+            # (np. fan run-on wygasajacy po STOP, albo wymuszenie 100% podczas
+            # chlodzenia) - jesli przycisk aktualizowalby sie tylko raz, moglby
+            # utknac pokazujac "ON" mimo ze firmware juz dawno wylaczyl wentylator.
+            if 'fan_on' in d and hasattr(self, 'btn_fan'):
+                self._sync_fan_button(bool(d['fan_on']))
         except Exception as e: print(f"cfg err: {e}")
+
+    def _sync_fan_button(self, is_on):
+        """Aktualizuje WYLACZNIE wyglad przycisku FAN wg stanu raportowanego
+        przez firmware (CFG) - nie wysyla zadnej komendy zwrotnej. To jedyne
+        wiarygodne zrodlo prawdy o tym czy wentylator faktycznie sie kreci,
+        bo firmware moze go wlaczac/wylaczac sam (run-on po STOP, wymuszenie
+        podczas chlodzenia), niezaleznie od tego co user ostatnio klikal."""
+        if self.fan_on == is_on:
+            return  # bez zmian - nie ma po co dotykac widgetu
+        self.fan_on = is_on
+        if is_on:
+            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+        else:
+            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     def _draw_chart(self):
         t=self.t; t1=self.temp1; t2=self.temp2; sp=self.spt; spa=self.spa; pw=self.pwm
