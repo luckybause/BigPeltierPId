@@ -63,6 +63,11 @@ SP_MAX_UI = 100.0
 RAMP_MIN_UI = 0.5
 RAMP_MAX_UI = 80.0
 
+# Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
+# wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
+# to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
+BUILD_VERSION = "2026-07-10.1"
+
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
     """Formatuje mala wartosc z prefiksem SI, np. 4.83e-8 -> ('48.30', 'n').
@@ -408,12 +413,10 @@ class PeltierControl:
         self.t0 = None
         self.data_queue = queue.Queue()
 
-        self.raw_maxrows = 100
+        self.raw_maxrows = 100  # bufor w pamieci dla EXPORT CSV (live-wiersz pokazuje tylko ostatnia probke)
         self.raw_rows = []
         self.raw_paused = False
-        self.raw_autoscroll = True
         self._raw_last_ui_ts = 0.0
-        self.raw_ui_interval = 0.2  # throttling: max 5 aktualizacji Treeview / sekunde
 
         # Keithley 2611B (SMU) - pomiar pradu przez LAN/TSP, synchronizowany z PID
         self.keithley = KeithleyClient()
@@ -667,6 +670,8 @@ class PeltierControl:
                  font=(FONT, fsz(13), 'bold')).pack(side='left', padx=(8, 0))
         tk.Label(top, text="ItsyBitsy M0 + Cytron MDD10A", bg=C['bg2'], fg=C['dim2'],
                  font=(FONT, fsz(9))).pack(side='left', padx=8)
+        tk.Label(top, text=f"build {BUILD_VERSION}", bg=C['bg2'], fg=C['panel3'],
+                 font=(FONT, fsz(8))).pack(side='left', padx=(4, 0))
 
         sf = tk.Frame(top, bg=C['bg2'])
         sf.pack(side='right', padx=16)
@@ -1768,7 +1773,7 @@ class PeltierControl:
         hd.pack(fill='x', pady=(0, 10))
         tk.Label(hd, text="RAW THERMOCOUPLE DATA", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
-        tk.Label(hd, text="  raw T1/T2 stream from the device, 10 Hz",
+        tk.Label(hd, text="  live snapshot, 10 Hz",
                  bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
 
         self.btn_raw_pause = tk.Button(hd, text="⏸ PAUSE", command=self._toggle_raw_pause,
@@ -1784,57 +1789,41 @@ class PeltierControl:
                                       font=(FONT, fsz(9)))
         self.raw_count_lbl.pack(side='right', padx=(6, 12))
 
-        # Tabela (Treeview)
-        table_wrap = tk.Frame(wrap, bg=C['panel'])
-        table_wrap.pack(fill='both', expand=True)
-        tk.Frame(table_wrap, bg=C['blue'], height=3).pack(fill='x')
+        # ── JEDEN WIERSZ na zywo - zamiast rosnacej/przewijanej tabeli. Tanie
+        # w utrzymaniu (kilka Label.config() zamiast Treeview.insert 10x/s),
+        # wiec moze sie aktualizowac bez wzgledu na to czy zakladka jest
+        # widoczna i bez zadnego throttlingu - nie ma tu nic co mogloby
+        # spowolnic program, bo nie buduje sie zadna historia na ekranie.
+        row_wrap = tk.Frame(wrap, bg=C['panel'])
+        row_wrap.pack(fill='x')
+        tk.Frame(row_wrap, bg=C['blue'], height=3).pack(fill='x')
+        cells_frame = tk.Frame(row_wrap, bg=C['panel'])
+        cells_frame.pack(fill='x', padx=8, pady=14)
 
-        cols = ('idx', 'czas_fw', 'pc_time', 't1', 't2', 'sp', 'spa', 'pct', 'fan', 'dir', 'k_i', 'k_v', 'state')
-        headers = {
-            'idx': '#', 'czas_fw': 'FW time [s]', 'pc_time': 'PC time',
-            't1': 'T1 [C]', 't2': 'T2 [C]', 'sp': 'SP target [C]',
-            'spa': 'SP active [C]', 'pct': 'Peltier %', 'fan': 'Fan %', 'dir': 'Direction',
-            'k_i': 'I Keithley', 'k_v': 'V Keithley', 'state': 'state'
-        }
-        widths = {
-            'idx': 50, 'czas_fw': 90, 'pc_time': 110, 't1': 80, 't2': 80,
-            'sp': 90, 'spa': 90, 'pct': 80, 'fan': 70, 'dir': 80,
-            'k_i': 110, 'k_v': 100, 'state': 70
-        }
+        self.raw_live_cells = {}
+        cols = [
+            ('idx', '#', 50), ('czas_fw', 'FW TIME [s]', 90), ('pc_time', 'PC TIME', 130),
+            ('t1', 'T1 [°C]', 80), ('t2', 'T2 [°C]', 80), ('sp', 'SP TARGET [°C]', 100),
+            ('spa', 'SP ACTIVE [°C]', 100), ('pct', 'PELTIER %', 80), ('fan', 'FAN %', 70),
+            ('dir', 'DIRECTION', 90), ('k_i', 'I KEITHLEY', 100), ('k_v', 'V KEITHLEY', 100),
+            ('state', 'STATE', 70),
+        ]
+        for key, label, width in cols:
+            cell = tk.Frame(cells_frame, bg=C['panel'])
+            cell.pack(side='left', padx=(0, 10))
+            tk.Label(cell, text=label, bg=C['panel'], fg=C['dim2'],
+                     font=(FONT, fsz(7)), width=max(6, width//9), anchor='w').pack(anchor='w')
+            val_lbl = tk.Label(cell, text="—", bg=C['panel'], fg=C['text'],
+                               font=(FONT, fsz(11), 'bold'), anchor='w')
+            val_lbl.pack(anchor='w')
+            self.raw_live_cells[key] = val_lbl
 
-        style = ttk.Style()
-        style.configure('Raw.Treeview', background=C['bg2'], fieldbackground=C['bg2'],
-                        foreground=C['text'], font=(FONT, fsz(9)), rowheight=22, borderwidth=0)
-        style.configure('Raw.Treeview.Heading', background=C['panel'], foreground=C['dim'],
-                        font=(FONT, fsz(9), 'bold'), borderwidth=0)
-        style.map('Raw.Treeview', background=[('selected', C['panel3'])])
-
-        tree_frame = tk.Frame(table_wrap, bg=C['panel'])
-        tree_frame.pack(fill='both', expand=True, padx=8, pady=8)
-
-        ysb = ttk.Scrollbar(tree_frame, orient='vertical')
-        ysb.pack(side='right', fill='y')
-
-        self.raw_tree = ttk.Treeview(tree_frame, columns=cols, show='headings',
-                                     style='Raw.Treeview', yscrollcommand=ysb.set)
-        for c in cols:
-            self.raw_tree.heading(c, text=headers.get(c, c))
-            self.raw_tree.column(c, width=widths.get(c, 80), anchor='center')
-        self.raw_tree.pack(side='left', fill='both', expand=True)
-        ysb.config(command=self.raw_tree.yview)
-
-        # Wykrywaj reczne przewijanie - wylacz autoscroll
-        def on_scroll(*a):
-            self.raw_autoscroll = (self.raw_tree.yview()[1] >= 0.999)
-        self.raw_tree.bind('<MouseWheel>', lambda e: setattr(self, 'raw_autoscroll', False))
-        self.raw_tree.bind('<Button-4>', lambda e: setattr(self, 'raw_autoscroll', False))
-        self.raw_tree.bind('<Button-5>', lambda e: setattr(self, 'raw_autoscroll', False))
-
-        info = tk.Label(wrap, text="The table only updates while this tab is open (max 5x/s) - so it doesn't "
-                        f"load the program in the background. The buffer (max {self.raw_maxrows} samples) always collects data, so EXPORT CSV "
-                        "works independently. The full raw record from START to STOP is in the ARCHIVE tab.",
+        info = tk.Label(wrap, text="Live snapshot of the latest sample - updates in place, no scrolling "
+                        f"history, so it never slows the program down. The buffer (max {self.raw_maxrows} "
+                        "samples) still collects data in the background for EXPORT CSV. The full raw "
+                        "record from START to STOP is in the ARCHIVE tab.",
                         bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), wraplength=900, justify='left')
-        info.pack(anchor='w', pady=(8, 0))
+        info.pack(anchor='w', pady=(14, 0))
 
     def _toggle_raw_pause(self):
         self.raw_paused = not self.raw_paused
@@ -1845,14 +1834,15 @@ class PeltierControl:
 
     def clear_raw(self):
         self.raw_rows = []
-        if hasattr(self, 'raw_tree'):
-            for item in self.raw_tree.get_children():
-                self.raw_tree.delete(item)
+        if hasattr(self, 'raw_live_cells'):
+            for lbl in self.raw_live_cells.values():
+                lbl.config(text="—")
         if hasattr(self, 'raw_count_lbl'):
             self.raw_count_lbl.config(text="0 samples")
 
     def _raw_row_values(self, row, idx):
-        """Formatuje jeden wiersz (krotke danych) na wartosci wyswietlane w Treeview."""
+        """Formatuje jeden wiersz (krotke danych) na slownik wartosci do
+        wyswietlenia w live-wierszu (klucze odpowiadaja self.raw_live_cells)."""
         czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat = row
         t1s = f"{t1:.3f}" if t1 is not None else "—"
         t2s = f"{t2:.3f}" if t2 is not None else "—"
@@ -1866,24 +1856,19 @@ class PeltierControl:
         if pct < 0.5:
             dirs = "—"  # PWM prawie zero - kierunek bez znaczenia
         spas = "—" if state == "MAN" else f"{spa:.2f}"
-        return (idx, f"{czas_fw:.2f}", pc_time, t1s, t2s,
-                f"{sp:.2f}", spas, f"{pct:.1f}", f"{fan:.1f}", dirs, kis, kvs, state)
+        return {'idx': str(idx), 'czas_fw': f"{czas_fw:.2f}", 'pc_time': pc_time,
+                't1': t1s, 't2': t2s, 'sp': f"{sp:.2f}", 'spa': spas,
+                'pct': f"{pct:.1f}", 'fan': f"{fan:.1f}", 'dir': dirs,
+                'k_i': kis, 'k_v': kvs, 'state': state}
 
     def _raw_rebuild_tree(self):
-        """Pelne przebudowanie tabeli z bufora self.raw_rows - wywolywane raz,
-        gdy uzytkownik dopiero co przelaczyl sie na zakladke RAW DATA (zeby od
-        razu zobaczyc aktualny stan, a nie czekac na throttlowane aktualizacje)."""
-        if not hasattr(self, 'raw_tree'):
+        """Odswieza live-wiersz z ostatniej probki w buforze - wywolywane przy
+        przelaczeniu na zakladke RAW DATA, zeby od razu widziec aktualny stan."""
+        if not hasattr(self, 'raw_live_cells') or not self.raw_rows:
             return
-        for item in self.raw_tree.get_children():
-            self.raw_tree.delete(item)
-        start_idx = max(1, len(self.raw_rows) - self.raw_maxrows + 1)
-        for i, row in enumerate(self.raw_rows[-self.raw_maxrows:]):
-            self.raw_tree.insert('', 'end', values=self._raw_row_values(row, start_idx + i))
-        if self.raw_autoscroll:
-            children = self.raw_tree.get_children()
-            if children:
-                self.raw_tree.see(children[-1])
+        vals = self._raw_row_values(self.raw_rows[-1], len(self.raw_rows))
+        for key, lbl in self.raw_live_cells.items():
+            lbl.config(text=vals.get(key, "—"))
         if hasattr(self, 'raw_count_lbl'):
             self.raw_count_lbl.config(text=f"{len(self.raw_rows)} samples")
         self._raw_last_ui_ts = time.time()
@@ -1891,36 +1876,21 @@ class PeltierControl:
     def _raw_append(self, row):
         # row = (czas_fw, pc_time, t1, t2, sp, spa, pct, fan, state, k_i, k_v, heat)
         # Bufor w pamieci rosnie zawsze (tani append+trim na liscie Pythona) -
-        # to on zasila EXPORT CSV i pelne przebudowanie tabeli, niezaleznie od
-        # tego czy ktokolwiek aktualnie patrzy na zakladke.
+        # zasila EXPORT CSV niezaleznie od tego czy live-wiersz jest widoczny.
         self.raw_rows.append(row)
         if len(self.raw_rows) > self.raw_maxrows:
             self.raw_rows = self.raw_rows[-self.raw_maxrows:]
 
-        if self.raw_paused or not hasattr(self, 'raw_tree'):
+        if self.raw_paused or not hasattr(self, 'raw_live_cells'):
             return
 
-        # Kosztowna czesc (Treeview.insert, .see(), przewijanie) wykonujemy
-        # TYLKO gdy zakladka RAW DATA jest faktycznie widoczna na ekranie,
-        # i nie czesciej niz raw_ui_interval - inaczej caly program przycinal
-        # sie od aktualizacji tabeli 10x/s w tle, nawet gdy nikt na nia nie patrzy.
-        if not self.raw_tab_visible:
-            return
-        now = time.time()
-        if now - self._raw_last_ui_ts < self.raw_ui_interval:
-            return
-        self._raw_last_ui_ts = now
-
-        idx = len(self.raw_rows)
-        self.raw_tree.insert('', 'end', values=self._raw_row_values(row, idx))
-        children = self.raw_tree.get_children()
-        if len(children) > self.raw_maxrows:
-            for item in children[:len(children) - self.raw_maxrows]:
-                self.raw_tree.delete(item)
-        if self.raw_autoscroll:
-            children = self.raw_tree.get_children()
-            if children:
-                self.raw_tree.see(children[-1])
+        # Aktualizacja jednego wiersza to zaledwie kilka Label.config() - na
+        # tyle tanie, ze nie trzeba juz throttlowac ani sprawdzac widocznosci
+        # zakladki (w przeciwienstwie do starej tabeli Treeview, ktora przy
+        # 10 Hz insertow potrafila zauwazalnie spowalniac cala aplikacje).
+        vals = self._raw_row_values(row, len(self.raw_rows))
+        for key, lbl in self.raw_live_cells.items():
+            lbl.config(text=vals.get(key, "—"))
         self.raw_count_lbl.config(text=f"{len(self.raw_rows)} samples")
 
     def export_raw_csv(self):
