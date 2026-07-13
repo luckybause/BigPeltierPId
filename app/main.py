@@ -41,7 +41,7 @@ C = {
 }
 
 FONT = 'Consolas'
-FS = 1.0
+FS = 1.12  # delikatne globalne powiekszenie czcionki calej aplikacji
 def fsz(n): return max(6, int(round(n * FS)))
 def px(n): return max(1, int(round(n * FS)))  # skalowanie wymiarow (szerokosci/wysokosci) wg DPI
 
@@ -66,7 +66,7 @@ RAMP_MAX_UI = 80.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-10.8"
+BUILD_VERSION = "2026-07-11.3"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -111,6 +111,43 @@ def mk_btn_outline(parent, text, cmd, color, **kw):
                   highlightthickness=2, highlightbackground=color,
                   highlightcolor=color,
                   activebackground=C['panel3'], activeforeground=color, **kw)
+
+def mk_segmented(parent, options, variable, command=None, accent=None, font_size=9):
+    """Grupa przyciskow-przelacznikow wygladajaca jak JEDNA spojna kontrolka
+    (segmented control) zamiast oddzielnych, rozjechanych 'kwadratow' -
+    cienka wspolna obwodka, przyciski stykaja sie bez przerw, aktywny segment
+    dostaje pelne wypelnienie kolorem akcentu z ciemnym tekstem. Zastepuje
+    wczesniejsze uzycie tk.Radiobutton(indicatoron=False) ktore w praktyce
+    nie dawalo wyraznej roznicy miedzy stanem wybranym a niewybranym.
+    options: lista (etykieta, wartosc). Zwraca dict {wartosc: widget}."""
+    accent = accent or C['cyan']
+    outer = tk.Frame(parent, bg=C['border'])
+    outer.pack(side='left')
+    inner = tk.Frame(outer, bg=C['panel'])
+    inner.pack(padx=1, pady=1)
+    btns = {}
+    def _select(val, fire_command=True):
+        variable.set(val)
+        for v, b in btns.items():
+            if v == val:
+                b.config(bg=accent, fg='#12181a')
+            else:
+                b.config(bg=C['panel'], fg=C['dim'])
+        if fire_command and command: command()
+    for i, (label, val) in enumerate(options):
+        b = tk.Button(inner, text=label, command=lambda v=val: _select(v),
+                     bg=C['panel'], fg=C['dim'], font=(FONT, fsz(font_size)),
+                     relief='flat', cursor='hand2', bd=0, padx=10, pady=6,
+                     activebackground=C['panel3'])
+        b.pack(side='left', padx=(0 if i == 0 else 1, 0))
+        btns[val] = b
+    # Ustawiamy wizualnie POCZATKOWY wybrany segment BEZ odpalania command() -
+    # w chwili tworzenia tej kontrolki widgety utworzone PO niej (np. pole
+    # wpisu wartosci progu w ARCHIVE) moga jeszcze nie istniec, a command
+    # czesto sie do nich odwoluje. Uzytkownik i tak nie klikal, wiec nic nie
+    # powinno sie jeszcze wykonywac - tylko wyglad ma odzwierciedlac stan.
+    _select(variable.get(), fire_command=False)
+    return btns
 
 # ════════════════════════════════════════════════════════
 #  SLIDER + POLE LICZBOWE
@@ -438,6 +475,8 @@ class PeltierControl:
         # Keithley 2611B (SMU) - pomiar pradu przez LAN/TSP, synchronizowany z PID
         self.keithley = KeithleyClient()
         self.keithley_connected = False
+        self._keithley_autoconnect_enabled = True
+        self._keithley_autoconnect_busy = False
         self.keithley_running = False
         self.keithley_thread = None
         self.keithley_lock = threading.Lock()
@@ -535,12 +574,20 @@ class PeltierControl:
         st = ttk.Style()
         try: st.theme_use('clam')
         except: pass
-        st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
+        st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[2, 4, 2, 0])
         st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim'],
-                     padding=[20, 10], font=(FONT, fsz(10), 'bold'), borderwidth=0)
+                     padding=[22, 12], font=(FONT, fsz(10), 'bold'), borderwidth=0)
+        # Aktywna zakladka: wyrazny akcentowy kolor tekstu (cyan) + jasniejsze
+        # tlo + delikatny obrys w kolorze akcentu, zeby od razu bylo widac
+        # ktora zakladka jest otwarta bez wpatrywania sie w subtelna roznice
+        # szarosci. Stan 'active' (najechanie mysza) tez dostaje podswietlenie
+        # dla lepszej informacji zwrotnej przed klikneciem.
         st.map('TNotebook.Tab',
-               background=[('selected', C['bg'])],
-               foreground=[('selected', C['text'])])
+               background=[('selected', C['bg']), ('active', C['panel3'])],
+               foreground=[('selected', C['cyan']), ('active', C['text'])],
+               bordercolor=[('selected', C['cyan'])],
+               lightcolor=[('selected', C['bg'])],
+               darkcolor=[('selected', C['bg'])])
 
     # ─── SERIAL ──────────────────────────────────────────
     def send(self, cmd):
@@ -822,11 +869,16 @@ class PeltierControl:
                  font=(FONT, fsz(7)), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
         vrow.pack(anchor='w', pady=(1, 0))
+        # width=7 + anchor='e': liczba jest wyrownana do prawej wewnatrz
+        # STALEJ szerokosci (font jest monospace, wiec to daje pikselowo
+        # stabilna pozycje) - bez tego kazda zmiana dlugosci liczby (np.
+        # "24.5" -> "-14.3" -> "100.0") przesuwala jednostke obok i caly
+        # dalszy uklad w wierszu kart, co wygladalo jak "skakanie" wartosci.
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, fsz(16), 'bold'))
+                       font=(FONT, fsz(16), 'bold'), width=7, anchor='e')
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(7)))
+                            font=(FONT, fsz(7)), width=9, anchor='w')
         unit_lbl.pack(side='left', pady=(4, 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl}
 
@@ -1277,7 +1329,7 @@ class PeltierControl:
                       variable=self.prog_use_global_ramp,
                       command=lambda: self.prog_ramp_entry.config(
                           state='disabled' if self.prog_use_global_ramp.get() else 'normal'),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
                       font=(FONT, fsz(8)), activebackground=C['panel'],
                       activeforeground=C['text']).pack(anchor='w')
         self.prog_ramp_entry = _pfield("RAMP (custom, optional)", "2.0", "°C/min")
@@ -1285,15 +1337,47 @@ class PeltierControl:
 
         self.prog_hold_entry = _pfield("HOLD FOR", "10.0", "min")
 
+        self.prog_end_program_var = tk.BooleanVar(value=False)
+        def _on_end_program_toggle():
+            if self.prog_end_program_var.get():
+                self.prog_hold_entry.config(state='disabled')
+            else:
+                self.prog_hold_entry.config(state='normal')
+        tk.Checkbutton(linner, text="End program here once reached (skip hold, ignore later steps)",
+                      variable=self.prog_end_program_var, command=_on_end_program_toggle,
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
+                      font=(FONT, fsz(8)), activebackground=C['panel'],
+                      activeforeground=C['text'], wraplength=240,
+                      justify='left').pack(anchor='w', pady=(6, 0))
+
         mk_btn(linner, "+ ADD STEP", self.add_program_step, C['cyan']).pack(fill='x', pady=(14, 0))
 
         tk.Frame(linner, bg=C['border'], height=1).pack(fill='x', pady=14)
 
         tk.Label(linner, text="PROGRAM FILE", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 8))
+
+        # Szybki wybor z listy juz zapisanych programow - zamiast zawsze
+        # otwierac dialog wyboru pliku. "LOAD SELECTED" wczytuje to co jest
+        # wybrane w liscie ponizej; "LOAD PROGRAM" (dalej) nadal otwiera
+        # dialog plikowy, gdy program lezy gdzies indziej na dysku.
+        pick_row = tk.Frame(linner, bg=C['panel'])
+        pick_row.pack(fill='x', pady=(0, 4))
+        self.prog_quick_pick_var = tk.StringVar(value="")
+        self.prog_quick_pick_combo = ttk.Combobox(
+            pick_row, textvariable=self.prog_quick_pick_var, state='readonly',
+            style='Dark.TCombobox', font=(FONT, fsz(9)))
+        self.prog_quick_pick_combo.pack(side='left', fill='x', expand=True)
+        tk.Button(pick_row, text="⟳", command=self._refresh_prog_quick_pick,
+                 bg=C['panel'], fg=C['dim'], font=(FONT, fsz(10), 'bold'),
+                 relief='flat', cursor='hand2', bd=0, padx=6,
+                 activebackground=C['panel3']).pack(side='left', padx=(4, 0))
+        mk_btn_outline(linner, "▶ LOAD SELECTED", self._load_selected_quick_pick, C['cyan']).pack(fill='x', pady=(4, 6))
+
         mk_btn_outline(linner, "💾 SAVE PROGRAM", self.save_program, C['green']).pack(fill='x', pady=2)
-        mk_btn_outline(linner, "📂 LOAD PROGRAM", self.load_program, C['orange']).pack(fill='x', pady=2)
+        mk_btn_outline(linner, "📂 LOAD PROGRAM (browse file)", self.load_program, C['orange']).pack(fill='x', pady=2)
         mk_btn_outline(linner, "🗑 CLEAR ALL", self.clear_program, C['red']).pack(fill='x', pady=2)
+        self._refresh_prog_quick_pick()
 
         # ── PRAWA STRONA: lista krokow + sterowanie ──
         right = tk.Frame(body, bg=C['bg'])
@@ -1365,10 +1449,14 @@ class PeltierControl:
 
             marker = "▶ " if active else ""
             ramp_txt = f"{step['ramp']:.1f}°C/min" if step['ramp'] is not None else "global ramp"
+            if step.get('end_program'):
+                tail = "⏹ END PROGRAM HERE (no hold)"
+            else:
+                tail = f"hold {step['hold_min']:.1f} min"
             txt = (f"{marker}STEP {i+1}: → {step['target']:.1f}°C  "
-                   f"({ramp_txt})  •  hold {step['hold_min']:.1f} min")
+                   f"({ramp_txt})  •  {tail}")
             tk.Label(row, text=txt, bg=row_bg,
-                    fg=C['cyan'] if active else C['text'],
+                    fg=C['red'] if step.get('end_program') else (C['cyan'] if active else C['text']),
                     font=(FONT, fsz(9), 'bold' if active else 'normal')
                     ).pack(side='left', padx=10, pady=8, fill='x', expand=True)
 
@@ -1385,15 +1473,22 @@ class PeltierControl:
     def add_program_step(self):
         try:
             target = float(self.prog_target_entry.get().replace(',', '.'))
-            hold_min = float(self.prog_hold_entry.get().replace(',', '.'))
         except ValueError:
-            messagebox.showerror("Error", "Check the numeric values (TARGET, HOLD FOR).")
+            messagebox.showerror("Error", "Check the numeric value (TARGET).")
             return
+        end_program = self.prog_end_program_var.get()
+        hold_min = 0.0
+        if not end_program:
+            try:
+                hold_min = float(self.prog_hold_entry.get().replace(',', '.'))
+            except ValueError:
+                messagebox.showerror("Error", "Check the numeric value (HOLD FOR).")
+                return
+            if hold_min < 0:
+                messagebox.showerror("Error", "Hold time cannot be negative.")
+                return
         if not (SP_MIN_UI <= target <= SP_MAX_UI):
             messagebox.showerror("Error", f"TARGET is out of controller range ({SP_MIN_UI:g}..{SP_MAX_UI:g}°C).")
-            return
-        if hold_min < 0:
-            messagebox.showerror("Error", "Hold time cannot be negative.")
             return
         ramp = None
         if not self.prog_use_global_ramp.get():
@@ -1405,7 +1500,8 @@ class PeltierControl:
             if not (RAMP_MIN_UI <= ramp <= RAMP_MAX_UI):
                 messagebox.showerror("Error", f"RAMP is out of controller range ({RAMP_MIN_UI:g}..{RAMP_MAX_UI:g}°C/min).")
                 return
-        self.program_steps.append({'target': target, 'ramp': ramp, 'hold_min': hold_min})
+        self.program_steps.append({'target': target, 'ramp': ramp, 'hold_min': hold_min,
+                                    'end_program': end_program})
         self._refresh_program_list()
 
     def _delete_program_step(self, idx):
@@ -1448,6 +1544,7 @@ class PeltierControl:
             with open(dest, 'w', encoding='utf-8') as f:
                 json.dump({'steps': self.program_steps}, f, indent=2, ensure_ascii=False)
             self._refresh_control_program_list()
+            self._refresh_prog_quick_pick()
             messagebox.showinfo("Saved", f"Program saved to:\n{dest}")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
@@ -1464,8 +1561,40 @@ class PeltierControl:
         for s in steps:
             clean.append({'target': float(s['target']),
                           'ramp': (float(s['ramp']) if s.get('ramp') is not None else None),
-                          'hold_min': float(s['hold_min'])})
+                          'hold_min': float(s['hold_min']),
+                          'end_program': bool(s.get('end_program', False))})
         return clean
+
+    def _refresh_prog_quick_pick(self):
+        """Wypelnia liste szybkiego wyboru nazwami zapisanych programow (bez
+        koniecznosci otwierania dialogu wyboru pliku za kazdym razem) -
+        odswiezane po starcie aplikacji i po kazdym zapisie nowego programu."""
+        if not hasattr(self, 'prog_quick_pick_combo'):
+            return
+        names = sorted(p.name for p in self.programs_dir.glob("*.json"))
+        self.prog_quick_pick_combo.config(values=names)
+        if self.prog_quick_pick_var.get() not in names:
+            self.prog_quick_pick_var.set(names[0] if names else "")
+
+    def _load_selected_quick_pick(self):
+        """Wczytuje program wybrany w liscie rozwijanej - szybsza alternatywa
+        dla LOAD PROGRAM (ktory zawsze otwiera dialog wyboru pliku)."""
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before loading another one.")
+            return
+        name = self.prog_quick_pick_var.get()
+        if not name:
+            messagebox.showinfo("No programs", "No saved programs found - save one first, "
+                                "or use LOAD PROGRAM to browse for a file elsewhere.")
+            return
+        try:
+            clean = self._parse_program_json(self.programs_dir / name)
+            self.program_steps = clean
+            self._refresh_program_list()
+            if hasattr(self, '_refresh_control_program_list'):
+                self._refresh_control_program_list()
+        except Exception as e:
+            messagebox.showerror("Load error", f"Could not load '{name}':\n{e}")
 
     def load_program(self):
         if self.program_running:
@@ -1538,6 +1667,8 @@ class PeltierControl:
             dist = abs(s['target'] - cur)
             total += dist / rate + s['hold_min']
             cur = s['target']
+            if s.get('end_program'):
+                break  # kolejne kroki nigdy sie nie wykonaja - program konczy sie tutaj
         return total
 
     def _set_program_status(self, text, color, detail=""):
@@ -1581,6 +1712,20 @@ class PeltierControl:
                 if self.program_stable_since is None:
                     self.program_stable_since = time.time()
                 elif time.time() - self.program_stable_since >= self.program_stable_needed_s:
+                    if step.get('end_program'):
+                        # Ten krok konczy CALY program od razu po ustabilizowaniu
+                        # sie na celu - bez przytrzymania, bez dalszych krokow
+                        # (nawet jesli byly zdefiniowane po nim na liscie).
+                        self.program_running = False
+                        self.program_state = 'done'
+                        self.btn_prog_start.config(state='normal')
+                        self.btn_prog_stop.config(state='disabled')
+                        self._set_program_status(
+                            "✓ Program complete (ended at target).", C['green'],
+                            f"Reached {step['target']:.1f}°C - stopped as configured "
+                            f"(step {self.program_step_idx+1}/{len(self.program_steps)}).")
+                        self._refresh_program_list()
+                        return
                     self.program_state = 'holding'
                     self.program_hold_start = time.time()
             else:
@@ -1589,13 +1734,14 @@ class PeltierControl:
             ramp_rate = step['ramp'] if step['ramp'] is not None else self.sl_ru.get()
             ramp_rate = max(ramp_rate, 0.1)
             eta_s = abs(current_temp - step['target']) / ramp_rate * 60.0
+            then_txt = "then END PROGRAM" if step.get('end_program') else \
+                       f"then hold {self._fmt_mmss(step['hold_min']*60)}"
             self._set_program_status(
                 text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
                      f"approaching {step['target']:.1f}°C",
                 color=C['cyan'],
                 detail=f"Now: {current_temp:.2f}°C (±{self.program_tolerance:g}°C tol.) · "
-                       f"ETA to target: ~{self._fmt_mmss(eta_s)} · "
-                       f"then hold {self._fmt_mmss(step['hold_min']*60)}")
+                       f"ETA to target: ~{self._fmt_mmss(eta_s)} · {then_txt}")
 
         elif self.program_state == 'holding':
             elapsed = time.time() - self.program_hold_start
@@ -1665,15 +1811,14 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
 
         sec2 = self._adv_section(inner, "FEED-FORWARD", C['yellow'])
-        tk.Label(sec2, text="HOLD = base power to maintain temperature\nRAMP = extra power for ramp dynamics\n"
-                      "Symmetric: heating and cooling each have their own\n"
-                      "HOLD/RAMP gains, so both track the set ramp rate\n"
-                      "with predictive power instead of cooling relying\n"
-                      "only on reactive PID correction.",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left').pack(anchor='w', pady=(0, 8))
+        self._make_collapsible_desc(sec2, "what is this?",
+                 "HOLD = base power to maintain temperature. RAMP = extra power "
+                 "for ramp dynamics. Symmetric: heating and cooling each have "
+                 "their own HOLD/RAMP gains, so both track the set ramp rate "
+                 "with predictive power instead of cooling relying only on "
+                 "reactive PID correction.")
         tk.Label(sec2, text="HEATING", bg=C['bg2'], fg=C['orange'],
-                 font=(FONT, fsz(8), 'bold')).pack(anchor='w', pady=(0, 2))
+                 font=(FONT, fsz(8), 'bold')).pack(anchor='w', pady=(4, 2))
         self.sl_kffh = SliderField(sec2, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/10°C", 2,
                                    on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
         self.sl_kffr = SliderField(sec2, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
@@ -1691,24 +1836,22 @@ class PeltierControl:
                                   on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
 
         sec_dir = self._adv_section(inner, "HEATING / COOLING DIRECTION", C['green'])
-        tk.Label(sec_dir,
-                 text="OFF (default): hard direction lock - when the target is\n"
-                      "below the current temperature, the PID can ONLY cool\n"
-                      "(PWM never goes toward heating, even briefly), and\n"
-                      "vice versa for heating. Fewer direction switches = less\n"
-                      "noise on a sensitive measurement, but on overshoot the\n"
-                      "system can only drop to PWM=0 and wait for the temperature\n"
-                      "to settle on its own - seen as a slow \"drift\" from target.\n\n"
-                      "ON: the PID can use the opposite direction as a brake on\n"
-                      "overshoot (e.g. a brief heat pulse right after cooling\n"
-                      "ends, if the temperature dropped too far) - faster and\n"
-                      "more accurate correction near target, at the cost of\n"
-                      "possible extra direction switches (and related noise).",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left', wraplength=480).pack(anchor='w', pady=(0, 10))
+        self._make_collapsible_desc(sec_dir, "what does OFF/ON mean?",
+                 "OFF (default): hard direction lock - when the target is below "
+                 "the current temperature, the PID can ONLY cool (PWM never goes "
+                 "toward heating, even briefly), and vice versa for heating. "
+                 "Fewer direction switches = less noise on a sensitive "
+                 "measurement, but on overshoot the system can only drop to "
+                 "PWM=0 and wait for the temperature to settle on its own - seen "
+                 "as a slow \"drift\" from target.\n\n"
+                 "ON: the PID can use the opposite direction as a brake on "
+                 "overshoot (e.g. a brief heat pulse right after cooling ends, "
+                 "if the temperature dropped too far) - faster and more accurate "
+                 "correction near target, at the cost of possible extra "
+                 "direction switches (and related noise).")
         self.oppdir_var = tk.BooleanVar(value=False)
         dir_row = tk.Frame(sec_dir, bg=C['bg2'])
-        dir_row.pack(fill='x')
+        dir_row.pack(fill='x', pady=(4, 0))
         self.btn_oppdir_off = tk.Button(dir_row, text="OFF (lock)",
                                         command=lambda: self._set_oppdir(False),
                                         bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
@@ -1721,23 +1864,21 @@ class PeltierControl:
         self.btn_oppdir_on.pack(side='left', fill='x', expand=True)
 
         sec_at = self._adv_section(inner, "AUTO-TUNE (LIVE)", C['orange'])
-        tk.Label(sec_at,
-                 text="Runs for ~2 minutes (60 cycles, one every 2s) while the PID\n"
-                      "is already running (AUTO). Watches for oscillation and slowly\n"
-                      "nudges Kp/Ki/Kd toward more stable values - and, new: if it\n"
-                      "sees oscillation WHILE HOLDING (not during an active ramp),\n"
-                      "it also reduces the FEED-FORWARD HOLD gain (KFFH/KFFHC),\n"
-                      "since that kind of steady, regular oscillation right at the\n"
-                      "target often comes from a feed-forward value thats too\n"
-                      "strong for the system's real thermal inertia, not from the\n"
-                      "PID gains themselves - lowering Kp/Kd alone doesn't always\n"
-                      "fully fix it. Adjustments happen live; nothing is saved to\n"
-                      "the device permanently until you press SAVE elsewhere.",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left', wraplength=480).pack(anchor='w', pady=(0, 10))
+        self._make_collapsible_desc(sec_at, "what does this do?",
+                 "Runs for ~2 minutes (60 cycles, one every 2s) while the PID is "
+                 "already running (AUTO). Watches for oscillation and slowly "
+                 "nudges Kp/Ki/Kd toward more stable values - and, new: if it "
+                 "sees oscillation WHILE HOLDING (not during an active ramp), it "
+                 "also reduces the FEED-FORWARD HOLD gain (KFFH/KFFHC), since "
+                 "that kind of steady, regular oscillation right at the target "
+                 "often comes from a feed-forward value that's too strong for "
+                 "the system's real thermal inertia, not from the PID gains "
+                 "themselves - lowering Kp/Kd alone doesn't always fully fix it. "
+                 "Adjustments happen live; nothing is saved to the device "
+                 "permanently until you press SAVE elsewhere.")
         self.selftune_status_lbl = tk.Label(sec_at, text="Not running.",
                                             bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'))
-        self.selftune_status_lbl.pack(anchor='w', pady=(0, 8))
+        self.selftune_status_lbl.pack(anchor='w', pady=(4, 8))
         at_row = tk.Frame(sec_at, bg=C['bg2'])
         at_row.pack(fill='x')
         self.btn_selftune_start = tk.Button(at_row, text="▶ START AUTO-TUNE",
@@ -1826,6 +1967,32 @@ class PeltierControl:
         inner = tk.Frame(box, bg=C['bg2'])
         inner.pack(fill='x', padx=12, pady=10)
         return inner
+
+    def _make_collapsible_desc(self, parent, label, text, default_expanded=False):
+        """Zwijany blok opisowy (przycisk ▶/▼ + ukryty/widoczny tekst) - ten
+        sam wzorzec co 'field descriptions'/'units & hardware limits' w
+        zakladce KEITHLEY, teraz wielokrotnego uzytku. Dlugie akapity
+        wyjasnien zaciemnialy widok samych kontrolek (suwakow/przyciskow)
+        ponizej - domyslnie zwiniete, rozwijane na zadanie."""
+        state = {'expanded': default_expanded}
+        btn = tk.Button(parent, text=("▼ " if default_expanded else "▶ ") + label,
+                        bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                        relief='flat', cursor='hand2', bd=0, anchor='w')
+        btn.pack(fill='x', pady=(0, 2))
+        body = tk.Label(parent, text=text, bg=C['bg2'], fg=C['dim2'],
+                        font=(FONT, fsz(8)), justify='left', wraplength=480)
+        def _toggle():
+            state['expanded'] = not state['expanded']
+            if state['expanded']:
+                body.pack(anchor='w', pady=(0, 10), after=btn)
+                btn.config(text="▼ " + label)
+            else:
+                body.pack_forget()
+                btn.config(text="▶ " + label)
+        btn.config(command=_toggle)
+        if default_expanded:
+            body.pack(anchor='w', pady=(0, 10), after=btn)
+        return btn, body
 
     def _set_panel_enabled(self, en):
         for sl in ['sl_sp', 'sl_ru', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_kffh', 'sl_kffr',
@@ -1993,20 +2160,20 @@ class PeltierControl:
             spd = int(self.sl_fan.get())
             if spd == 0: spd = 100; self.sl_fan.set(100, silent=True)
             self.send(f"FAN:{spd}")
-            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+            self.btn_fan.config(text="● ON", bg=C['green'], fg='#0f1f14', highlightbackground=C['green'])
         else:
             self.send("FANOFF")
-            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+            self.btn_fan.config(text="○ OFF", bg=C['bg2'], fg=C['dim2'], highlightbackground=C['dim'])
 
     def set_fan_speed(self, v):
         spd = int(v)
         self.send(f"FAN:{spd}")
         if spd > 0:
             self.fan_on = True
-            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+            self.btn_fan.config(text="● ON", bg=C['green'], fg='#0f1f14', highlightbackground=C['green'])
         else:
             self.fan_on = False
-            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+            self.btn_fan.config(text="○ OFF", bg=C['bg2'], fg=C['dim2'], highlightbackground=C['dim'])
 
     def do_reset(self):
         if not self.connected:
@@ -2270,7 +2437,7 @@ class PeltierControl:
         cont_row.pack(fill='x', pady=(10, 0))
         tk.Checkbutton(cont_row, text="Measurement only (no sweep - constant value)",
                       variable=self.sweep_continuous_var, command=lambda: self._toggle_continuous_mode(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
                       justify='left').pack(anchor='w')
@@ -2363,7 +2530,7 @@ class PeltierControl:
         self._bidir_row = tk.Frame(self.params_body, bg=C['panel'])
         self._bidir_row.pack(fill='x', pady=(6, 0))
         tk.Checkbutton(self._bidir_row, text="Sweep back and forth", variable=self.sweep_bidir_var,
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
                       justify='left').pack(anchor='w')
@@ -2375,7 +2542,7 @@ class PeltierControl:
         self.chk_loop = tk.Checkbutton(self._loop_chk_row, text="Loop (repeat until STOP)",
                       variable=self.sweep_loop_var,
                       command=lambda: self._toggle_loop_pause_field(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text'], wraplength=240,
                       justify='left')
@@ -2422,25 +2589,48 @@ class PeltierControl:
         chart_sel = tk.Frame(right, bg=C['panel'])
         chart_sel.pack(fill='x', padx=14, pady=(0, 6))
         self.sweep_chart_view = "IV"  # "IV", "VT", "IT"
+        # width=4 (jednakowa dla wszystkich trzech, font monospace) - bez tego
+        # "I-V" (3 znaki) i "V(t)"/"I(t)" (4 znaki) dawaly rozjezdzajaca sie
+        # szerokosc przyciskow, wiec caly rzad nie wygladal jak rowne "kwadraty".
         self.btn_chart_iv = tk.Button(chart_sel, text="I-V", command=lambda: self._set_chart_view("IV"),
                                       bg=C['orange'], fg='#1a1c1f', font=(FONT, fsz(9), 'bold'),
-                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+                                      relief='flat', cursor='hand2', bd=0, width=4, pady=5)
         self.btn_chart_iv.pack(side='left', padx=(0, 4))
         self.btn_chart_vt = tk.Button(chart_sel, text="V(t)", command=lambda: self._set_chart_view("VT"),
                                       bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
-                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+                                      relief='flat', cursor='hand2', bd=0, width=4, pady=5)
         self.btn_chart_vt.pack(side='left', padx=(0, 4))
         self.btn_chart_it = tk.Button(chart_sel, text="I(t)", command=lambda: self._set_chart_view("IT"),
                                       bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
-                                      relief='flat', cursor='hand2', bd=0, padx=10, pady=5)
+                                      relief='flat', cursor='hand2', bd=0, width=4, pady=5)
         self.btn_chart_it.pack(side='left')
 
         self.sweep_autoscale_var = tk.BooleanVar(value=True)
         tk.Checkbutton(chart_sel, text="Auto-scale", variable=self.sweep_autoscale_var,
                       command=lambda: self._redraw_sweep_chart(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
                       font=(FONT, fsz(9)), activebackground=C['panel'],
                       activeforeground=C['text']).pack(side='right')
+
+        # Wygladzanie DISPLAY-ONLY (srednia krocząca) - nie dotyka surowych
+        # danych ani pliku CSV, tylko dorysowuje dodatkowa, gladsza linie na
+        # tym samym wykresie, zeby latwiej bylo dostrzec trend w bardzo
+        # zaszumionym sygnale (np. prad rzedu pojedynczych fA/pA).
+        tk.Label(chart_sel, text="window:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='right', padx=(2, 4))
+        self.sweep_smooth_window_entry = tk.Entry(
+            chart_sel, bg=C['bg2'], fg=C['text'], insertbackground=C['text'],
+            relief='flat', font=(FONT, fsz(9)), width=4,
+            highlightthickness=1, highlightbackground=C['border'])
+        self.sweep_smooth_window_entry.insert(0, "15")
+        self.sweep_smooth_window_entry.pack(side='right', padx=(0, 2))
+        self.sweep_smooth_window_entry.bind('<Return>', lambda e: self._redraw_sweep_chart())
+        self.sweep_smooth_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(chart_sel, text="Smooth (moving avg)", variable=self.sweep_smooth_var,
+                      command=lambda: self._redraw_sweep_chart(),
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
+                      font=(FONT, fsz(9)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(side='right', padx=(0, 10))
 
         # Duze karty na zywo: napiecie, prad, postep kroku
         scards_wrap = tk.Frame(right, bg=C['panel'])
@@ -2462,7 +2652,11 @@ class PeltierControl:
             spine.set_color(C['border'])
         self.sweep_ax.grid(True, color=C['grid'], linewidth=0.5, alpha=0.5)
         self.sweep_line, = self.sweep_ax.plot([], [], color=C['orange'], marker='o',
-                                               markersize=3, linewidth=1.2)
+                                               markersize=3, linewidth=1.2,
+                                               zorder=5, label='raw')
+        self.sweep_line_smooth, = self.sweep_ax.plot([], [], color=C['cyan'], marker='',
+                                                      linewidth=2.0, zorder=6, label='smoothed')
+        self.sweep_line_smooth.set_visible(False)
         self.sweep_fig.tight_layout()
 
         self.sweep_cv = FigureCanvasTkAgg(self.sweep_fig, master=right)
@@ -2529,6 +2723,39 @@ class PeltierControl:
             _fmt(self.sweep_ax, '', 'A'); mini_units = ('', 'A')
             self.sweep_line.set_marker('')
         self.sweep_line.set_data(xs, ys)
+
+        # Wygladzanie (srednia krocząca) - opcjonalna DRUGA linia narysowana
+        # NA WIERZCHU surowych danych, zeby latwiej zobaczyc trend w mocno
+        # zaszumionym sygnale. Nie zmienia self.sweep_points ani pliku CSV -
+        # to czysto wizualna nakladka liczona na biezaco z tych samych danych.
+        if getattr(self, 'sweep_smooth_var', None) is not None and self.sweep_smooth_var.get() and len(ys) >= 2:
+            try:
+                win = max(2, int(self.sweep_smooth_window_entry.get()))
+            except ValueError:
+                win = 15
+            win = min(win, len(ys))
+            ys_smooth = []
+            run_sum = 0.0
+            from collections import deque
+            buf = deque()
+            for y in ys:
+                buf.append(y); run_sum += y
+                if len(buf) > win:
+                    run_sum -= buf.popleft()
+                ys_smooth.append(run_sum / len(buf))
+            self.sweep_line_smooth.set_data(xs, ys_smooth)
+            self.sweep_line_smooth.set_visible(True)
+            self.sweep_line.set_alpha(0.35)  # przygaszamy surowe dane, zeby wygladzona linia byla czytelna
+            if not self.sweep_ax.get_legend():
+                self.sweep_ax.legend(facecolor=C['panel'], edgecolor=C['border'],
+                                     labelcolor=C['dim'], fontsize=7, loc='best')
+        else:
+            self.sweep_line_smooth.set_visible(False)
+            self.sweep_line.set_alpha(1.0)
+            leg = self.sweep_ax.get_legend()
+            if leg is not None:
+                leg.remove()
+
         manual_zoom = getattr(self, '_sweep_chart_frozen', False)
         if not manual_zoom and (getattr(self, 'sweep_autoscale_var', None) is None or self.sweep_autoscale_var.get()):
             self.sweep_ax.set_autoscale_on(True)
@@ -3022,13 +3249,6 @@ class PeltierControl:
             side='left', padx=(0, 8))
         mk_btn_outline(kbr, "DISCONNECT", self.keithley_disconnect, C['red']).pack(side='left')
 
-        tk.Label(kinner, text="This tab is ONLY for checking the USB connection to the instrument.\n"
-                 "You set voltage/current, sweep range and limits in the KEITHLEY tab.\n"
-                 "START on CONTROL launches the PID and the sweep configured there at the same time.\n"
-                 "USB connection (TMC488 protocol) - requires the WinUSB driver (Zadig).",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left').pack(anchor='w', pady=(10, 0))
-
         info = tk.Frame(wrap, bg=C['panel'])
         info.pack(fill='x')
         tk.Frame(info, bg=C['dim2'], height=3).pack(fill='x')
@@ -3047,6 +3267,7 @@ class PeltierControl:
                      font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
 
         self.refresh_ports()
+        self.root.after(1200, self._keithley_autoconnect_tick)
 
     def refresh_ports(self):
         self.conn_list.delete(0, 'end')
@@ -3061,7 +3282,36 @@ class PeltierControl:
             self.connect(self._ports[s[0]].device)
 
     # ─── KEITHLEY 2611B ──────────────────────────────────
+    def _keithley_autoconnect_tick(self):
+        """Probuje polaczyc sie z Keithleyem automatycznie w tle, bez potrzeby
+        klikania TEST CONNECTION - powtarza probe co ok. 12s dopoki polaczenie
+        nie zostanie nawiazane. Uruchamiane raz przy starcie aplikacji, potem
+        samo sie ponownie planuje. Respektuje reczny DISCONNECT (patrz
+        keithley_disconnect) - jesli user swiadomie sie rozlaczyl, nie
+        wskakujemy mu z powrotem co kilkanascie sekund; reczny TEST CONNECTION
+        ponownie wlacza auto-retry."""
+        interval_ms = 12000
+        if self._keithley_autoconnect_enabled and not self.keithley_connected \
+           and not self._keithley_autoconnect_busy:
+            self._keithley_autoconnect_busy = True
+            self.keithley_status_lbl.config(text="● searching for USB device...", fg=C['yellow'])
+            def worker():
+                try:
+                    idn = self.keithley.connect()
+                    self.keithley_connected = True
+                    self.root.after(0, lambda: self.keithley_status_lbl.config(
+                        text=f"● connected: {idn[:40]}", fg=C['green']))
+                except Exception:
+                    self.keithley_connected = False
+                    self.root.after(0, lambda: self.keithley_status_lbl.config(
+                        text="● not connected (retrying automatically…)", fg=C['dim2']))
+                finally:
+                    self._keithley_autoconnect_busy = False
+            threading.Thread(target=worker, daemon=True).start()
+        self.root.after(interval_ms, self._keithley_autoconnect_tick)
+
     def keithley_test_connect(self):
+        self._keithley_autoconnect_enabled = True  # reczna proba tez zbroji auto-retry na przyszlosc
         self.keithley_status_lbl.config(text="● searching for USB device...", fg=C['yellow'])
         self.root.update_idletasks()
 
@@ -3081,6 +3331,7 @@ class PeltierControl:
         self.keithley_running = False
         self.keithley.disconnect()
         self.keithley_connected = False
+        self._keithley_autoconnect_enabled = False  # respektuj swiadomy wybor uzytkownika
         self.keithley_status_lbl.config(text="● not connected", fg=C['dim2'])
 
     def keithley_stop_measurement(self):
@@ -3241,17 +3492,9 @@ class PeltierControl:
         tk.Label(atb2, text="CHART:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
         self.arch_chart_mode = tk.StringVar(value='time')
-        def _mode_btn(text, val):
-            b = tk.Radiobutton(atb2, text=text, variable=self.arch_chart_mode, value=val,
-                          command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
-                          selectcolor=C['bg2'], font=(FONT, fsz(9)),
-                          activebackground=C['panel'], activeforeground=C['text'],
-                          indicatoron=False, padx=10, pady=3, relief='flat',
-                          bd=1, highlightthickness=0)
-            b.pack(side='left', padx=(0, 4))
-            return b
-        _mode_btn("temperature / time", 'time')
-        _mode_btn("Keithley current / temperature", 'iT')
+        mk_segmented(atb2,
+                     [("temperature / time", 'time'), ("Keithley current / temperature", 'iT')],
+                     self.arch_chart_mode, command=self._redraw_arch)
 
         atb2b = tk.Frame(cf, bg=C['panel'])
         atb2b.pack(fill='x', padx=8, pady=(0, 8))
@@ -3261,7 +3504,7 @@ class PeltierControl:
         self.arch_show_current_chk = tk.Checkbutton(
             atb2b, text="Current", variable=self.arch_show_current_var,
             command=lambda: self._redraw_arch(),
-            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+            bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
             font=(FONT, fsz(9)), activebackground=C['panel'],
             activeforeground=C['text'])
         self.arch_show_current_chk.pack(side='left', padx=(4, 0))
@@ -3269,7 +3512,7 @@ class PeltierControl:
         self.arch_show_voltage_chk = tk.Checkbutton(
             atb2b, text="Voltage (same panel, together)", variable=self.arch_show_voltage_var,
             command=lambda: self._redraw_arch(),
-            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+            bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
             font=(FONT, fsz(9)), activebackground=C['panel'],
             activeforeground=C['text'])
         self.arch_show_voltage_chk.pack(side='left', padx=(6, 0))
@@ -3279,30 +3522,25 @@ class PeltierControl:
         tk.Label(atb3, text="ALIGN:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
         self.arch_align_mode = tk.StringVar(value='none')
-        def _align_btn(text, val):
-            b = tk.Radiobutton(atb3, text=text, variable=self.arch_align_mode, value=val,
-                          command=self._on_align_mode_change, bg=C['panel'], fg=C['dim'],
-                          selectcolor=C['bg2'], font=(FONT, fsz(9)),
-                          activebackground=C['panel'], activeforeground=C['text'],
-                          indicatoron=False, padx=8, pady=3, relief='flat',
-                          bd=1, highlightthickness=0)
-            b.pack(side='left', padx=(0, 4))
-            return b
-        _align_btn("none (time since start)", 'none')
-        self.arch_align_temp_btn = _align_btn("by temperature =", 'temp')
-        self.arch_align_cur_btn = _align_btn("by current =", 'current')
+        _align_segments = mk_segmented(
+            atb3,
+            [("none (time since start)", 'none'), ("by temperature", 'temp'),
+             ("by current", 'current'), ("auto: match cycle", 'auto')],
+            self.arch_align_mode, command=self._on_align_mode_change, accent=C['orange'])
+        self.arch_align_temp_btn = _align_segments['temp']
+        self.arch_align_cur_btn = _align_segments['current']
+        self.arch_align_auto_btn = _align_segments['auto']
         self.arch_align_entry = tk.Entry(atb3, bg=C['bg2'], fg=C['text'],
                                         insertbackground=C['text'], relief='flat',
                                         font=(FONT, fsz(9)), width=10,
                                         highlightthickness=1, highlightbackground=C['border'])
         self.arch_align_entry.insert(0, "25.0")
-        self.arch_align_entry.pack(side='left', padx=(2, 2))
+        self.arch_align_entry.pack(side='left', padx=(8, 2))
         self.arch_align_entry.bind('<Return>', lambda e: self._redraw_arch())
         self.arch_align_unit_lbl = tk.Label(atb3, text="°C", bg=C['panel'], fg=C['dim2'],
                                             font=(FONT, fsz(9)))
-        self.arch_align_unit_lbl.pack(side='left', padx=(0, 4))
-        self.arch_align_auto_btn = _align_btn("auto: match cycle →", 'auto')
-        mk_btn_outline(atb3, "APPLY", self._redraw_arch, C['cyan']).pack(side='left', padx=(4, 0))
+        self.arch_align_unit_lbl.pack(side='left', padx=(0, 6))
+        mk_btn_outline(atb3, "APPLY", self._redraw_arch, C['cyan']).pack(side='left')
         self.arch_align_entry.config(state='disabled')
 
         atb4 = tk.Frame(cf, bg=C['panel'])
@@ -4361,9 +4599,9 @@ class PeltierControl:
             return  # bez zmian - nie ma po co dotykac widgetu
         self.fan_on = is_on
         if is_on:
-            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+            self.btn_fan.config(text="● ON", bg=C['green'], fg='#0f1f14', highlightbackground=C['green'])
         else:
-            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+            self.btn_fan.config(text="○ OFF", bg=C['bg2'], fg=C['dim2'], highlightbackground=C['dim'])
 
     def _draw_chart(self):
         t=self.t; t1=self.temp1; t2=self.temp2; sp=self.spt; spa=self.spa; pw=self.pwm
