@@ -66,7 +66,7 @@ RAMP_MAX_UI = 80.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.3"
+BUILD_VERSION = "2026-07-11.5"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -3736,6 +3736,26 @@ class PeltierControl:
         for v in self.arch_vars.values(): v.set(False)
         self._redraw_arch()
 
+    def _downsample_cycle_arrays(self, t, t1, t2, sp, pwm, ki, kv, target=1200):
+        """Downsampluje WSZYSTKIE tablice danego cyklu razem (te same indeksy
+        dla wszystkich kanalow, zeby zostaly wzajemnie zsynchronizowane w
+        czasie). Zwykle, RaWNOMIERNE probkowanie co N-ty punkt (nie min/max
+        per kubelek) - to daje PLYNNA linie pokazujaca faktyczna trajektorie
+        dojscia do wartosci, czego oczekuje sie przy tak czestym probkowaniu.
+        Wczesniejsza wersja zachowywala lokalne minima/maksima zeby nie
+        gubic ostrych pikow w szumiacym sygnale pradu, ale przy polaczeniu
+        w linie dawalo to sztuczne, 'prostokatne' skoki (bo w kazdym kubelku
+        min i max to zwykle dwa rozne, przypadkowe wychylenia szumu, a nie
+        prawdziwa cecha sygnalu) - rownomierne probkowanie tego nie robi."""
+        n = len(t)
+        if n <= target:
+            return t, t1, t2, sp, pwm, ki, kv
+        step = n / target
+        idxs = sorted(set(int(i * step) for i in range(target)) | {n - 1})
+        return ([t[i] for i in idxs], [t1[i] for i in idxs], [t2[i] for i in idxs],
+                [sp[i] for i in idxs], [pwm[i] for i in idxs],
+                [ki[i] for i in idxs], [kv[i] for i in idxs])
+
     def _load_cycle(self, path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -4020,6 +4040,14 @@ class PeltierControl:
             d = self._load_cycle(path)
             if not d: continue
             t,t1,t2,sp,pwm,ki,kv = d
+            # Downsampluj DUZE cykle (dziesiatki tysiecy probek przy dlugim
+            # logowaniu 10Hz) do rozsadnej liczby punktow - matplotlib i tak
+            # nie pokaze wiecej rozdzielczosci niz szerokosc wykresu w
+            # pikselach, a rysowanie/hover na pelnym surowym zbiorze
+            # zauwazalnie zacinaly interfejs przy porownywaniu wykresow.
+            # Zachowuje lokalne minima/maksima (nie plaskie co-N-ty-punkt),
+            # wiec ostre piki (np. skoki pradu) nie znikaja z wykresu.
+            t,t1,t2,sp,pwm,ki,kv = self._downsample_cycle_arrays(t,t1,t2,sp,pwm,ki,kv)
             has_i = any(v is not None for v in ki)
             has_v = any(v is not None for v in kv)
             any_current_data = any_current_data or has_i
