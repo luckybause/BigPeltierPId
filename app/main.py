@@ -24,6 +24,17 @@ try:
     matplotlib.use('TkAgg')
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    # WAZNE: to jest OPTYMALIZACJA WYLACZNIE RENDERINGU (rysowania pikseli na
+    # ekranie), NIE dotyka zadnych danych. Kazdy punkt nadal jest w pelni
+    # obecny w Line2D (hover, eksport, wszystko widzi 100% surowego zbioru).
+    # path.simplify pozwala silnikowi Agg pomijac rysowanie segmentow linii,
+    # ktore i tak wypadlyby na tym samym pikselu (np. przy 40000 punktach na
+    # wykresie szerokim na 1400px, wiele z nich fizycznie nie moze byc
+    # rozroznialnych) - to przyspiesza sam akt malowania na ekranie, bez
+    # jakiegokolwiek okrojenia, uśredniania czy zniekształcenia danych.
+    matplotlib.rcParams['path.simplify'] = True
+    matplotlib.rcParams['path.simplify_threshold'] = 1.0
+    matplotlib.rcParams['agg.path.chunksize'] = 10000
 except ImportError as e:
     print(f"pip install matplotlib\n{e}"); input(); sys.exit(1)
 
@@ -66,7 +77,7 @@ RAMP_MAX_UI = 80.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.5"
+BUILD_VERSION = "2026-07-11.7"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -2431,6 +2442,20 @@ class PeltierControl:
                                     relief='flat', cursor='hand2', bd=0, padx=4, pady=6)
         self.btn_mode_i.pack(side='left', fill='x', expand=True)
 
+        # Jednoklikowy, gotowy preset dla pomiaru genuine short-circuit
+        # current (np. prad piroelektryczny/fotoprad) - SOURCE V przy 0V to
+        # WLASCIWY tryb do mierzenia prawdziwego pradu generowanego przez
+        # probke. SOURCE I=0A robi cos innego (patrz ostrzezenie ponizej) i
+        # bylo zrodlem realnego zamieszania w tej sesji.
+        mk_btn_outline(mode_row, "⚡ SHORT-CIRCUIT CURRENT PRESET (recommended)",
+                       self._apply_short_circuit_preset, C['green']).pack(fill='x', pady=(6, 0))
+
+        self.sweep_mode_warning_lbl = tk.Label(
+            mode_row, text="", bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(8), 'bold'),
+            justify='left', wraplength=250)
+        # nie pakujemy od razu - pokazuje sie tylko gdy wykryty zostanie
+        # niewlasciwy tryb (patrz _update_sweep_mode_warning)
+
         # Tylko pomiar (bez sweepu) - pojedyncza stala wartosc, ciagly pomiar
         self.sweep_continuous_var = tk.BooleanVar(value=False)
         cont_row = tk.Frame(linner, bg=C['panel'])
@@ -2554,7 +2579,14 @@ class PeltierControl:
         self.sweep_loop_pause_entry.master.pack_forget()  # ukryte dopoki petla wylaczona
         self._loop_pause_row = self.sweep_loop_pause_entry.master
 
-        btn_row = tk.Frame(linner, bg=C['panel'])
+        # WAZNE: btn_row musi byc rodzenstwem _loop_pause_row (oba dzieci
+        # self.params_body) - inaczej pack(before=self._sweep_btn_row) w
+        # _toggle_continuous_mode() rzuca TclError ("can't pack X inside Y"),
+        # bo Tk wymaga tego samego rodzica dla widgetu i jego "before=".
+        # Wczesniej btn_row bylo parentowane do 'linner' (zewnetrzna ramka
+        # sekcji), co rozjezdzalo sie z self.params_body przy pierwszym
+        # zaznaczeniu "Measurement only" na swiezym uruchomieniu aplikacji.
+        btn_row = tk.Frame(self.params_body, bg=C['panel'])
         self._sweep_btn_row = btn_row
         btn_row.pack(fill='x', pady=(16, 0))
         self.btn_sweep_start = tk.Button(btn_row, text="▶ START SWEEP", command=self.keithley_sweep_start,
@@ -2807,6 +2839,7 @@ class PeltierControl:
                      "spacing between CONSECUTIVE samples [ms] - THIS controls\n"
                      "the data-collection rate (e.g. 100ms =\n"
                      "10 samples/s). NPLC/AVERAGING - see below.")
+            self.sweep_value_entry.bind('<KeyRelease>', lambda e: self._update_sweep_mode_warning())
         else:
             self._single_value_frame.pack_forget()
             self._sweep_range_frame.pack(fill='x', before=self.sweep_limit_entry.master)
@@ -2827,11 +2860,60 @@ class PeltierControl:
                      "electrical signal to settle). NPLC/AVERAGING -\n"
                      "see below: control the noise of the current/voltage measurement.")
 
+        self._update_sweep_mode_warning()
+
     def _toggle_loop_pause_field(self):
         if self.sweep_loop_var.get():
             self._loop_pause_row.pack(fill='x', pady=4, before=self._sweep_btn_row)
         else:
             self._loop_pause_row.pack_forget()
+
+    def _update_sweep_mode_warning(self):
+        """Pokazuje wyrazne ostrzezenie gdy wybrana kombinacja ustawien NIE
+        jest wlasciwa do pomiaru prawdziwego pradu generowanego przez probke
+        (np. prad piroelektryczny/fotoprad). Konkretnie: SOURCE I z wartoscia
+        bliska zeru to NIE jest pomiar pradu - to Keithley aktywnie dociskajacy
+        napiecie, zeby WYMUSIC prad bliski zeru (wirtualny "otwarty obwod
+        pradowy"), wiec odczyt "current" w tym trybie to szum petli serwo,
+        nie realny sygnal z probki. Bylo to realnym zrodlem zamieszania w tej
+        sesji (probka dawala pozornie chaotyczny szum, bo mierzylismy w
+        niewlasciwym trybie)."""
+        if not hasattr(self, 'sweep_mode_warning_lbl'):
+            return
+        try:
+            val = float(self.sweep_value_entry.get().replace(',', '.'))
+        except (ValueError, AttributeError):
+            val = None
+        is_source_i_near_zero = (self.sweep_mode == "I" and val is not None and abs(val) < 1e-9)
+        if is_source_i_near_zero:
+            self.sweep_mode_warning_lbl.config(
+                text="⚠ SOURCE I at ~0A does NOT measure real sample current - "
+                     "it forces near-zero current and reports the servo-loop "
+                     "voltage noise instead. For genuine short-circuit current "
+                     "(e.g. pyroelectric/photocurrent), use SOURCE V at 0V - "
+                     "see the preset button above.")
+            self.sweep_mode_warning_lbl.pack(fill='x', pady=(6, 0))
+        else:
+            self.sweep_mode_warning_lbl.pack_forget()
+
+    def _apply_short_circuit_preset(self):
+        """Jednoklikowe, gotowe ustawienie do pomiaru prawdziwego pradu
+        zwarciowego probki (SOURCE V = 0V + ciagly pomiar) - wlasciwy tryb dla
+        prądu piroelektrycznego/fotopradu. Eliminuje ryzyko przypadkowego
+        pozostania w SOURCE I=0A (patrz _update_sweep_mode_warning), ktore
+        NIE mierzy prawdziwego pradu probki."""
+        if self.sweep_mode != "V":
+            self._set_sweep_mode("V")
+        if not self.sweep_continuous_var.get():
+            self.sweep_continuous_var.set(True)
+            self._toggle_continuous_mode()
+        self.sweep_value_entry.delete(0, 'end'); self.sweep_value_entry.insert(0, "0.0")
+        self.sweep_limit_entry.delete(0, 'end'); self.sweep_limit_entry.insert(0, "0.000001")  # 1uA compliance domyslnie
+        self._update_sweep_mode_warning()
+        messagebox.showinfo("Preset applied",
+            "SOURCE V = 0V, measuring genuine short-circuit current.\n\n"
+            "LIMIT (current compliance) set to a safe default of 1µA - "
+            "adjust if your sample/setup needs a different protection level.")
 
     def _set_sweep_mode(self, mode):
         if mode == self.sweep_mode:
@@ -2871,6 +2953,7 @@ class PeltierControl:
             entry.delete(0, 'end'); entry.insert(0, saved[key])
 
         self._redraw_sweep_chart()
+        self._update_sweep_mode_warning()
 
     def clear_sweep(self):
         self.sweep_points = []
@@ -3736,26 +3819,6 @@ class PeltierControl:
         for v in self.arch_vars.values(): v.set(False)
         self._redraw_arch()
 
-    def _downsample_cycle_arrays(self, t, t1, t2, sp, pwm, ki, kv, target=1200):
-        """Downsampluje WSZYSTKIE tablice danego cyklu razem (te same indeksy
-        dla wszystkich kanalow, zeby zostaly wzajemnie zsynchronizowane w
-        czasie). Zwykle, RaWNOMIERNE probkowanie co N-ty punkt (nie min/max
-        per kubelek) - to daje PLYNNA linie pokazujaca faktyczna trajektorie
-        dojscia do wartosci, czego oczekuje sie przy tak czestym probkowaniu.
-        Wczesniejsza wersja zachowywala lokalne minima/maksima zeby nie
-        gubic ostrych pikow w szumiacym sygnale pradu, ale przy polaczeniu
-        w linie dawalo to sztuczne, 'prostokatne' skoki (bo w kazdym kubelku
-        min i max to zwykle dwa rozne, przypadkowe wychylenia szumu, a nie
-        prawdziwa cecha sygnalu) - rownomierne probkowanie tego nie robi."""
-        n = len(t)
-        if n <= target:
-            return t, t1, t2, sp, pwm, ki, kv
-        step = n / target
-        idxs = sorted(set(int(i * step) for i in range(target)) | {n - 1})
-        return ([t[i] for i in idxs], [t1[i] for i in idxs], [t2[i] for i in idxs],
-                [sp[i] for i in idxs], [pwm[i] for i in idxs],
-                [ki[i] for i in idxs], [kv[i] for i in idxs])
-
     def _load_cycle(self, path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -3767,7 +3830,16 @@ class PeltierControl:
                     v1 = r.get('temperatura1_C','')
                     t1.append(float(v1) if v1 else None)
                     v2 = r.get('temperatura2_C','')
-                    t2.append(float(v2) if v2 else None)
+                    # Ta sama ochrona co w strumieniu live (_parse_csv_line):
+                    # bug w starszym firmware potrafil zapisac literalne 0.0
+                    # dla T2 przy pojedynczym, przejsciowym zlym odczycie
+                    # termopary (naprawione w PeltierPID.ino - patrz komentarz
+                    # przy "if(tc2OK)"). Traktujemy dokladne 0.0 jako brak
+                    # odczytu (przerwa na wykresie), nie prawdziwa temperature -
+                    # dzieki temu rowniez CYKLE ZAPISANE PRZED NAPRAWA nie
+                    # pokazuja juz fantomowych skokow do zera.
+                    t2v = float(v2) if v2 else None
+                    t2.append(t2v if t2v != 0 else None)
                     sp.append(float(r.get('setpoint_cel_C',0)))
                     pwm.append(float(r.get('peltier_pct',0)))
                     vki = r.get('keithley_prad_A','')
@@ -4040,14 +4112,13 @@ class PeltierControl:
             d = self._load_cycle(path)
             if not d: continue
             t,t1,t2,sp,pwm,ki,kv = d
-            # Downsampluj DUZE cykle (dziesiatki tysiecy probek przy dlugim
-            # logowaniu 10Hz) do rozsadnej liczby punktow - matplotlib i tak
-            # nie pokaze wiecej rozdzielczosci niz szerokosc wykresu w
-            # pikselach, a rysowanie/hover na pelnym surowym zbiorze
-            # zauwazalnie zacinaly interfejs przy porownywaniu wykresow.
-            # Zachowuje lokalne minima/maksima (nie plaskie co-N-ty-punkt),
-            # wiec ostre piki (np. skoki pradu) nie znikaja z wykresu.
-            t,t1,t2,sp,pwm,ki,kv = self._downsample_cycle_arrays(t,t1,t2,sp,pwm,ki,kv)
+            # UWAGA: brak downsamplingu - rysujemy 100% surowych danych, bez
+            # zadnej redukcji/wygladzania. Wydajnosc rysowania duzych cykli
+            # (dziesiatki tysiecy probek) jest zamiast tego rozwiazana przez
+            # wlaczenie path.simplify w matplotlib (patrz poczatek pliku) -
+            # to czysto renderingowa optymalizacja pikseli na ekranie, ktora
+            # NIE zmienia, nie usuwa i nie zaklamuje zadnego punktu danych -
+            # caly zbior pozostaje kompletny (hover, eksport, wszystko).
             has_i = any(v is not None for v in ki)
             has_v = any(v is not None for v in kv)
             any_current_data = any_current_data or has_i
