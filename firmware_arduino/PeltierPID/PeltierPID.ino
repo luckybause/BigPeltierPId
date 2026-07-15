@@ -341,8 +341,20 @@ void runST(float temp){
   int pi2=(stI-2+ST_HIST)%ST_HIST,ci2=(stI-1+ST_HIST)%ST_HIST;
   float tr=abs(stEH[ci2])-abs(stEH[pi2]);
   bool im=(tr<-0.1f),wo=(tr>0.3f);
+  // Rampa zakonczona (spA juz dojechalo do celu) - oscylacja W TYM stanie
+  // czesto NIE bierze sie z samego PID, tylko z feed-forward HOLD, ktory
+  // caly czas wstrzykuje stala, "zgadywana" moc niezaleznie od PID. Jesli
+  // jest za duzy wzgledem rzeczywistej bezwladnosci ukladu (typowo przy
+  // duzym dystansie od temperatury otoczenia), wywoluje regularna oscylacje
+  // ktora samo tlumienie Kp/Ki/Kd nie zawsze w pelni eliminuje, bo zrodlo
+  // problemu siedzi POZA regulatorem PID.
+  bool holding = (abs(spT-spA) < 0.5f);
   if(htg){
-    if(osc){Kp_h=constrain(Kp_h*(1-ST_ADJ*1.5f),KP_MIN,KP_MAX);Kd_h=constrain(Kd_h*(1-ST_ADJ),KD_MIN,KD_MAX);Ki_h=constrain(Ki_h*(1-ST_ADJ*0.5f),KI_MIN,KI_MAX);ig*=0.5f;stSt="OSC-";}
+    if(osc){
+      Kp_h=constrain(Kp_h*(1-ST_ADJ*1.5f),KP_MIN,KP_MAX);Kd_h=constrain(Kd_h*(1-ST_ADJ),KD_MIN,KD_MAX);Ki_h=constrain(Ki_h*(1-ST_ADJ*0.5f),KI_MIN,KI_MAX);ig*=0.5f;
+      if(holding){ kffHold=constrain(kffHold*(1-ST_ADJ),0.0f,20.0f); stSt="OSC-FF"; }
+      else stSt="OSC-";
+    }
     else if(satd&&ae>2){stSt="SAT";}
     else if(ae>8&&!im){Kp_h=constrain(Kp_h*(1+ST_ADJ*2),KP_MIN,KP_MAX);stSt="SLOW++";}
     else if(ae>3&&wo){Kp_h=constrain(Kp_h*(1+ST_ADJ),KP_MIN,KP_MAX);stSt="WORSE";}
@@ -351,7 +363,11 @@ void runST(float temp){
     Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
     if(ae<stBH){stBH=ae;stBKpH=Kp_h;stBKiH=Ki_h;stBKdH=Kd_h;}
   } else {
-    if(osc){Kp_c=constrain(Kp_c*(1-ST_ADJ*1.5f),KP_MIN,KP_MAX);Kd_c=constrain(Kd_c*(1-ST_ADJ),KD_MIN,KD_MAX);Ki_c=constrain(Ki_c*(1-ST_ADJ*0.5f),KI_MIN,KI_MAX);ig*=0.5f;stSt="OSC-";}
+    if(osc){
+      Kp_c=constrain(Kp_c*(1-ST_ADJ*1.5f),KP_MIN,KP_MAX);Kd_c=constrain(Kd_c*(1-ST_ADJ),KD_MIN,KD_MAX);Ki_c=constrain(Ki_c*(1-ST_ADJ*0.5f),KI_MIN,KI_MAX);ig*=0.5f;
+      if(holding){ kffHoldCool=constrain(kffHoldCool*(1-ST_ADJ),0.0f,20.0f); stSt="OSC-FF"; }
+      else stSt="OSC-";
+    }
     else if(satd&&ae>2){stSt="SAT";}
     else if(ae>8&&!im){Kp_c=constrain(Kp_c*(1+ST_ADJ*2),KP_MIN,KP_MAX);stSt="SLOW++";}
     else if(ae>3&&wo){Kp_c=constrain(Kp_c*(1+ST_ADJ),KP_MIN,KP_MAX);stSt="WORSE";}
@@ -924,8 +940,15 @@ void loop(){
     tP=now;float temp=rdT();
     if(tc2OK){
       float r2=tc2.readThermocoupleTemperature();
+      // NAPRAWIONE: pojedynczy, przejsciowy zly odczyt (szum, chwilowe
+      // zaklocenie) NIE kasuje juz temp2 do NAN. Wczesniej kazdy taki
+      // pojedynczy zly odczyt zerowal temp2 do NAN, co przy druku ponizej
+      // (isnan(temp2)?0.0f:temp2) zamienialo sie w dosl. 0.0C - gwaltowny,
+      // FALSZYWY skok na wykresie nieodzwierciedlajacy rzeczywistej
+      // temperatury. Teraz, tak jak przy T1 (patrz rdT(): fallback na lT),
+      // zly pojedynczy odczyt po prostu ZACHOWUJE ostatnia dobra wartosc
+      // zamiast zerowac cale pomiary do zera.
       if(!isnan(r2) && r2>-50 && r2<200) temp2=r2;
-      else temp2=NAN;
     }
     if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}Serial.println("!!! TEMP MAX - STOP !!!");}
     switch(sys){
