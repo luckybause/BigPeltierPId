@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.12"
+BUILD_VERSION = "2026-07-11.14"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -341,10 +341,18 @@ class KeithleyClient:
         self.inst.timeout = self.TIMEOUT_MS
 
     def setup_source_v_measure_i(self, channel="a", voltage=0.0, ilimit=0.1,
-                                  nplc=1.0, filter_count=1):
+                                  nplc=1.0, filter_count=1, autozero=True, autorange=True):
         """Konfiguruje SMU: zrodlo napiecia, pomiar pradu, dany limit pradowy (compliance).
         nplc - czas integracji pomiaru w okresach sieci (wyzej = mniej szumu, wolniej).
         filter_count - ile pomiarow usredniac sprzetowo w jeden odczyt (1 = wylaczone).
+        autozero - AUTOZERO_AUTO (dokladniejsze, ale wg dokumentacji/forum Keithleya i NI
+        potrafi znaczaco spowolnic pomiar - realne testy pokazuja nawet ~1.75x wolniej niz
+        sam czysty czas NPLC) vs AUTOZERO_OFF (szybsze, ale odczyt moze z czasem dryfowac -
+        warto okresowo recznie wywolac zero raz na jakis czas jesli to wylaczone na dluzej).
+        autorange - AUTORANGE_ON (wygodne, ale przy sygnale blisko granicy zakresu potrafi
+        "polowac" miedzy zakresami, dodajac narzut) vs stale ustawiony zakres (szybsze i
+        stabilniejsze w czasie, ale trzeba znac przyblizona skale sygnalu z gory - uzyj
+        ustawionego LIMIT jako przyblizenia najgorszego przypadku).
         Dla malych sygnalow (pA-nA, np. prad piroelektryczny) NPLC=0.01 to za mala
         integracja - odczyt to praktycznie sam szum ADC, ktory dodatkowo wywoluje
         ciagle przelaczanie zakresu (autorange hunting) i daje pilokształtne skoki +/-."""
@@ -354,22 +362,30 @@ class KeithleyClient:
         self._exec(f"{ch}.source.levelv = {voltage:.6f}")
         self._exec(f"{ch}.source.limiti = {ilimit:.6f}")
         self._exec(f"{ch}.measure.nplc = {nplc:.4f}")
-        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_AUTO")
-        self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_ON")
+        self._exec(f"{ch}.measure.autozero = {ch}.{'AUTOZERO_AUTO' if autozero else 'AUTOZERO_OFF'}")
+        if autorange:
+            self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_ON")
+        else:
+            self._exec(f"{ch}.measure.autorangei = {ch}.AUTORANGE_OFF")
+            self._exec(f"{ch}.measure.rangei = {ilimit:.6f}")
         self._configure_filter(ch, filter_count)
 
     def setup_source_i_measure_v(self, channel="a", current=0.0, vlimit=1.0,
-                                  nplc=1.0, filter_count=1):
+                                  nplc=1.0, filter_count=1, autozero=True, autorange=True):
         """Konfiguruje SMU: zrodlo pradu, pomiar napiecia, dany limit napieciowy (compliance).
-        nplc / filter_count - patrz setup_source_v_measure_i."""
+        nplc / filter_count / autozero / autorange - patrz setup_source_v_measure_i."""
         ch = f"smu{channel}"
         self._exec(f"{ch}.reset()")
         self._exec(f"{ch}.source.func = {ch}.OUTPUT_DCAMPS")
         self._exec(f"{ch}.source.leveli = {current:.6f}")
         self._exec(f"{ch}.source.limitv = {vlimit:.6f}")
         self._exec(f"{ch}.measure.nplc = {nplc:.4f}")
-        self._exec(f"{ch}.measure.autozero = {ch}.AUTOZERO_AUTO")
-        self._exec(f"{ch}.measure.autorangev = {ch}.AUTORANGE_ON")
+        self._exec(f"{ch}.measure.autozero = {ch}.{'AUTOZERO_AUTO' if autozero else 'AUTOZERO_OFF'}")
+        if autorange:
+            self._exec(f"{ch}.measure.autorangev = {ch}.AUTORANGE_ON")
+        else:
+            self._exec(f"{ch}.measure.autorangev = {ch}.AUTORANGE_OFF")
+            self._exec(f"{ch}.measure.rangev = {vlimit:.6f}")
         self._configure_filter(ch, filter_count)
 
     def _configure_filter(self, ch, filter_count):
@@ -1301,6 +1317,39 @@ class PeltierControl:
         linner = tk.Frame(left, bg=C['panel'])
         linner.pack(fill='both', expand=True, padx=14, pady=14)
 
+        # Ustawienie GLOBALNE (dotyczy wszystkich krokow programu) - jak
+        # blisko celu trzeba podejsc, zeby krok zaczal liczyc "osiagniety".
+        # Wczesniej byla to sztywna wartosc 0.5C w kodzie - przy wolno
+        # zbiegajacej rampie (np. asymptotyczne zblizanie sie do celu przy
+        # nowej logice kierunku, gdzie PWM lagodnie opada do zera) osiagniecie
+        # DOKLADNIE 0.5C potrafilo trwac bardzo dlugo, mimo ze temperatura
+        # byla juz praktycznie na miejscu. Teraz uzytkownik moze poszerzyc
+        # ten zakres, zeby odliczanie czasu przytrzymania zaczynalo sie
+        # wczesniej.
+        tol_row = tk.Frame(linner, bg=C['panel'])
+        tol_row.pack(fill='x', pady=(0, 12))
+        tk.Label(tol_row, text="TOLERANCE (± all steps)", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w')
+        tol_r2 = tk.Frame(tol_row, bg=C['panel'])
+        tol_r2.pack(fill='x', pady=(2, 0))
+        self.prog_tolerance_entry = tk.Entry(
+            tol_r2, bg=C['bg2'], fg=C['text'], insertbackground=C['text'],
+            relief='flat', font=(FONT, fsz(10)),
+            highlightthickness=1, highlightbackground=C['border'])
+        self.prog_tolerance_entry.insert(0, str(self.program_tolerance))
+        self.prog_tolerance_entry.pack(side='left', fill='x', expand=True, ipady=4)
+        tk.Label(tol_r2, text="°C", bg=C['panel'], fg=C['dim2'],
+                font=(FONT, fsz(9))).pack(side='left', padx=(6, 0))
+        self.prog_tolerance_entry.bind('<FocusOut>', lambda e: self._apply_program_tolerance())
+        self.prog_tolerance_entry.bind('<Return>', lambda e: self._apply_program_tolerance())
+        tk.Label(tol_row, text="Once T1 is within this range of a step's target, the "
+                 "hold countdown for that step begins (a wider range starts it sooner, "
+                 "since a slow final approach doesn't have to be exact).",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=240).pack(anchor='w', pady=(3, 0))
+
+        tk.Frame(linner, bg=C['border'], height=1).pack(fill='x', pady=(0, 12))
+
         tk.Label(linner, text="NEW STEP", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 10))
 
@@ -1691,6 +1740,17 @@ class PeltierControl:
         if self.program_step_idx >= len(self.program_steps):
             self.program_running = False
             self.program_state = 'done'
+            # NAPRAWIONE: wczesniej konczylismy TYLKO ksiegowosc po stronie
+            # PC (program_running/program_state), nigdy nie mowiac firmware
+            # zeby faktycznie przestal regulowac. Efekt: PID w firmware
+            # nadal trzymal ostatnia temperature w nieskonczonosc, a log
+            # cyklu (CSV) nigdy sie nie zamykal/zapisywal, bo to zamkniecie
+            # jest wyzwalane przez przejscie stanu firmware AUTO->MAN (patrz
+            # tick(): "elif not pid_on and self.cyc_on: self.cyc_stop(...)"),
+            # a firmware nigdy nie dostawal komendy STOP. Teraz wysylamy ja
+            # jawnie, tak samo jak robi to zwykly przycisk STOP na CONTROL.
+            self.send("STOP")
+            self._update_run_button(False)
             self.btn_prog_start.config(state='normal')
             self.btn_prog_stop.config(state='disabled')
             self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
@@ -1717,8 +1777,14 @@ class PeltierControl:
                         # Ten krok konczy CALY program od razu po ustabilizowaniu
                         # sie na celu - bez przytrzymania, bez dalszych krokow
                         # (nawet jesli byly zdefiniowane po nim na liscie).
+                        # NAPRAWIONE (ten sam bug co przy normalnym zakonczeniu
+                        # powyzej): trzeba jawnie wyslac STOP do firmware i
+                        # zaktualizowac przycisk RUN, inaczej PID nigdy sie
+                        # nie zatrzyma i log cyklu nigdy sie nie zapisze.
                         self.program_running = False
                         self.program_state = 'done'
+                        self.send("STOP")
+                        self._update_run_button(False)
                         self.btn_prog_start.config(state='normal')
                         self.btn_prog_stop.config(state='disabled')
                         self._set_program_status(
@@ -1766,8 +1832,14 @@ class PeltierControl:
                     # czekania na kolejny tick (ktory i tak by to wykryl na
                     # starcie funkcji, ale to niepotrzebne opoznienie o 250ms
                     # i dodatkowy, mylacy stan posredni)
+                    # NAPRAWIONE: trzecie miejsce z tym samym bugiem co przy
+                    # normalnym wejsciu do funkcji i przy end_program - brak
+                    # wyslania STOP do firmware oznaczal ze PID nigdy sie
+                    # nie zatrzymywal, a log cyklu nigdy sie nie zapisywal.
                     self.program_running = False
                     self.program_state = 'done'
+                    self.send("STOP")
+                    self._update_run_button(False)
                     self.btn_prog_start.config(state='normal')
                     self.btn_prog_stop.config(state='disabled')
                     self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
@@ -2564,6 +2636,35 @@ class PeltierControl:
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
         self.sweep_nplc_entry = _field("NPLC", "1.0", "PLC")
         self.sweep_avg_entry = _field("AVERAGING", "1", "x")
+
+        # AUTOZERO/AUTORANGE - wczesniej wpisane na sztywno (zawsze ON), bez
+        # zadnej mozliwosci wylaczenia. Wedlug dokumentacji Keithleya i
+        # zglaszanych na forum Keithley/NI realnych pomiarow, samo AUTOZERO
+        # potrafi spowolnic pomiar nawet ~1.75x wzgledem czystego czasu NPLC
+        # (np. NPLC=1 dajace teoretycznie ~19.7ms w praktyce mierzone jako
+        # ~34.7ms z autozero wlaczonym) - to jeden z glownych, wczesniej
+        # niewidocznych/niezmiennych czynnikow spowalniajacych pomiar ponizej
+        # oficjalnej maksymalnej predkosci przyrzadu. AUTORANGE tez dodaje
+        # narzut gdy sygnal "poluje" miedzy zakresami blisko ich granicy.
+        az_row = tk.Frame(self.params_body, bg=C['panel'])
+        az_row.pack(fill='x', pady=(8, 0))
+        self.sweep_autozero_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(az_row, text="AUTOZERO (more accurate, can be noticeably slower)",
+                      variable=self.sweep_autozero_var,
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
+                      font=(FONT, fsz(8)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(anchor='w')
+        self.sweep_autorange_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(az_row, text="AUTORANGE (convenient, adds overhead near range edges)",
+                      variable=self.sweep_autorange_var,
+                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
+                      font=(FONT, fsz(8)), activebackground=C['panel'],
+                      activeforeground=C['text']).pack(anchor='w', pady=(2, 0))
+        tk.Label(az_row, text="Turning either OFF trades some accuracy/range-safety for "
+                 "speed - see field descriptions above for details.",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=250).pack(anchor='w', pady=(3, 0))
+
         linner = old_linner
 
         # Sweep dwukierunkowy (tam i z powrotem) - przydatne np. do histerezy
@@ -2920,6 +3021,21 @@ class PeltierControl:
         on = self.tc2_enabled_var.get()
         self.send(f"TC2:{1 if on else 0}")
 
+    def _apply_program_tolerance(self):
+        """Aktualizuje globalna tolerancje (± zakres) uzywana przez wszystkie
+        kroki programu do rozpoznania 'cel osiagniety' - patrz pole
+        TOLERANCE w formularzu, zastepuje wczesniej sztywna wartosc 0.5C."""
+        try:
+            val = float(self.prog_tolerance_entry.get().replace(',', '.'))
+        except ValueError:
+            self.prog_tolerance_entry.delete(0, 'end')
+            self.prog_tolerance_entry.insert(0, str(self.program_tolerance))
+            return
+        val = max(0.05, min(val, 10.0))  # sensowne granice - od bardzo precyzyjnego po bardzo luzne
+        self.program_tolerance = val
+        self.prog_tolerance_entry.delete(0, 'end')
+        self.prog_tolerance_entry.insert(0, f"{val:g}")
+
     def _apply_short_circuit_preset(self):
         """Jednoklikowe, gotowe ustawienie do pomiaru prawdziwego pradu
         zwarciowego probki (SOURCE V = 0V + ciagly pomiar) - wlasciwy tryb dla
@@ -3114,9 +3230,13 @@ class PeltierControl:
                 unit = "V" if mode == "V" else "A"
 
                 if mode == "V":
-                    self.keithley.setup_source_v_measure_i("a", points[0], limit, nplc, avg_count)
+                    self.keithley.setup_source_v_measure_i("a", points[0], limit, nplc, avg_count,
+                                                            autozero=self.sweep_autozero_var.get(),
+                                                            autorange=self.sweep_autorange_var.get())
                 else:
-                    self.keithley.setup_source_i_measure_v("a", points[0], limit, nplc, avg_count)
+                    self.keithley.setup_source_i_measure_v("a", points[0], limit, nplc, avg_count,
+                                                            autozero=self.sweep_autozero_var.get(),
+                                                            autorange=self.sweep_autorange_var.get())
                 self.keithley.output_on("a")
 
                 first_pass = True
@@ -3829,7 +3949,7 @@ class PeltierControl:
             name = self._cycle_display_name(f)
             disp = name if len(name) <= 22 else name[:20]+"…"
             tk.Checkbutton(row, text=disp, variable=var, command=self._redraw_arch,
-                           bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
+                           bg=C['bg2'], fg=C['text'], selectcolor=col,
                            activebackground=C['bg2'], activeforeground=col,
                            font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                            anchor='w').pack(side='left', fill='x', expand=True)
