@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.16"
+BUILD_VERSION = "2026-07-11.19"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -589,9 +589,19 @@ class PeltierControl:
         self.sweep_t0 = None
         self.SWEEP_SETTLE_SKIP_S = 3.0  # pomijane na wykresie po starcie/nowej petli
         self.last_known_rel = 0.0
+        self.last_known_rel_wallclock_ts = time.time()  # do ekstrapolacji "t" dla wierszy wstawianych miedzy tykniecami PID (patrz cyc_log z watku Keithleya)
         self.last_known_t1 = None
         self.last_known_t2 = None
         self.last_known_sp = None
+        self.last_known_spa = None
+        self.last_known_pct = 0.0
+        self.last_known_fn = 0.0
+        self.last_known_heat_dir = True
+        self.last_known_kp = None
+        self.last_known_ki = None
+        self.last_known_kd = None
+        self.last_known_state = None
+        self.cyc_log_lock = threading.Lock()  # chroni cyc_wr.writerow() przed jednoczesnym zapisem z 2 watkow (glowny tick + watek Keithleya)
 
         self.reach_start_t = None
         self.reach_start_temp = None
@@ -612,7 +622,8 @@ class PeltierControl:
         self.program_step_sent = False
         self.program_stable_since = None
         self.program_hold_start = None
-        self.program_tolerance = 0.5      # C - tolerancja uznania ze cel osiagniety
+        self.program_tolerance = 0.5      # C - tolerancja uznania ze cel osiagniety (globalna, domyslna)
+        self.prog_editing_idx = None      # indeks kroku aktualnie edytowanego (None = tryb "dodaj nowy")
         self.program_stable_needed_s = 5  # s - jak dlugo w tolerancji zanim zaczniemy hold
         self.chart_window = 0
 
@@ -1377,13 +1388,32 @@ class PeltierControl:
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
-        # ── LEWY PANEL: formularz dodawania kroku ──
+        # ── LEWY PANEL: formularz dodawania kroku (SCROLLOWALNY - zeby
+        # przyciski SAVE/LOAD/CLEAR nigdy nie znikaly niezaleznie od
+        # wysokosci okna i liczby pol w formularzu, tak samo jak w KEITHLEY) ──
         left = tk.Frame(body, bg=C['panel'], width=px(280))
         left.pack(side='left', fill='y', padx=(0, 12))
         left.pack_propagate(False)
         tk.Frame(left, bg=C['cyan'], height=3).pack(fill='x')
-        linner = tk.Frame(left, bg=C['panel'])
-        linner.pack(fill='both', expand=True, padx=14, pady=14)
+
+        scroll_wrap = tk.Frame(left, bg=C['panel'])
+        scroll_wrap.pack(fill='both', expand=True)
+        pcanvas = tk.Canvas(scroll_wrap, bg=C['panel'], highlightthickness=0, width=px(260))
+        psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
+        pcanvas.configure(yscrollcommand=psb.set)
+        psb.pack(side='right', fill='y')
+        pcanvas.pack(side='left', fill='both', expand=True)
+
+        linner = tk.Frame(pcanvas, bg=C['panel'])
+        linner_id = pcanvas.create_window((0, 0), window=linner, anchor='nw')
+        linner.bind('<Configure>', lambda e: pcanvas.configure(scrollregion=pcanvas.bbox('all')))
+        pcanvas.bind('<Configure>', lambda e: pcanvas.itemconfig(linner_id, width=e.width))
+        pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>',
+                     lambda ev: pcanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        pcanvas.bind('<Leave>', lambda e: pcanvas.unbind_all('<MouseWheel>'))
+        linner_pad = tk.Frame(linner, bg=C['panel'])
+        linner_pad.pack(fill='both', expand=True, padx=14, pady=14)
+        linner = linner_pad  # reszta kodu buduje wewnatrz tego z paddingiem
 
         # Ustawienie GLOBALNE (dotyczy wszystkich krokow programu) - jak
         # blisko celu trzeba podejsc, zeby krok zaczal liczyc "osiagniety".
@@ -1451,6 +1481,15 @@ class PeltierControl:
 
         self.prog_hold_entry = _pfield("HOLD FOR", "10.0", "min")
 
+        tol_step_row = tk.Frame(linner, bg=C['panel'])
+        tol_step_row.pack(fill='x', pady=(8, 0))
+        self.prog_use_global_tolerance = tk.BooleanVar(value=True)
+        mk_checkbox(tol_step_row, "use global tolerance (above)", self.prog_use_global_tolerance,
+                   command=lambda: self.prog_step_tolerance_entry.config(
+                       state='disabled' if self.prog_use_global_tolerance.get() else 'normal'))
+        self.prog_step_tolerance_entry = _pfield("TOLERANCE (custom, this step only)", "0.5", "°C")
+        self.prog_step_tolerance_entry.config(state='disabled')
+
         self.prog_end_program_var = tk.BooleanVar(value=False)
         def _on_end_program_toggle():
             if self.prog_end_program_var.get():
@@ -1460,7 +1499,10 @@ class PeltierControl:
         mk_checkbox(linner, "End program here once reached (skip hold, ignore later steps)",
                    self.prog_end_program_var, command=_on_end_program_toggle)
 
-        mk_btn(linner, "+ ADD STEP", self.add_program_step, C['cyan']).pack(fill='x', pady=(14, 0))
+        self.btn_add_step = mk_btn(linner, "+ ADD STEP", self.add_program_step, C['cyan'])
+        self.btn_add_step.pack(fill='x', pady=(14, 0))
+        self.btn_cancel_edit_step = mk_btn_outline(linner, "✕ Cancel edit", self._cancel_edit_program_step, C['dim2'])
+        # nie pakujemy - pokazuje sie tylko w trybie edycji, patrz _edit_program_step
 
         tk.Frame(linner, bg=C['border'], height=1).pack(fill='x', pady=14)
 
@@ -1551,36 +1593,43 @@ class PeltierControl:
             return
         for i, step in enumerate(self.program_steps):
             active = self.program_running and i == self.program_step_idx
+            editing = (self.prog_editing_idx == i)
             row_bg = C['bg2'] if active else C['panel']
             row = tk.Frame(self.prog_list_inner, bg=row_bg,
-                          highlightthickness=1 if active else 0,
-                          highlightbackground=C['cyan'])
+                          highlightthickness=1 if (active or editing) else 0,
+                          highlightbackground=C['orange'] if editing else C['cyan'])
             row.pack(fill='x', padx=8, pady=3)
 
-            marker = "▶ " if active else ""
+            marker = "▶ " if active else ("✎ " if editing else "")
             ramp_txt = f"{step['ramp']:.1f}°C/min" if step['ramp'] is not None else "global ramp"
+            step_tol = step.get('tolerance')
+            tol_txt = f"±{step_tol:g}°C" if step_tol is not None else "global tol."
             if step.get('end_program'):
                 tail = "⏹ END PROGRAM HERE (no hold)"
             else:
                 tail = f"hold {step['hold_min']:.1f} min"
             txt = (f"{marker}STEP {i+1}: → {step['target']:.1f}°C  "
-                   f"({ramp_txt})  •  {tail}")
+                   f"({ramp_txt}, {tol_txt})  •  {tail}")
             tk.Label(row, text=txt, bg=row_bg,
-                    fg=C['red'] if step.get('end_program') else (C['cyan'] if active else C['text']),
-                    font=(FONT, fsz(9), 'bold' if active else 'normal')
+                    fg=C['orange'] if editing else (C['red'] if step.get('end_program') else (C['cyan'] if active else C['text'])),
+                    font=(FONT, fsz(9), 'bold' if (active or editing) else 'normal')
                     ).pack(side='left', padx=10, pady=8, fill='x', expand=True)
 
             btns = tk.Frame(row, bg=row_bg)
             btns.pack(side='right', padx=6)
-            for txt_b, cmd in [("↑", lambda i=i: self._move_program_step(i, -1)),
-                                ("↓", lambda i=i: self._move_program_step(i, 1)),
-                                ("✕", lambda i=i: self._delete_program_step(i))]:
+            for txt_b, cmd, color in [("✎", lambda i=i: self._edit_program_step(i), C['orange']),
+                                        ("↑", lambda i=i: self._move_program_step(i, -1), C['dim']),
+                                        ("↓", lambda i=i: self._move_program_step(i, 1), C['dim']),
+                                        ("✕", lambda i=i: self._delete_program_step(i), C['red'])]:
                 tk.Button(btns, text=txt_b, command=cmd, bg=row_bg,
-                         fg=C['dim'] if txt_b != "✕" else C['red'],
+                         fg=color,
                          font=(FONT, fsz(9), 'bold'), relief='flat', cursor='hand2',
                          bd=0, padx=6, activebackground=C['panel3']).pack(side='left')
 
     def add_program_step(self):
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before editing the step list.")
+            return
         try:
             target = float(self.prog_target_entry.get().replace(',', '.'))
         except ValueError:
@@ -1610,8 +1659,96 @@ class PeltierControl:
             if not (RAMP_MIN_UI <= ramp <= RAMP_MAX_UI):
                 messagebox.showerror("Error", f"RAMP is out of controller range ({RAMP_MIN_UI:g}..{RAMP_MAX_UI:g}°C/min).")
                 return
-        self.program_steps.append({'target': target, 'ramp': ramp, 'hold_min': hold_min,
-                                    'end_program': end_program})
+        # Tolerancja PER-KROK (opcjonalna) - jesli "use global tolerance"
+        # odznaczone, ten konkretny krok uzywa wlasnej wartosci zamiast
+        # globalnego ustawienia z gory panelu. None = uzyj globalnej.
+        tolerance = None
+        if not self.prog_use_global_tolerance.get():
+            try:
+                tolerance = float(self.prog_step_tolerance_entry.get().replace(',', '.'))
+            except ValueError:
+                messagebox.showerror("Error", "Check the TOLERANCE value.")
+                return
+            if not (0.05 <= tolerance <= 10.0):
+                messagebox.showerror("Error", "TOLERANCE should be between 0.05 and 10°C.")
+                return
+        new_step = {'target': target, 'ramp': ramp, 'hold_min': hold_min,
+                    'end_program': end_program, 'tolerance': tolerance}
+        if self.prog_editing_idx is not None:
+            # Tryb EDYCJI - podmieniamy istniejacy krok w miejscu, nie dodajemy nowego
+            idx = self.prog_editing_idx
+            if 0 <= idx < len(self.program_steps):
+                self.program_steps[idx] = new_step
+            self._cancel_edit_program_step()  # wraca do trybu "dodaj nowy" + odswieza liste
+        else:
+            self.program_steps.append(new_step)
+            self._refresh_program_list()
+
+    def _edit_program_step(self, idx):
+        """Wczytuje wartosci istniejacego kroku z powrotem do formularza po
+        lewej i przelacza go w tryb edycji - klikniecie 'ADD STEP' (teraz
+        pokazujace sie jako 'SAVE CHANGES') zaktualizuje ten krok w miejscu
+        zamiast dodawac nowy na koncu listy."""
+        if self.program_running:
+            messagebox.showwarning("Program running", "Stop the program before editing the step list.")
+            return
+        if not (0 <= idx < len(self.program_steps)):
+            return
+        step = self.program_steps[idx]
+        self.prog_editing_idx = idx
+
+        self.prog_target_entry.delete(0, 'end'); self.prog_target_entry.insert(0, f"{step['target']:g}")
+
+        if step['ramp'] is None:
+            self.prog_use_global_ramp.set(True)
+            self.prog_ramp_entry.config(state='normal')
+            self.prog_ramp_entry.delete(0, 'end'); self.prog_ramp_entry.insert(0, "2.0")
+            self.prog_ramp_entry.config(state='disabled')
+        else:
+            self.prog_use_global_ramp.set(False)
+            self.prog_ramp_entry.config(state='normal')
+            self.prog_ramp_entry.delete(0, 'end'); self.prog_ramp_entry.insert(0, f"{step['ramp']:g}")
+
+        self.prog_hold_entry.config(state='normal')
+        self.prog_hold_entry.delete(0, 'end'); self.prog_hold_entry.insert(0, f"{step['hold_min']:g}")
+
+        step_tol = step.get('tolerance')
+        if step_tol is None:
+            self.prog_use_global_tolerance.set(True)
+            self.prog_step_tolerance_entry.config(state='normal')
+            self.prog_step_tolerance_entry.delete(0, 'end'); self.prog_step_tolerance_entry.insert(0, "0.5")
+            self.prog_step_tolerance_entry.config(state='disabled')
+        else:
+            self.prog_use_global_tolerance.set(False)
+            self.prog_step_tolerance_entry.config(state='normal')
+            self.prog_step_tolerance_entry.delete(0, 'end'); self.prog_step_tolerance_entry.insert(0, f"{step_tol:g}")
+
+        self.prog_end_program_var.set(step.get('end_program', False))
+        if step.get('end_program', False):
+            self.prog_hold_entry.config(state='disabled')
+
+        self.btn_add_step.config(text="✓ SAVE CHANGES (step {})".format(idx+1), bg=C['orange'])
+        self.btn_cancel_edit_step.pack(fill='x', pady=(6, 0))
+        self._refresh_program_list()  # odswiez, zeby podswietlic edytowany wiersz
+
+    def _cancel_edit_program_step(self):
+        """Wychodzi z trybu edycji bez zapisywania zmian, wraca do trybu
+        'dodaj nowy krok' i przywraca formularz do wartosci domyslnych."""
+        self.prog_editing_idx = None
+        self.btn_add_step.config(text="+ ADD STEP", bg=C['cyan'])
+        self.btn_cancel_edit_step.pack_forget()
+        self.prog_target_entry.delete(0, 'end'); self.prog_target_entry.insert(0, "25.0")
+        self.prog_use_global_ramp.set(True)
+        self.prog_ramp_entry.config(state='normal')
+        self.prog_ramp_entry.delete(0, 'end'); self.prog_ramp_entry.insert(0, "2.0")
+        self.prog_ramp_entry.config(state='disabled')
+        self.prog_hold_entry.config(state='normal')
+        self.prog_hold_entry.delete(0, 'end'); self.prog_hold_entry.insert(0, "10.0")
+        self.prog_use_global_tolerance.set(True)
+        self.prog_step_tolerance_entry.config(state='normal')
+        self.prog_step_tolerance_entry.delete(0, 'end'); self.prog_step_tolerance_entry.insert(0, "0.5")
+        self.prog_step_tolerance_entry.config(state='disabled')
+        self.prog_end_program_var.set(False)
         self._refresh_program_list()
 
     def _delete_program_step(self, idx):
@@ -1620,6 +1757,11 @@ class PeltierControl:
             return
         if 0 <= idx < len(self.program_steps):
             del self.program_steps[idx]
+            if self.prog_editing_idx == idx:
+                self._cancel_edit_program_step()  # edytowany krok wlasnie zniknal - wyjdz z edycji
+                return  # _cancel_edit_program_step juz odswieza liste
+            elif self.prog_editing_idx is not None and self.prog_editing_idx > idx:
+                self.prog_editing_idx -= 1  # przesuniecie po usunieciu wczesniejszego kroku
             self._refresh_program_list()
 
     def _move_program_step(self, idx, direction):
@@ -1629,6 +1771,9 @@ class PeltierControl:
         j = idx + direction
         if 0 <= idx < len(self.program_steps) and 0 <= j < len(self.program_steps):
             self.program_steps[idx], self.program_steps[j] = self.program_steps[j], self.program_steps[idx]
+            # jesli przesuwamy akurat edytowany krok, podazaj za nim indeksem
+            if self.prog_editing_idx == idx: self.prog_editing_idx = j
+            elif self.prog_editing_idx == j: self.prog_editing_idx = idx
             self._refresh_program_list()
 
     def clear_program(self):
@@ -1672,7 +1817,8 @@ class PeltierControl:
             clean.append({'target': float(s['target']),
                           'ramp': (float(s['ramp']) if s.get('ramp') is not None else None),
                           'hold_min': float(s['hold_min']),
-                          'end_program': bool(s.get('end_program', False))})
+                          'end_program': bool(s.get('end_program', False)),
+                          'tolerance': (float(s['tolerance']) if s.get('tolerance') is not None else None)})
         return clean
 
     def _refresh_prog_quick_pick(self):
@@ -1841,7 +1987,9 @@ class PeltierControl:
                 self.program_step_sent = True
                 self.program_stable_since = None
 
-            within_tol = abs(current_temp - step['target']) <= self.program_tolerance
+            step_tolerance = step.get('tolerance')
+            active_tolerance = step_tolerance if step_tolerance is not None else self.program_tolerance
+            within_tol = abs(current_temp - step['target']) <= active_tolerance
             if within_tol:
                 if self.program_stable_since is None:
                     self.program_stable_since = time.time()
@@ -1883,7 +2031,7 @@ class PeltierControl:
                 text=f"STEP {self.program_step_idx+1}/{len(self.program_steps)}: "
                      f"approaching {step['target']:.1f}°C",
                 color=C['cyan'],
-                detail=f"Now: {current_temp:.2f}°C (±{self.program_tolerance:g}°C tol.) · "
+                detail=f"Now: {current_temp:.2f}°C (±{active_tolerance:g}°C tol.) · "
                        f"ETA to target: ~{self._fmt_mmss(eta_s)} · {then_txt}")
 
         elif self.program_state == 'holding':
@@ -3357,6 +3505,36 @@ class PeltierControl:
                         except Exception:
                             pass  # nie przerywaj sweepu z powodu bledu zapisu pojedynczego wiersza
 
+                        # NOWY, NIEZALEZNY zapis rowniez do LOGU CYKLU (ten
+                        # sam plik co ARCHIVE czyta) - przy KAZDEJ probce
+                        # Keithleya, nie tylko przy tykniecach termopar co
+                        # 100ms. Efekt: gdy Keithley mierzy szybciej (np. co
+                        # ~30ms), jego probki zostaja WSTAWIONE MIEDZY wiersze
+                        # temperaturowe wedlug rzeczywistego czasu, zamiast
+                        # ginac (wczesniej tylko ostatnia probka przed danym
+                        # tykniecem trafiala do tego pliku). Temperatura w
+                        # tych "wstawionych" wierszach to OSTATNIA ZNANA
+                        # wartosc (zero-order hold) ekstrapolowana w czasie -
+                        # nie mamy swiezszego odczytu termopary dokladnie w
+                        # tym momencie, ale przy typowej bezwladnosci cieplnej
+                        # ukladu i odstepach rzedu dziesiatek ms, trzymanie
+                        # ostatniej wartosci jest dokladniejsze niz czekanie
+                        # do nastepnego tykniecia. Kolumna czasu ("t") jest
+                        # ekstrapolowana z zegara systemowego od ostatniego
+                        # znanego tykniecia, wiec wiersze faktycznie ukladaja
+                        # sie chronologicznie MIEDZY wierszami z temperatura.
+                        if self.cyc_on:
+                            t_extrap = self.last_known_rel + \
+                                (time.time() - self.last_known_rel_wallclock_ts)
+                            self.cyc_log(t_extrap, self.last_known_t1, self.last_known_t2,
+                                        self.last_known_sp, self.last_known_pct,
+                                        self.last_known_fn, spa=self.last_known_spa,
+                                        kp=self.last_known_kp, ki=self.last_known_ki,
+                                        kd=self.last_known_kd, fw_ts=None,
+                                        state=self.last_known_state,
+                                        keithley_i=i_meas, keithley_v=v_meas,
+                                        heat=self.last_known_heat_dir)
+
                     if not loop or self.sweep_abort:
                         break
                     if loop_pause_ms > 0:
@@ -4035,7 +4213,25 @@ class PeltierControl:
                     vkv = r.get('keithley_napiecie_V','')
                     kv.append(float(vkv) if vkv else None)
                 except: continue
-            return (t,t1,t2,sp,pwm,ki,kv) if t else None
+            if not t:
+                return None
+            # Sortuj wg czasu - dwa niezalezne watki (tyknienia PID co 100ms +
+            # probki Keithleya w ich wlasnym tempie) pisza teraz do TEGO
+            # SAMEGO pliku (patrz keithley_sweep_start). Blokada (cyc_log_lock)
+            # chroni tylko przed uszkodzeniem pliku przy jednoczesnym zapisie,
+            # NIE gwarantuje ze wiersze trafiaja w idealnej kolejnosci
+            # czasowej (mozliwy niewielki jitter przy przelaczeniach watkow) -
+            # sortujemy tutaj defensywnie, zeby wykres mial gwarantowanie
+            # rosnaca os X niezaleznie od kolejnosci zapisu w pliku.
+            order = sorted(range(len(t)), key=lambda i: t[i])
+            t   = [t[i]   for i in order]
+            t1  = [t1[i]  for i in order]
+            t2  = [t2[i]  for i in order]
+            sp  = [sp[i]  for i in order]
+            pwm = [pwm[i] for i in order]
+            ki  = [ki[i]  for i in order]
+            kv  = [kv[i]  for i in order]
+            return (t,t1,t2,sp,pwm,ki,kv)
         except: return None
 
     def _style_arch_ax(self, ax):
@@ -4734,9 +4930,18 @@ class PeltierControl:
                 # Ostatnia znana temp/czas - do odczytu przez watek sweep (korelacja
                 # kazdego punktu I-V z temperatura w momencie pomiaru)
                 self.last_known_rel = rel
+                self.last_known_rel_wallclock_ts = time.time()
                 self.last_known_t1 = t1
                 self.last_known_t2 = t2
                 self.last_known_sp = sp
+                self.last_known_spa = spa
+                self.last_known_pct = pct
+                self.last_known_fn = fn
+                self.last_known_heat_dir = heat_dir
+                self.last_known_kp = d.get('kp')
+                self.last_known_ki = d.get('ki')
+                self.last_known_kd = d.get('kd')
+                self.last_known_state = d.get('state')
 
                 if len(self.t) > self.maxlen:
                     for a in [self.t,self.temp1,self.temp2,self.spt,self.spa,self.pwm,self.fanv]:
@@ -4760,30 +4965,23 @@ class PeltierControl:
                 # niespojnosc miedzy oddzielnymi odczytami w tej samej iteracji.
                 k_i, k_v = self._keithley_latest()
 
-                # Do LOGU CYKLU (CSV) zapisujemy prad/napiecie TYLKO gdy to
-                # GENUINE NOWA probka z Keithleya (jego wlasny watek zdazyl
-                # zwrocic nowy pomiar od ostatniego zapisu) - w przeciwnym
-                # razie None (puste pole w CSV). Bez tego: Keithley przy
-                # wyzszym NPLC/AVERAGING mierzy WOLNIEJ niz co 100ms (tempo
-                # loga, wyznaczone przez termopary), wiec ten sam odczyt
-                # trafial do 2-3 kolejnych wierszy CSV z rzedu, mimo ze
-                # temperatura w tych wierszach faktycznie sie zmieniala -
-                # przy wykresie I(T) dawalo to sztuczne, plaskie "schodki"
-                # (kwadratowy ksztalt) zamiast prawdziwej, ciaglej trajektorii.
-                # Wyswietlacz na zywo (RAW DATA/karty) NADAL pokazuje ostatnia
-                # znana wartosc bez migotania - to ograniczenie dotyczy
-                # wylacznie tego co ladowane jest do pliku/wykresu archiwum.
-                if self.keithley_last_ts is not None and self.keithley_last_ts != self._last_logged_keithley_ts:
-                    k_i_log, k_v_log = k_i, k_v
-                    self._last_logged_keithley_ts = self.keithley_last_ts
-                else:
-                    k_i_log, k_v_log = None, None
-
+                # UWAGA: ten wiersz (tyknienie firmware, co 100ms) NIE
+                # zapisuje juz Keithleya (zawsze None) - odpowiedzialnosc za
+                # to przejal WLASNY, niezalezny zapis w watku Keithleya (patrz
+                # keithley_sweep_start), ktory dopisuje swoj wlasny wiersz
+                # PRZY KAZDEJ swojej probce (np. co ~30ms), a nie tylko przy
+                # tyknieciach termopar. Dzieki temu ZADNA probka Keithleya nie
+                # ginie (wczesniej: przy szybszym pomiarze niz 100ms, tylko
+                # ostatnia probka przed danym tykniecem trafiala do pliku,
+                # reszta byla bezpowrotnie tracona z tego pliku - mimo ze byla
+                # w pelni zapisana w osobnym sweep_*.csv). Teraz oba strumienie
+                # (temperatura co 100ms, Keithley co jego wlasne tempo) trafiaja
+                # do TEGO SAMEGO pliku cyklu, przeplatane wg rzeczywistego czasu.
                 if self.cyc_on:
                     self.cyc_log(rel, t1, t2, sp, pct, fn,
                                  spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
                                  fw_ts=tsr, state=d.get('state'),
-                                 keithley_i=k_i_log, keithley_v=k_v_log, heat=heat_dir)
+                                 keithley_i=None, keithley_v=None, heat=heat_dir)
 
                 pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v, heat_dir))
@@ -5013,15 +5211,24 @@ class PeltierControl:
                 kvs = f"{keithley_v:.9e}" if keithley_v is not None else ""
                 dirs = "" if heat is None else ("HEAT" if heat else "COOL")
                 pc_ts = datetime.now().isoformat(timespec="milliseconds")
-                self.cyc_wr.writerow([
+                row = [
                     pc_ts, fwts, f"{t:.3f}",
                     t1s, t2s,
                     spas, f"{sp:.3f}",
                     f"{pct:.2f}", f"{fn:.2f}", dirs,
                     kps, kis, kds, state or "",
                     kis_a, kvs,
-                ])
-                self.cyc_file.flush(); self.cyc_rows += 1
+                ]
+                # Lock: cyc_log() jest teraz wolane zarowno z watku glownego
+                # (co 100ms, przy kazdym tyknieciu firmware) JAK I z watku
+                # Keithleya (przy kazdej jego probce, np. co ~30ms - patrz
+                # keithley_sweep_start) - bez blokady dwa jednoczesne
+                # writerow() z roznych watkow moglyby przeplatac bajty i
+                # uszkodzic plik CSV.
+                with self.cyc_log_lock:
+                    self.cyc_wr.writerow(row)
+                    self.cyc_file.flush()
+                self.cyc_rows += 1
             except Exception as e:
                 # NIE gub bledow po cichu - licz je i pokaz w naglowku statusu,
                 # zeby brak danych w CSV nie byl niespodzianka po eksperymencie
