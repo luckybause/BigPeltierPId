@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.14"
+BUILD_VERSION = "2026-07-11.16"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -159,6 +159,74 @@ def mk_segmented(parent, options, variable, command=None, accent=None, font_size
     # powinno sie jeszcze wykonywac - tylko wyglad ma odzwierciedlac stan.
     _select(variable.get(), fire_command=False)
     return btns
+
+def mk_checkbox(parent, text, variable, command=None, bg=None, wraplength=250, font_size=11, side=None, accent=None):
+    """Wlasny checkbox (kwadrat-znacznik + etykieta, obsluga kliknieciem)
+    zamiast natywnego tk.Checkbutton. Powod: na niektorych platformach/
+    motywach natywny wskaznik Tk nie daje WYRAZNEJ roznicy miedzy stanem
+    zaznaczonym i niezaznaczonym (oba wygladaly niemal identycznie), przez
+    co nie dalo sie stwierdzic czy opcja jest wlaczona - zglaszany, powtarzajacy
+    sie problem. Ten widget zawsze jednoznacznie pokazuje stan: wypelniony,
+    ZIELONY kwadrat z checkmarkiem gdy ON, pusty, SZARY kontur gdy OFF -
+    duzy, latwo widoczny, niezalezny od platformy/motywu, bo rysujemy to
+    sami zamiast polegac na natywnym rendererze. wraplength ustawiony
+    domyslnie (dlugi tekst etykiety zawijal sie zle/przycinal bez tego przy
+    natywnym Checkbutton).
+    side: None (domyslnie) pakuje blokowo (anchor='w', fill='x') - do uzycia
+    w pionowych panelach formularzy. Podaj 'right'/'left' do uzycia w
+    poziomym pasku narzedzi (np. obok innych kontrolek w jednym wierszu).
+    accent: kolor stanu ON - domyslnie zielony; podaj inny (np. kolor cyklu
+    w ARCHIVE) gdy zaznaczenie ma tez pelnic funkcje kodowania kolorem."""
+    bg = bg or C['panel']
+    accent = accent or C['green']
+    row = tk.Frame(parent, bg=bg)
+    if side:
+        row.pack(side=side)
+    else:
+        row.pack(anchor='w', fill='x')
+    box = tk.Label(row, text="☐", width=2, font=(FONT, fsz(font_size+5), 'bold'),
+                   bg=bg, fg=C['dim2'])
+    box.pack(side='left', padx=(0, 8), pady=(1, 0), anchor='n')
+    lbl = tk.Label(row, text=text, bg=bg, fg=C['dim'], font=(FONT, fsz(font_size)),
+                   justify='left', wraplength=wraplength, anchor='w')
+    lbl.pack(side='left', fill='x', expand=True)
+
+    def render():
+        if variable.get():
+            box.config(text="☑", fg=(accent if state['enabled'] else C['dim2']))
+            lbl.config(fg=(C['text'] if state['enabled'] else C['dim2']))
+        else:
+            box.config(text="☐", fg=C['dim2'])
+            lbl.config(fg=(C['dim'] if state['enabled'] else C['dim2']))
+
+    def toggle(event=None):
+        if not state['enabled']:
+            return
+        variable.set(not variable.get())
+        render()
+        if command: command()
+
+    state = {'enabled': True}
+    for w in (row, box, lbl):
+        w.bind("<Button-1>", toggle)
+        w.config(cursor='hand2')
+    render()
+    row.render = render  # pozwala wymusic odswiezenie wygladu z zewnatrz (np. po zmianie variable bez kliknięcia)
+
+    def set_enabled(enabled):
+        """Blokuje/odblokowuje klikalnosc i przygasza wyglad - zamiennik dla
+        .config(state='disabled'/'normal') na natywnych Tk widgetach, ktorego
+        ten wlasny checkbox (Frame+Label, nie prawdziwy Checkbutton) nie
+        wspiera natywnie."""
+        state['enabled'] = enabled
+        row.config(cursor='hand2' if enabled else 'arrow')
+        for w in (row, box, lbl):
+            w.config(cursor='hand2' if enabled else 'arrow')
+        render()
+    row.set_enabled = set_enabled
+    row.is_enabled = lambda: state['enabled']
+    row.variable = variable
+    return row
 
 # ════════════════════════════════════════════════════════
 #  SLIDER + POLE LICZBOWE
@@ -1375,13 +1443,9 @@ class PeltierControl:
         ramp_row = tk.Frame(linner, bg=C['panel'])
         ramp_row.pack(fill='x', pady=(8, 0))
         self.prog_use_global_ramp = tk.BooleanVar(value=True)
-        tk.Checkbutton(ramp_row, text="use global ramp rate (CONTROL)",
-                      variable=self.prog_use_global_ramp,
-                      command=lambda: self.prog_ramp_entry.config(
-                          state='disabled' if self.prog_use_global_ramp.get() else 'normal'),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(8)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(anchor='w')
+        mk_checkbox(ramp_row, "use global ramp rate (CONTROL)", self.prog_use_global_ramp,
+                   command=lambda: self.prog_ramp_entry.config(
+                       state='disabled' if self.prog_use_global_ramp.get() else 'normal'))
         self.prog_ramp_entry = _pfield("RAMP (custom, optional)", "2.0", "°C/min")
         self.prog_ramp_entry.config(state='disabled')
 
@@ -1393,12 +1457,8 @@ class PeltierControl:
                 self.prog_hold_entry.config(state='disabled')
             else:
                 self.prog_hold_entry.config(state='normal')
-        tk.Checkbutton(linner, text="End program here once reached (skip hold, ignore later steps)",
-                      variable=self.prog_end_program_var, command=_on_end_program_toggle,
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(8)), activebackground=C['panel'],
-                      activeforeground=C['text'], wraplength=240,
-                      justify='left').pack(anchor='w', pady=(6, 0))
+        mk_checkbox(linner, "End program here once reached (skip hold, ignore later steps)",
+                   self.prog_end_program_var, command=_on_end_program_toggle)
 
         mk_btn(linner, "+ ADD STEP", self.add_program_step, C['cyan']).pack(fill='x', pady=(14, 0))
 
@@ -1731,6 +1791,19 @@ class PeltierControl:
             self.control_prog_status_lbl.config(text=text, fg=color)
             self.control_prog_detail_lbl.config(text=detail)
 
+    def _stop_peltier_and_keithley(self):
+        """Wspolny helper wywolywany przy KAZDYM zakonczeniu programu (normalnym
+        po ostatnim kroku, przez end_program, i przez skrot w galezi holding) -
+        zatrzymuje PID w firmware (STOP) I, jesli akurat trwa pomiar Keithleya
+        (np. w trybie ciaglym rownolegle do rampy), zatrzymuje go tez. Bez tego
+        Peltier poprawnie sie wylaczal, ale Keithley zostawal dzialajacy w
+        nieskonczonosc i dalej dopisywal probki do pliku sweep, mimo ze caly
+        eksperyment juz sie skonczyl - bezuzyteczne dane po fakcie."""
+        self.send("STOP")
+        self._update_run_button(False)
+        if self.sweep_running:
+            self.keithley_sweep_stop()
+
     def _program_tick(self, current_temp):
         """Maszyna stanow programatora - wywolywana co kazdy tick() (250ms) gdy
         aktywny jest program. current_temp - biezaca temperatura T1 (moze byc
@@ -1748,9 +1821,9 @@ class PeltierControl:
             # jest wyzwalane przez przejscie stanu firmware AUTO->MAN (patrz
             # tick(): "elif not pid_on and self.cyc_on: self.cyc_stop(...)"),
             # a firmware nigdy nie dostawal komendy STOP. Teraz wysylamy ja
-            # jawnie, tak samo jak robi to zwykly przycisk STOP na CONTROL.
-            self.send("STOP")
-            self._update_run_button(False)
+            # jawnie (i zatrzymujemy tez Keithleya jesli mierzyl) przez
+            # wspolny helper - tak samo jak robi to zwykly przycisk STOP.
+            self._stop_peltier_and_keithley()
             self.btn_prog_start.config(state='normal')
             self.btn_prog_stop.config(state='disabled')
             self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
@@ -1780,11 +1853,14 @@ class PeltierControl:
                         # NAPRAWIONE (ten sam bug co przy normalnym zakonczeniu
                         # powyzej): trzeba jawnie wyslac STOP do firmware i
                         # zaktualizowac przycisk RUN, inaczej PID nigdy sie
-                        # nie zatrzyma i log cyklu nigdy sie nie zapisze.
+                        # nie zatrzyma i log cyklu nigdy sie nie zapisze. Przez
+                        # wspolny helper, ktory dodatkowo zatrzymuje TEZ
+                        # Keithleya jesli akurat mierzyl - bez tego Peltier
+                        # sie wylaczal poprawnie, ale pomiar pradu zostawal
+                        # wlaczony w nieskonczonosc, bezuzytecznie po fakcie.
                         self.program_running = False
                         self.program_state = 'done'
-                        self.send("STOP")
-                        self._update_run_button(False)
+                        self._stop_peltier_and_keithley()
                         self.btn_prog_start.config(state='normal')
                         self.btn_prog_stop.config(state='disabled')
                         self._set_program_status(
@@ -1836,10 +1912,10 @@ class PeltierControl:
                     # normalnym wejsciu do funkcji i przy end_program - brak
                     # wyslania STOP do firmware oznaczal ze PID nigdy sie
                     # nie zatrzymywal, a log cyklu nigdy sie nie zapisywal.
+                    # Przez wspolny helper (zatrzymuje tez Keithleya).
                     self.program_running = False
                     self.program_state = 'done'
-                    self.send("STOP")
-                    self._update_run_button(False)
+                    self._stop_peltier_and_keithley()
                     self.btn_prog_start.config(state='normal')
                     self.btn_prog_stop.config(state='disabled')
                     self._set_program_status("✓ Program complete.", C['green'], f"Completed {len(self.program_steps)} steps.")
@@ -2534,11 +2610,8 @@ class PeltierControl:
         tc2_row = tk.Frame(mode_row, bg=C['bg2'])
         tc2_row.pack(fill='x', pady=(8, 0))
         self.tc2_enabled_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(tc2_row, text="T2 thermocouple enabled",
-                      variable=self.tc2_enabled_var, command=self._toggle_tc2,
-                      bg=C['bg2'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['bg2'],
-                      activeforeground=C['text']).pack(anchor='w')
+        self.tc2_checkbox_row = mk_checkbox(tc2_row, "T2 thermocouple enabled", self.tc2_enabled_var,
+                                            command=self._toggle_tc2, bg=C['bg2'])
         tk.Label(tc2_row, text="Identified as an EMI source affecting sensitive pA "
                  "current readings - disable while measuring, without unplugging the cable.",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
@@ -2548,12 +2621,8 @@ class PeltierControl:
         self.sweep_continuous_var = tk.BooleanVar(value=False)
         cont_row = tk.Frame(linner, bg=C['panel'])
         cont_row.pack(fill='x', pady=(10, 0))
-        tk.Checkbutton(cont_row, text="Measurement only (no sweep - constant value)",
-                      variable=self.sweep_continuous_var, command=lambda: self._toggle_continuous_mode(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text'], wraplength=240,
-                      justify='left').pack(anchor='w')
+        mk_checkbox(cont_row, "Measurement only (no sweep - constant value)",
+                   self.sweep_continuous_var, command=lambda: self._toggle_continuous_mode())
 
         def _field(label, default, unit=""):
             row = tk.Frame(linner, bg=C['panel'])
@@ -2649,17 +2718,11 @@ class PeltierControl:
         az_row = tk.Frame(self.params_body, bg=C['panel'])
         az_row.pack(fill='x', pady=(8, 0))
         self.sweep_autozero_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(az_row, text="AUTOZERO (more accurate, can be noticeably slower)",
-                      variable=self.sweep_autozero_var,
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(8)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(anchor='w')
+        mk_checkbox(az_row, "AUTOZERO (more accurate, can be noticeably slower)",
+                   self.sweep_autozero_var)
         self.sweep_autorange_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(az_row, text="AUTORANGE (convenient, adds overhead near range edges)",
-                      variable=self.sweep_autorange_var,
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(8)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(anchor='w', pady=(2, 0))
+        mk_checkbox(az_row, "AUTORANGE (convenient, adds overhead near range edges)",
+                   self.sweep_autorange_var)
         tk.Label(az_row, text="Turning either OFF trades some accuracy/range-safety for "
                  "speed - see field descriptions above for details.",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
@@ -2671,24 +2734,15 @@ class PeltierControl:
         self.sweep_bidir_var = tk.BooleanVar(value=False)
         self._bidir_row = tk.Frame(self.params_body, bg=C['panel'])
         self._bidir_row.pack(fill='x', pady=(6, 0))
-        tk.Checkbutton(self._bidir_row, text="Sweep back and forth", variable=self.sweep_bidir_var,
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text'], wraplength=240,
-                      justify='left').pack(anchor='w')
+        mk_checkbox(self._bidir_row, "Sweep back and forth", self.sweep_bidir_var)
 
         # Petla - powtarzaj sweep w kolko, np. przez caly czas rampy PID
         self.sweep_loop_var = tk.BooleanVar(value=False)
         self._loop_chk_row = tk.Frame(self.params_body, bg=C['panel'])
         self._loop_chk_row.pack(fill='x', pady=(4, 0))
-        self.chk_loop = tk.Checkbutton(self._loop_chk_row, text="Loop (repeat until STOP)",
-                      variable=self.sweep_loop_var,
-                      command=lambda: self._toggle_loop_pause_field(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text'], wraplength=240,
-                      justify='left')
-        self.chk_loop.pack(anchor='w')
+        self.chk_loop = mk_checkbox(self._loop_chk_row, "Loop (repeat until STOP)",
+                                    self.sweep_loop_var,
+                                    command=lambda: self._toggle_loop_pause_field())
 
         linner = self.params_body
         self.sweep_loop_pause_entry = _field("PAUSE", "0", "ms")
@@ -2755,11 +2809,8 @@ class PeltierControl:
         self.btn_chart_it.pack(side='left')
 
         self.sweep_autoscale_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(chart_sel, text="Auto-scale", variable=self.sweep_autoscale_var,
-                      command=lambda: self._redraw_sweep_chart(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(side='right')
+        mk_checkbox(chart_sel, "Auto-scale", self.sweep_autoscale_var,
+                   command=lambda: self._redraw_sweep_chart(), side='right')
 
         # Wygladzanie DISPLAY-ONLY (srednia krocząca) - nie dotyka surowych
         # danych ani pliku CSV, tylko dorysowuje dodatkowa, gladsza linie na
@@ -2775,11 +2826,8 @@ class PeltierControl:
         self.sweep_smooth_window_entry.pack(side='right', padx=(0, 2))
         self.sweep_smooth_window_entry.bind('<Return>', lambda e: self._redraw_sweep_chart())
         self.sweep_smooth_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(chart_sel, text="Smooth (moving avg)", variable=self.sweep_smooth_var,
-                      command=lambda: self._redraw_sweep_chart(),
-                      bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-                      font=(FONT, fsz(9)), activebackground=C['panel'],
-                      activeforeground=C['text']).pack(side='right', padx=(0, 10))
+        mk_checkbox(chart_sel, "Smooth (moving avg)", self.sweep_smooth_var,
+                   command=lambda: self._redraw_sweep_chart(), side='right')
 
         # Duze karty na zywo: napiecie, prad, postep kroku
         scards_wrap = tk.Frame(right, bg=C['panel'])
@@ -2942,7 +2990,8 @@ class PeltierControl:
             self._single_value_frame.pack(fill='x', before=self.sweep_limit_entry.master)
             self._bidir_row.pack_forget()
             self.sweep_loop_var.set(True)
-            self.chk_loop.config(state='disabled')
+            self.chk_loop.set_enabled(False)
+            self.chk_loop.render()
             self._loop_pause_row.pack(fill='x', pady=4, before=self._sweep_btn_row)
             self.sweep_loop_pause_entry.field_lbl.config(text="INTERVAL")
             self.params_desc_lbl.config(
@@ -2961,8 +3010,9 @@ class PeltierControl:
             self._single_value_frame.pack_forget()
             self._sweep_range_frame.pack(fill='x', before=self.sweep_limit_entry.master)
             self._bidir_row.pack(fill='x', pady=(6, 0), before=self._loop_chk_row)
-            self.chk_loop.config(state='normal')
+            self.chk_loop.set_enabled(True)
             self.sweep_loop_var.set(False)
+            self.chk_loop.render()
             self._loop_pause_row.pack_forget()
             self.sweep_loop_pause_entry.field_lbl.config(text="PAUSE")
             self.params_desc_lbl.config(
@@ -3655,6 +3705,7 @@ class PeltierControl:
         self.arch_canvas.bind('<Leave>', lambda e: self.arch_canvas.unbind_all('<MouseWheel>'))
 
         self.arch_vars = {}
+        self.arch_checkboxes = {}
 
         cf = tk.Frame(body, bg=C['panel'])
         cf.pack(side='left', fill='both', expand=True)
@@ -3728,21 +3779,13 @@ class PeltierControl:
         self.arch_show_current_var = tk.BooleanVar(value=True)
         tk.Label(atb2b, text="KEITHLEY (below temperature):", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 4))
-        self.arch_show_current_chk = tk.Checkbutton(
-            atb2b, text="Current", variable=self.arch_show_current_var,
-            command=lambda: self._redraw_arch(),
-            bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-            font=(FONT, fsz(9)), activebackground=C['panel'],
-            activeforeground=C['text'])
-        self.arch_show_current_chk.pack(side='left', padx=(4, 0))
+        self.arch_show_current_chk = mk_checkbox(
+            atb2b, "Current", self.arch_show_current_var,
+            command=lambda: self._redraw_arch(), side='left')
         self.arch_show_voltage_var = tk.BooleanVar(value=False)
-        self.arch_show_voltage_chk = tk.Checkbutton(
-            atb2b, text="Voltage (same panel, together)", variable=self.arch_show_voltage_var,
-            command=lambda: self._redraw_arch(),
-            bg=C['panel'], fg=C['dim'], selectcolor=C['cyan'],
-            font=(FONT, fsz(9)), activebackground=C['panel'],
-            activeforeground=C['text'])
-        self.arch_show_voltage_chk.pack(side='left', padx=(6, 0))
+        self.arch_show_voltage_chk = mk_checkbox(
+            atb2b, "Voltage (same panel, together)", self.arch_show_voltage_var,
+            command=lambda: self._redraw_arch(), side='left')
 
         atb3 = tk.Frame(cf, bg=C['panel'])
         atb3.pack(fill='x', padx=8, pady=(0, 8))
@@ -3905,6 +3948,7 @@ class PeltierControl:
     def refresh_arch(self):
         for w in self.arch_items.winfo_children(): w.destroy()
         self.arch_vars = {}
+        self.arch_checkboxes = {}
         files = self._arch_list_files()
         if not files:
             tk.Label(self.arch_items, text="No saved cycles yet.",
@@ -3948,11 +3992,10 @@ class PeltierControl:
                      font=(FONT, fsz(8)), width=6, anchor='w').pack(side='left', padx=(6, 0))
             name = self._cycle_display_name(f)
             disp = name if len(name) <= 22 else name[:20]+"…"
-            tk.Checkbutton(row, text=disp, variable=var, command=self._redraw_arch,
-                           bg=C['bg2'], fg=C['text'], selectcolor=col,
-                           activebackground=C['bg2'], activeforeground=col,
-                           font=(FONT, fsz(9)), bd=0, highlightthickness=0,
-                           anchor='w').pack(side='left', fill='x', expand=True)
+            cb_row = mk_checkbox(row, disp, var, command=self._redraw_arch,
+                                 bg=C['bg2'], accent=col, side='left')
+            cb_row.pack(fill='x', expand=True)  # nadpisujemy domyslny side='left' pack na fill+expand
+            self.arch_checkboxes[str(f)] = cb_row
 
     def _delete_cycle(self, path):
         if messagebox.askyesno("Delete", f"Delete: {path.name}?"):
@@ -3961,6 +4004,7 @@ class PeltierControl:
 
     def _arch_clear_sel(self):
         for v in self.arch_vars.values(): v.set(False)
+        for cb in self.arch_checkboxes.values(): cb.render()
         self._redraw_arch()
 
     def _load_cycle(self, path):
@@ -4270,9 +4314,9 @@ class PeltierControl:
 
         # checkboxy prad/napiecie i wyrownanie maja sens tylko w widoku czasowym
         if hasattr(self, 'arch_show_current_chk'):
-            st = 'normal' if mode == 'time' else 'disabled'
-            self.arch_show_current_chk.config(state=st)
-            self.arch_show_voltage_chk.config(state=st)
+            enabled = (mode == 'time')
+            self.arch_show_current_chk.set_enabled(enabled)
+            self.arch_show_voltage_chk.set_enabled(enabled)
         if hasattr(self, 'arch_align_temp_btn'):
             align_state = 'normal' if mode == 'time' else 'disabled'
             self.arch_align_temp_btn.config(state=align_state)
@@ -4850,6 +4894,7 @@ class PeltierControl:
                 self._sync_fan_button(bool(d['fan_on']))
             if 'tc2_enabled' in d and hasattr(self, 'tc2_enabled_var'):
                 self.tc2_enabled_var.set(bool(d['tc2_enabled']))
+                if hasattr(self, 'tc2_checkbox_row'): self.tc2_checkbox_row.render()
         except Exception as e: print(f"cfg err: {e}")
 
     def _sync_fan_button(self, is_on):
