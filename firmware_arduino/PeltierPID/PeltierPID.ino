@@ -68,7 +68,7 @@
 #define KD_BASE_H    0.8f
 #define KD_BASE_C    0.3f
 #define RAMP_MIN     0.5f
-#define RAMP_MAX    80.0f
+#define RAMP_MAX    150.0f
 #define TMAX_MIN    50.0f
 #define TMAX_MAX   115.0f
 
@@ -383,35 +383,85 @@ void runST(float temp){
   if(stC>=ST_CYC_MAX) stStop();
 }
 
+// Feed-forward dla zadanego kierunku (heating=true/false) - wydzielone do
+// osobnej funkcji, bo w nowej logice compPID() liczymy je DWUKROTNIE w
+// niektorych cyklach: raz dla wciaz aktualnego kierunku (zeby sprawdzic czy
+// PID sam chce sie przelaczyc), i ewentualnie ponownie dla NOWEGO kierunku
+// od razu po przelaczeniu, zeby ten sam cykl PID uzyl juz poprawnych wartosci.
+float computeFF(bool heating){
+  if (heating) {
+    float hold = kffHold*(spA - T_AMBIENT);
+    float ramp = 0.0f;
+    if(spT > spA+0.2f){
+      ramp = kffRamp*rU;
+      ramp *= constrain((spT-spA)/3.0f, 0.0f, 1.0f);
+    }
+    return constrain(hold + ramp, 0.0f, FF_MAX);
+  } else {
+    float hold = kffHoldCool*(T_AMBIENT - spA);
+    float ramp = 0.0f;
+    if(spT < spA-0.2f){
+      ramp = kffRampCool*rD;
+      ramp *= constrain((spA-spT)/3.0f, 0.0f, 1.0f);
+    }
+    return -constrain(hold + ramp, 0.0f, FF_MAX);
+  }
+}
+
 // ── PID + Feed-Forward (symetryczny: grzanie i chlodzenie) ─────
 int compPID(float temp){
   float dt=PID_DT_MS/1000.0f,err=spA-temp;
 
-  // Kierunek (grzanie/chlodzenie): TWARDA blokada wg celu (spT) wzgledem
-  // RZECZYWISTEJ temperatury (temp), a NIE wzgledem pozycji rampy (spA).
-  // Zasada: cel wyzej niz aktualna temperatura -> caly cykl TYLKO grzanie
-  // (PWM nigdy nie schodzi ponizej 0, nawet chwilowo). Cel nizej -> TYLKO
-  // chlodzenie. Histereza DIR_HYST wokol granicy zapobiega drganiu kierunku
-  // przy szumie termopary dokladnie w momencie gdy temp~=spT.
+  float dRaw=(err-pe)/dt; pe=err;
+  dFilt = dFilt + 0.3f*(dRaw - dFilt);
+
+  // Kierunek (grzanie/chlodzenie): NIE porownujemy juz celu (spT) z
+  // rzeczywista temperatura. Zamiast tego liczymy surowy wynik PID w
+  // OBECNYM, jeszcze niezmienionym kierunku - i przelaczamy TYLKO gdy PID
+  // sam, na podstawie bledu wzgledem rampujacego sie punktu zadanego (spA),
+  // chce mocy w przeciwna strone.
   //
-  // Wczesniej kierunek zalezal od porownania spT vs spA (pozycja rampy), co
-  // dawalo dwa problemy: (1) gdy rampa dojdzie do celu (spA==spT), warunek
-  // stawal sie niejednoznaczny i wymagal dodatkowego override'u na >3C bledu,
-  // (2) mimo override'u nadal zdarzaly sie niepotrzebne przelaczenia HEAT/COOL
-  // generujace szum (kazde przelaczenie = reset integratora ig=0). Teraz
-  // kierunek zalezy tylko od jednej, stabilnej wielkosci (spT-temp), wiec
-  // przez caly czas trwania jednego cyklu grzania/chlodzenia kierunek jest
-  // ustalony raz i sie nie zmienia (chyba ze uzytkownik sam zmieni SP).
-  const float DIR_HYST = 0.5f;   // C - zwieksz np. do 1.0 jesli nadal drga
-  bool rH;
-  if      (spT - temp >  DIR_HYST) rH = true;   // cel wyzej -> grzanie
-  else if (temp - spT >  DIR_HYST) rH = false;  // cel nizej -> chlodzenie
-  else                              rH = htg;    // w strefie histerezy - bez zmian
+  // Efekt praktyczny: gdy rampa schodzi w dol (nowy, nizszy cel), system
+  // ZOSTAJE w trybie grzania i PWM naturalnie maleje w kierunku zera w miare
+  // jak blad sie zmniejsza/zmienia znak - dopiero gdy grzanie chcialoby
+  // ujemnej mocy (czyli samo zejscie do PWM=0 juz nie wystarcza, zeby
+  // nadazyc za tempem rampy), nastepuje przelaczenie na aktywne chlodzenie.
+  // To pozwala systemowi skorzystac z naturalnego chlodzenia biernego
+  // (strata ciepla do otoczenia) zamiast od razu wlaczac aktywne chlodzenie
+  // w momencie gdy tylko cel znajdzie sie ponizej aktualnej temperatury.
+  //
+  // Histereza DIR_HYST_PWM (w jednostkach PWM, nie stopniach C) zapobiega
+  // drganiu kierunku gdy rawOut oscyluje blisko zera.
+  float ff = computeFF(htg);
+  ffFilt += 0.08f*(ff - ffFilt);
+  float igTry = constrain(ig + err*dt, -INTEGRAL_MAX, INTEGRAL_MAX);
+  float rawOut = ffFilt + Kp*err + Ki*igTry + Kd*dFilt;
+
+  const float DIR_HYST_PWM = 5.0f;  // jednostki PWM (0-255) - margines przeciw drganiu
+  bool rH = htg;
+  if      (htg && rawOut < -DIR_HYST_PWM) rH = false;  // grzanie chce ujemnej mocy -> przelacz na chlodzenie
+  else if (!htg && rawOut >  DIR_HYST_PWM) rH = true;  // chlodzenie chce dodatniej mocy -> przelacz na grzanie
 
   if(rH!=htg){
-    ig=0;htg=rH;
+    ig=0;
+    dFilt=0;  // stara pochodna z przeciwnego kierunku jest bez sensu po przelaczeniu
+    htg=rH;
     if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}
     else   {Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
+    // Przelicz ff/rawOut od razu z NOWYMI gains/ff - inaczej pierwszy PWM
+    // po przelaczeniu liczylby sie jeszcze starymi (niewlasciwymi) wartosciami.
+    // WAZNE: ffFilt dostaje SNAP (przypisanie), nie wolny blend 0.08 jak
+    // normalnie - stara wartosc ffFilt z PRZECIWNEGO kierunku ma przeciwny
+    // znak, wiec blendowanie tylko 8% nowej wartosci zostawialo ffFilt
+    // "przyklejone" do starego znaku przez ~kilkanascie cykli, co natychmiast
+    // pchalo rawOut z powrotem przez prog histerezy w przeciwna strone -
+    // efekt: szybkie, powtarzajace sie oscylacje kierunku zamiast jednego
+    // czystego przelaczenia. Symulacja w Pythonie potwierdzila: bez snap -
+    // 7 przelaczen w jednym przebiegu rampy w dol; ze snap - dokladnie 1.
+    ff = computeFF(htg);
+    ffFilt = ff;
+    igTry = constrain(ig + err*dt, -INTEGRAL_MAX, INTEGRAL_MAX);
+    rawOut = ffFilt + Kp*err + Ki*igTry + Kd*dFilt;
   }
 
   // Wentylator zawsze na 100% podczas chlodzenia (niezaleznie od recznego
@@ -424,53 +474,32 @@ int compPID(float temp){
     fanOn=true; fanSpeed=100; fanApply();
   }
 
-  float dRaw=(err-pe)/dt; pe=err;
-  dFilt = dFilt + 0.3f*(dRaw - dFilt);
-
   // Zakres dozwolonego PWM: domyslnie (oppositeDirBrake=OFF) sztywno tylko
   // jeden kierunek wg htg - to eliminuje szum z przelaczen kierunku blisko
   // celu. Gdy oppositeDirBrake=ON, dopuszczamy pelny zakres [-PWM_MAX,PWM_MAX]
   // niezaleznie od htg - jesli PID "zobaczy" przeregulowanie (err przeciwnego
   // znaku), moze aktywnie zahamowac zamiast tylko zejsc do PWM=0 i czekac.
-  // Dobor wzmocnien (Kp/Ki/Kd, ff) nadal podaza za htg - to sie NIE zmienia,
-  // zeby nie wracal problem czestego przelaczania calego profilu regulacji.
   float lo = oppositeDirBrake ? -(float)PWM_MAX : (htg ? 0.0f : -(float)PWM_MAX);
   float hi = oppositeDirBrake ? (float)PWM_MAX : (htg ? (float)PWM_MAX : 0.0f);
 
-  float ff=0;
-  if(htg){
-    float hold = kffHold*(spA - T_AMBIENT);
-    float ramp = 0.0f;
-    if(spT > spA+0.2f){
-      ramp = kffRamp*rU;
-      ramp *= constrain((spT-spA)/3.0f, 0.0f, 1.0f);
-    }
-    ff = constrain(hold + ramp, 0.0f, FF_MAX);
-  } else {
-    // Analogiczny feed-forward dla CHLODZENIA - wczesniej go nie bylo (stad
-    // komentarz w naglowku pliku "tylko grzanie"), przez co chlodzenie
-    // polegalo wylacznie na reaktywnym PID bez zadnego przewidywania i
-    // gorzej nadazalo za zadana rampa niz grzanie. Struktura identyczna jak
-    // dla grzania, tylko lustrzana wzgledem T_AMBIENT i ze znakiem ujemnym:
-    // hold - moc potrzebna zeby TYLKO utrzymac temperature ponizej otoczenia
-    // (im nizej ponizej ambient, tym wiecej trzeba), ramp - dodatkowy zastrzyk
-    // mocy proporcjonalny do zadanego tempa chlodzenia (rD) w trakcie aktywnej
-    // rampy w dol, wygaszany w miare zblizania sie do celu.
-    float hold = kffHoldCool*(T_AMBIENT - spA);
-    float ramp = 0.0f;
-    if(spT < spA-0.2f){
-      ramp = kffRampCool*rD;
-      ramp *= constrain((spA-spT)/3.0f, 0.0f, 1.0f);
-    }
-    ff = -constrain(hold + ramp, 0.0f, FF_MAX);
-  }
-  ffFilt += 0.08f*(ff - ffFilt);
-
-  float igTry = constrain(ig + err*dt, -INTEGRAL_MAX, INTEGRAL_MAX);
-  float outT  = ffFilt + Kp*err + Ki*igTry + Kd*dFilt;
-  float outTc = constrain(outT, lo, hi);
-  bool inSat  = (outT != outTc);
-  bool deeper = (htg && err>0) || (!htg && err<0);
+  float outTc = constrain(rawOut, lo, hi);
+  bool inSat  = (rawOut != outTc);
+  // NAPRAWIONE: poprzednia wersja rozpoznawala "poglebianie nasycenia" tylko
+  // dla JEDNEJ, dalszej granicy zakresu (hi dla grzania, lo dla chlodzenia) -
+  // w starym projekcie kierunku (porownanie spT vs temp) to wystarczalo, bo
+  // kierunek przelaczal sie niemal natychmiast gdy tylko blad zmienial znak,
+  // wiec system nigdy dlugo nie siedzial zaklamowany przy BLISZSZEJ granicy
+  // (0). W NOWEJ logice kierunku (patrz wyzej) system SWIADOMIE zostaje
+  // zaklamowany przy 0 przez dluzszy czas (czekajac az PID sam zechce
+  // przeciwnej mocy) - a stara formula NIE rozpoznawala tego jako "nasycenie
+  // do zamrozenia", wiec integrator nawijal sie coraz glebiej (dziesiatki
+  // jednostek) podczas tego oczekiwania, co potem wywolywalo nadmiarowe,
+  // niepotrzebne przelaczenie z powrotem zaraz po pierwszym. Symulacja w
+  // Pythonie potwierdzila: bez tej poprawki - 2 zbedne przelaczenia nawet
+  // przy stabilnym trzymaniu temperatury; z poprawka - zero.
+  bool satHigh = (rawOut > hi);
+  bool satLow  = (rawOut < lo);
+  bool deeper = (satHigh && err>0) || (satLow && err<0);
   if(!(inSat && deeper)) ig = igTry;
 
   float out = ffFilt + Kp*err + Ki*ig + Kd*dFilt;
@@ -734,6 +763,7 @@ void sendCfg(){
   Serial.print(",KFFHC=");Serial.print(kffHoldCool,2);
   Serial.print(",KFFRC=");Serial.print(kffRampCool,2);
   Serial.print(",OPPDIR=");Serial.print(oppositeDirBrake?1:0);
+  Serial.print(",TC2=");Serial.print(tc2OK?1:0);
   Serial.println();
 }
 
@@ -761,6 +791,17 @@ void procCmd(String c){
   else if(key=="OPPDIR"){
     oppositeDirBrake=(val.toInt()>0);
     Serial.println(oppositeDirBrake?"OPPDIR ON (hamowanie przeciwnym kierunkiem)":"OPPDIR OFF (sztywna blokada kierunku)");
+  }
+  else if(key=="TC2"){
+    // Wylacza/wlacza odczyt DRUGIEJ termopary bez fizycznego odlaczania
+    // przewodu - dodane po tym jak uzytkownik zidentyfikowal T2 (jej kabel/
+    // aktywnosc SPI-ADC) jako zrodlo zaklocen wstrzykujacych sie do czulego
+    // pomiaru pradu pikoamperowego na Keithleyu. TC2 pozostaje fizycznie
+    // podlaczona (tc2.begin() juz sie powiodlo przy starcie), po prostu
+    // pomijamy jej odczyt w kazdym cyklu petli glownej dopoki nie zostanie
+    // ponownie wlaczona - zero dodatkowej aktywnosci SPI na tym kanale.
+    tc2OK=(val.toInt()>0);
+    Serial.println(tc2OK?"TC2 ON":"TC2 OFF (T2 wstrzymana - nie odczytujemy)");
   }
   else if(key=="START"){
     if(sys==MAN){
