@@ -24,17 +24,17 @@ try:
     matplotlib.use('TkAgg')
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-    # WAZNE: to jest OPTYMALIZACJA WYLACZNIE RENDERINGU (rysowania pikseli na
-    # ekranie), NIE dotyka zadnych danych. Kazdy punkt nadal jest w pelni
-    # obecny w Line2D (hover, eksport, wszystko widzi 100% surowego zbioru).
-    # path.simplify pozwala silnikowi Agg pomijac rysowanie segmentow linii,
-    # ktore i tak wypadlyby na tym samym pikselu (np. przy 40000 punktach na
-    # wykresie szerokim na 1400px, wiele z nich fizycznie nie moze byc
-    # rozroznialnych) - to przyspiesza sam akt malowania na ekranie, bez
-    # jakiegokolwiek okrojenia, uśredniania czy zniekształcenia danych.
-    matplotlib.rcParams['path.simplify'] = True
-    matplotlib.rcParams['path.simplify_threshold'] = 1.0
-    matplotlib.rcParams['agg.path.chunksize'] = 10000
+    # WAZNE: path.simplify CELOWO WYLACZONE. Wczesniej probowalismy je
+    # wlaczyc jako "czysto renderingowa" optymalizacje predkosci (nie
+    # dotykajaca danych), ale przy threshold=1.0 dawalo to widocznie
+    # zniejszony, niepoprawny wyglad wykresu (linie wygladaly na uproszczone/
+    # znieksztalcone na ekranie, mimo ze dane w pamieci byly kompletne).
+    # Uzytkownik wyraznie zastrzegl, ze nie chce ZADNEGO zniekształcenia
+    # rysowania - nawet czysto wizualnego, na poziomie pikseli - wiec
+    # zostawiamy domyslne, surowe renderowanie matplotlib (kazdy punkt
+    # rysowany dokladnie tak jak jest, bez zadnej optymalizacji upraszczajacej
+    # geometrie linii).
+    matplotlib.rcParams['path.simplify'] = False
 except ImportError as e:
     print(f"pip install matplotlib\n{e}"); input(); sys.exit(1)
 
@@ -72,12 +72,12 @@ SMU_MAX_POWER = 30.3    # W - maksymalna moc na kanal (V*I nie moze przekroczyc)
 SP_MIN_UI = -15.0
 SP_MAX_UI = 100.0
 RAMP_MIN_UI = 0.5
-RAMP_MAX_UI = 80.0
+RAMP_MAX_UI = 150.0
 
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.7"
+BUILD_VERSION = "2026-07-11.12"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -396,7 +396,10 @@ class KeithleyClient:
         self._exec(f"smu{channel}.source.leveli = {current:.6f}")
 
     def measure_iv(self, channel="a"):
-        """Zwraca (prad_A, napiecie_V) z jednego zapytania (szybsze niz dwa osobne)."""
+        """Zwraca (prad_A, napiecie_V) z jednego zapytania (szybsze niz dwa
+        osobne). Nie dotyka source.levelv i nie czeka na settle - do uzycia w
+        trybie ciaglym/'tylko pomiar' PO pierwszej probce, kiedy wartosc
+        zrodlowa juz jest ustawiona i sie nie zmienia miedzy pomiarami."""
         resp = self._query(f"print(smu{channel}.measure.i(), smu{channel}.measure.v())")
         parts = resp.replace(",", " ").split()
         i_val = float(parts[0])
@@ -429,21 +432,6 @@ class KeithleyClient:
         else:
             resp = self._query(
                 f"{ch}.source.leveli = {current:.6f}; print({ch}.measure.i(), {ch}.measure.v())")
-        parts = resp.replace(",", " ").split()
-        return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
-
-    def measure_iv(self, channel="a"):
-        """Mierzy I i V BEZ dotykania source.levelv i BEZ delay(settle) - do
-        uzycia w trybie ciaglym/'tylko pomiar' po PIERWSZEJ probce, kiedy
-        wartosc zrodlowa juz jest ustawiona i sie nie zmienia. Ponowne
-        ustawianie tej samej wartosci i czekanie na settle_s przy KAZDEJ
-        probce (jak robi set_voltage_and_measure) to zbedny narzut - to on
-        ograniczal tempo pomiaru w trybie ciaglym do SETTLE_TIME+NPLC+narzut
-        USB na kazda probke, mimo ze fizycznie nic sie nie zmienialo miedzy
-        pomiarami. Ta metoda pomija oba te elementy, zostawiajac tylko czas
-        integracji NPLC + komunikacje USB."""
-        ch = f"smu{channel}"
-        resp = self._query(f"print({ch}.measure.i(), {ch}.measure.v())")
         parts = resp.replace(",", " ").split()
         return float(parts[0]), float(parts[1]) if len(parts) > 1 else float('nan')
 
@@ -494,6 +482,7 @@ class PeltierControl:
         self.keithley_last_i = None
         self.keithley_last_v = None
         self.keithley_last_ts = None
+        self._last_logged_keithley_ts = None  # do wykrywania "swiezosci" probki przy zapisie do CSV cyklu
         self.keithley_ip = ""
         self.keithley_voltage = 1.0
         self.keithley_ilimit = 0.1
@@ -696,6 +685,7 @@ class PeltierControl:
             if 'KFFRC' in d: out['kffrc'] = float(d['KFFRC'])
             if 'OFFSET' in d: out['offset'] = float(d['OFFSET'])
             if 'OPPDIR' in d: out['oppdir'] = (d['OPPDIR'].strip() == '1')
+            if 'TC2' in d: out['tc2_enabled'] = (d['TC2'].strip() == '1')
             if 'FAN' in d:
                 fv = float(d['FAN'])
                 out['fan_on'] = fv > 0
@@ -1203,7 +1193,7 @@ class PeltierControl:
         self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
                                  C['orange'], "°C", 1,
                                  on_change=lambda v: self.send(f"SP:{v:.1f}"))
-        self.sl_ru = SliderField(inner, "HEAT/COOL RATE", 0.5, 80, 2.0,
+        self.sl_ru = SliderField(inner, "HEAT/COOL RATE", RAMP_MIN_UI, RAMP_MAX_UI, 2.0,
                                  C['yellow'], "°C/min", 1,
                                  on_change=lambda v: self.send(f"RU:{v:.1f}"))
 
@@ -1848,18 +1838,23 @@ class PeltierControl:
 
         sec_dir = self._adv_section(inner, "HEATING / COOLING DIRECTION", C['green'])
         self._make_collapsible_desc(sec_dir, "what does OFF/ON mean?",
-                 "OFF (default): hard direction lock - when the target is below "
-                 "the current temperature, the PID can ONLY cool (PWM never goes "
-                 "toward heating, even briefly), and vice versa for heating. "
-                 "Fewer direction switches = less noise on a sensitive "
-                 "measurement, but on overshoot the system can only drop to "
-                 "PWM=0 and wait for the temperature to settle on its own - seen "
-                 "as a slow \"drift\" from target.\n\n"
-                 "ON: the PID can use the opposite direction as a brake on "
-                 "overshoot (e.g. a brief heat pulse right after cooling ends, "
-                 "if the temperature dropped too far) - faster and more accurate "
-                 "correction near target, at the cost of possible extra "
-                 "direction switches (and related noise).")
+                 "Direction is decided by the PID itself, not by comparing the "
+                 "target to the current temperature: while heating, the system "
+                 "keeps heating (with PWM naturally decaying toward 0 as the "
+                 "ramp target drops) and only switches to cooling once the PID "
+                 "would genuinely need negative power to keep up - not the "
+                 "instant the target crosses below the current temperature. "
+                 "This lets the system use passive cooling (heat loss to "
+                 "ambient) before engaging active cooling, and vice versa. "
+                 "OFF (default): once switched, PWM is locked to that single "
+                 "direction (never goes negative while heating, or positive "
+                 "while cooling) - fewer direction switches, less noise on a "
+                 "sensitive measurement.\n\n"
+                 "ON: the PID can use the opposite direction as an active brake "
+                 "on overshoot (e.g. a brief heat pulse right after cooling "
+                 "ends, if the temperature dropped too far) - faster, more "
+                 "accurate correction near target, at the cost of possible "
+                 "extra direction switches (and related noise).")
         self.oppdir_var = tk.BooleanVar(value=False)
         dir_row = tk.Frame(sec_dir, bg=C['bg2'])
         dir_row.pack(fill='x', pady=(4, 0))
@@ -2456,6 +2451,27 @@ class PeltierControl:
         # nie pakujemy od razu - pokazuje sie tylko gdy wykryty zostanie
         # niewlasciwy tryb (patrz _update_sweep_mode_warning)
 
+        # Przelacznik T2 - dodany po tym jak uzytkownik wlasnym testem
+        # (odlaczenie przewodu -> skoki znikaly) zidentyfikowal DRUGA
+        # termopare jako zrodlo zaklocen wstrzykujacych sie do czulego
+        # pomiaru pradu pikoamperowego. Zamiast fizycznie odlaczac przewod
+        # za kazdym razem, ten przelacznik po prostu wstrzymuje jej odczyt
+        # w firmware (zero aktywnosci SPI/ADC na tym kanale), bez ruszania
+        # samego kabla. T2 zostaje fizycznie podlaczona - to tylko pauza
+        # odczytu, mozna wlaczyc z powrotem w kazdej chwili.
+        tc2_row = tk.Frame(mode_row, bg=C['bg2'])
+        tc2_row.pack(fill='x', pady=(8, 0))
+        self.tc2_enabled_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(tc2_row, text="T2 thermocouple enabled",
+                      variable=self.tc2_enabled_var, command=self._toggle_tc2,
+                      bg=C['bg2'], fg=C['dim'], selectcolor=C['cyan'],
+                      font=(FONT, fsz(9)), activebackground=C['bg2'],
+                      activeforeground=C['text']).pack(anchor='w')
+        tk.Label(tc2_row, text="Identified as an EMI source affecting sensitive pA "
+                 "current readings - disable while measuring, without unplugging the cable.",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=250).pack(anchor='w', pady=(2, 0))
+
         # Tylko pomiar (bez sweepu) - pojedyncza stala wartosc, ciagly pomiar
         self.sweep_continuous_var = tk.BooleanVar(value=False)
         cont_row = tk.Frame(linner, bg=C['panel'])
@@ -2895,6 +2911,14 @@ class PeltierControl:
             self.sweep_mode_warning_lbl.pack(fill='x', pady=(6, 0))
         else:
             self.sweep_mode_warning_lbl.pack_forget()
+
+    def _toggle_tc2(self):
+        """Wysyla komende wlaczajaca/wylaczajaca odczyt DRUGIEJ termopary bez
+        fizycznego odlaczania przewodu - patrz komentarz przy tworzeniu
+        checkboxa. Uzytkownik zidentyfikowal T2 jako zrodlo zaklocen
+        wplywajacych na pomiar pradu pikoamperowego na Keithleyu."""
+        on = self.tc2_enabled_var.get()
+        self.send(f"TC2:{1 if on else 0}")
 
     def _apply_short_circuit_preset(self):
         """Jednoklikowe, gotowe ustawienie do pomiaru prawdziwego pradu
@@ -4113,12 +4137,11 @@ class PeltierControl:
             if not d: continue
             t,t1,t2,sp,pwm,ki,kv = d
             # UWAGA: brak downsamplingu - rysujemy 100% surowych danych, bez
-            # zadnej redukcji/wygladzania. Wydajnosc rysowania duzych cykli
-            # (dziesiatki tysiecy probek) jest zamiast tego rozwiazana przez
-            # wlaczenie path.simplify w matplotlib (patrz poczatek pliku) -
-            # to czysto renderingowa optymalizacja pikseli na ekranie, ktora
-            # NIE zmienia, nie usuwa i nie zaklamuje zadnego punktu danych -
-            # caly zbior pozostaje kompletny (hover, eksport, wszystko).
+            # zadnej redukcji/wygladzania/upraszczania renderingu (patrz
+            # poczatek pliku: path.simplify jest CELOWO wylaczone). Duze cykle
+            # (dziesiatki tysiecy probek) moga rysowac sie wolniej, ale kazdy
+            # punkt jest dokladnie taki, jaki jest w danych - zero kompromisu
+            # na rzecz szybkosci kosztem wiernosci wykresu.
             has_i = any(v is not None for v in ki)
             has_v = any(v is not None for v in kv)
             any_current_data = any_current_data or has_i
@@ -4569,15 +4592,34 @@ class PeltierControl:
                     self.cyc_stop("done")
 
                 # Jedno wywolanie na probke - ta sama wartosc uzyta wszedzie
-                # (log cyklu, RAW DATA, karta na zywo), zeby wykluczyc jakakolwiek
+                # (RAW DATA, karta na zywo), zeby wykluczyc jakakolwiek
                 # niespojnosc miedzy oddzielnymi odczytami w tej samej iteracji.
                 k_i, k_v = self._keithley_latest()
+
+                # Do LOGU CYKLU (CSV) zapisujemy prad/napiecie TYLKO gdy to
+                # GENUINE NOWA probka z Keithleya (jego wlasny watek zdazyl
+                # zwrocic nowy pomiar od ostatniego zapisu) - w przeciwnym
+                # razie None (puste pole w CSV). Bez tego: Keithley przy
+                # wyzszym NPLC/AVERAGING mierzy WOLNIEJ niz co 100ms (tempo
+                # loga, wyznaczone przez termopary), wiec ten sam odczyt
+                # trafial do 2-3 kolejnych wierszy CSV z rzedu, mimo ze
+                # temperatura w tych wierszach faktycznie sie zmieniala -
+                # przy wykresie I(T) dawalo to sztuczne, plaskie "schodki"
+                # (kwadratowy ksztalt) zamiast prawdziwej, ciaglej trajektorii.
+                # Wyswietlacz na zywo (RAW DATA/karty) NADAL pokazuje ostatnia
+                # znana wartosc bez migotania - to ograniczenie dotyczy
+                # wylacznie tego co ladowane jest do pliku/wykresu archiwum.
+                if self.keithley_last_ts is not None and self.keithley_last_ts != self._last_logged_keithley_ts:
+                    k_i_log, k_v_log = k_i, k_v
+                    self._last_logged_keithley_ts = self.keithley_last_ts
+                else:
+                    k_i_log, k_v_log = None, None
 
                 if self.cyc_on:
                     self.cyc_log(rel, t1, t2, sp, pct, fn,
                                  spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
                                  fw_ts=tsr, state=d.get('state'),
-                                 keithley_i=k_i, keithley_v=k_v, heat=heat_dir)
+                                 keithley_i=k_i_log, keithley_v=k_v_log, heat=heat_dir)
 
                 pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v, heat_dir))
@@ -4678,14 +4720,16 @@ class PeltierControl:
                 if 'offset' in d and hasattr(self,'sl_off'): self.sl_off.set(float(d['offset']))
                 if 'oppdir' in d and hasattr(self,'oppdir_var'): self._set_oppdir(bool(d['oppdir']), send=False)
                 self._cfg_synced = True
-            # Stan wentylatora synchronizowany ZAWSZE (nie tylko raz przy
-            # pierwszym polaczeniu) - w przeciwienstwie do Kp/Ki/SP itp. moze
-            # sie zmienic AUTONOMICZNIE w firmware bez udzialu uzytkownika
-            # (np. fan run-on wygasajacy po STOP, albo wymuszenie 100% podczas
-            # chlodzenia) - jesli przycisk aktualizowalby sie tylko raz, moglby
-            # utknac pokazujac "ON" mimo ze firmware juz dawno wylaczyl wentylator.
+            # Stan wentylatora ORAZ T2 synchronizowane ZAWSZE (nie tylko raz
+            # przy pierwszym polaczeniu) - w przeciwienstwie do Kp/Ki/SP itp.
+            # to przelaczniki ktore uzytkownik bedzie zmienial WIELOKROTNIE w
+            # trakcie sesji (np. wylacz T2 przed czulym pomiarem Keithleya,
+            # wlacz z powrotem po). Jednorazowa synchronizacja zostawialaby
+            # checkbox utkniety na stanie sprzed pierwszego polaczenia.
             if 'fan_on' in d and hasattr(self, 'btn_fan'):
                 self._sync_fan_button(bool(d['fan_on']))
+            if 'tc2_enabled' in d and hasattr(self, 'tc2_enabled_var'):
+                self.tc2_enabled_var.set(bool(d['tc2_enabled']))
         except Exception as e: print(f"cfg err: {e}")
 
     def _sync_fan_button(self, is_on):
