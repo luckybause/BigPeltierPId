@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.24"
+BUILD_VERSION = "2026-07-11.25"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -3449,6 +3449,7 @@ class PeltierControl:
 
                 first_pass = True
                 first_pass_value_set = False  # gate dla measure_iv() - patrz petla for p in points
+                last_sweep_flush_ts = time.time()  # throttling flush() pliku sweep - patrz przy zapisie ponizej
                 while True:
                     if self.sweep_abort:
                         break
@@ -3511,7 +3512,25 @@ class PeltierControl:
                                 self.sweep_loop_count, f"{p:.9f}", unit,
                                 f"{i_meas:.12e}", f"{v_meas:.9f}",
                             ])
-                            sweep_log_file.flush()
+                            # NAPRAWIONE: flush() po KAZDEJ pojedynczej probce
+                            # (nawet co ~14ms) to syscall na TYM SAMYM watku,
+                            # ktory jednoczesnie probkuje Keithleya - jesli
+                            # system I/O (dysk/antywirus/OS) ma choc raz na
+                            # jakis czas wyzszy narzut przy flush (typowe np.
+                            # przy okresowym faktycznym zapisie na dysk zamiast
+                            # buforowania w pamieci OS), to bezposrednio
+                            # spowalnia WLASNIE TEN watek pomiarowy - inaczej
+                            # niz poprzednia poprawka (ktora dotyczyla tylko
+                            # watku glownego przy zapisie do INNEGO pliku,
+                            # logu cyklu). Throttlujemy do max raz na 200ms -
+                            # writerow() i tak trafia do bufora Pythona
+                            # natychmiast (dane nie gina), po prostu nie
+                            # wymuszamy syscalla flush() przy KAZDEJ z osobna
+                            # z kilkudziesieciu probek na sekunde.
+                            now_flush_ts = time.time()
+                            if now_flush_ts - last_sweep_flush_ts >= 0.2:
+                                sweep_log_file.flush()
+                                last_sweep_flush_ts = now_flush_ts
                         except Exception:
                             pass  # nie przerywaj sweepu z powodu bledu zapisu pojedynczego wiersza
 
