@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.19"
+BUILD_VERSION = "2026-07-11.21"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -590,6 +590,9 @@ class PeltierControl:
         self.SWEEP_SETTLE_SKIP_S = 3.0  # pomijane na wykresie po starcie/nowej petli
         self.last_known_rel = 0.0
         self.last_known_rel_wallclock_ts = time.time()  # do ekstrapolacji "t" dla wierszy wstawianych miedzy tykniecami PID (patrz cyc_log z watku Keithleya)
+        self.last_known_t1_prev = None    # temperatura sprzed OSTATNIEGO tykniecia - do liczenia trendu/predkosci zmiany
+        self.last_known_t2_prev = None
+        self.last_known_prev_wallclock_ts = time.time()  # kiedy zanotowano last_known_*_prev
         self.last_known_t1 = None
         self.last_known_t2 = None
         self.last_known_sp = None
@@ -602,6 +605,13 @@ class PeltierControl:
         self.last_known_kd = None
         self.last_known_state = None
         self.cyc_log_lock = threading.Lock()  # chroni cyc_wr.writerow() przed jednoczesnym zapisem z 2 watkow (glowny tick + watek Keithleya)
+        # Bufor probek Keithleya oczekujacych na PRAWDZIWA interpolacje (nie
+        # ekstrapolacje "w przod" - ta bywala plaska/zwodnicza przy szumie
+        # czujnika, patrz _flush_pending_keithley_rows). Kazda probka czeka
+        # tu do momentu az przyjdzie KOLEJNE tykniecie firmware (mamy wtedy
+        # "przed" i "po" i mozemy prawidlowo interpolowac miedzy nimi).
+        self._pending_keithley_rows = []
+        self._pending_keithley_lock = threading.Lock()
 
         self.reach_start_t = None
         self.reach_start_temp = None
@@ -3512,28 +3522,34 @@ class PeltierControl:
                         # ~30ms), jego probki zostaja WSTAWIONE MIEDZY wiersze
                         # temperaturowe wedlug rzeczywistego czasu, zamiast
                         # ginac (wczesniej tylko ostatnia probka przed danym
-                        # tykniecem trafiala do tego pliku). Temperatura w
-                        # tych "wstawionych" wierszach to OSTATNIA ZNANA
-                        # wartosc (zero-order hold) ekstrapolowana w czasie -
-                        # nie mamy swiezszego odczytu termopary dokladnie w
-                        # tym momencie, ale przy typowej bezwladnosci cieplnej
-                        # ukladu i odstepach rzedu dziesiatek ms, trzymanie
-                        # ostatniej wartosci jest dokladniejsze niz czekanie
-                        # do nastepnego tykniecia. Kolumna czasu ("t") jest
-                        # ekstrapolowana z zegara systemowego od ostatniego
-                        # znanego tykniecia, wiec wiersze faktycznie ukladaja
-                        # sie chronologicznie MIEDZY wierszami z temperatura.
+                        # tykniecem trafiala do tego pliku).
+                        #
+                        # WAZNE: probka NIE jest zapisywana od razu z
+                        # ekstrapolacja "w przod" - to dawalo zwodniczo plaska
+                        # temperature gdy akurat dwa ostatnie tykniecia mialy
+                        # (przez szum czujnika 0.1-0.2C) prawie identyczna
+                        # wartosc, mimo ze temperatura chwile pozniej faktycznie
+                        # rosla. Zamiast tego probka trafia do bufora i czeka
+                        # az przyjdzie KOLEJNE tykniecie firmware - wtedy (w
+                        # tick(), watek glowny) mamy juz PRAWDZIWA wartosc
+                        # "przed" i "po" i moge poprawnie INTERPOLOWAC miedzy
+                        # nimi wedlug proporcji czasu, zamiast zgadywac z
+                        # trendu sprzed. Patrz _flush_pending_keithley_rows.
                         if self.cyc_on:
-                            t_extrap = self.last_known_rel + \
-                                (time.time() - self.last_known_rel_wallclock_ts)
-                            self.cyc_log(t_extrap, self.last_known_t1, self.last_known_t2,
-                                        self.last_known_sp, self.last_known_pct,
-                                        self.last_known_fn, spa=self.last_known_spa,
-                                        kp=self.last_known_kp, ki=self.last_known_ki,
-                                        kd=self.last_known_kd, fw_ts=None,
-                                        state=self.last_known_state,
-                                        keithley_i=i_meas, keithley_v=v_meas,
-                                        heat=self.last_known_heat_dir)
+                            with self._pending_keithley_lock:
+                                self._pending_keithley_rows.append({
+                                    't_wallclock': time.time(),
+                                    't_before': self.last_known_rel,
+                                    't1_before': self.last_known_t1,
+                                    't2_before': self.last_known_t2,
+                                    'ts_before_wallclock': self.last_known_rel_wallclock_ts,
+                                    'sp': self.last_known_sp, 'pct': self.last_known_pct,
+                                    'fn': self.last_known_fn, 'spa': self.last_known_spa,
+                                    'kp': self.last_known_kp, 'ki': self.last_known_ki,
+                                    'kd': self.last_known_kd, 'state': self.last_known_state,
+                                    'heat': self.last_known_heat_dir,
+                                    'keithley_i': i_meas, 'keithley_v': v_meas,
+                                })
 
                     if not loop or self.sweep_abort:
                         break
@@ -3829,6 +3845,105 @@ class PeltierControl:
             elapsed = time.time() - t_start
             sleep_t = max(0.0, self.keithley_period_s - elapsed)
             time.sleep(sleep_t)
+
+    def _flush_pending_keithley_rows(self, t1_after, t2_after, rel_after, wallclock_after):
+        """Zapisuje do logu cyklu wszystkie probki Keithleya oczekujace w
+        buforze, interpolujac ich temperature MIEDZY wartoscia 'przed'
+        (zanotowana w chwili probki) a 'po' (dopiero co otrzymana w tym
+        tyknieciu) - wedlug proporcji uplynietego czasu (interpolacja
+        liniowa). To DOKLADNIEJSZE niz ekstrapolacja "w przod" z trendu
+        sprzed - przy szumiacym w skali pojedynczych probek (0.1-0.2C)
+        sygnale termopary, trend z dwoch ostatnich tyknięć potrafil byc
+        zwodniczo plaski (albo zlego znaku) mimo realnej zmiany temperatury
+        chwile pozniej. Interpolacja miedzy prawdziwym 'przed' i 'po' nie ma
+        tego problemu - zawsze trafia dokladnie na linie prosta miedzy dwoma
+        faktycznie zmierzonymi punktami."""
+        with self._pending_keithley_lock:
+            if not self._pending_keithley_rows:
+                return
+            pending = self._pending_keithley_rows
+            self._pending_keithley_rows = []
+        for p in pending:
+            span = wallclock_after - p['ts_before_wallclock']
+            frac = (p['t_wallclock'] - p['ts_before_wallclock']) / span if span > 0.001 else 0.0
+            frac = max(0.0, min(1.0, frac))
+            def interp(before, after):
+                if before is None: return after
+                if after is None: return before
+                return before + frac * (after - before)
+            t1_i = interp(p['t1_before'], t1_after)
+            t2_i = interp(p['t2_before'], t2_after)
+            t_i = interp(p['t_before'], rel_after)
+            self.cyc_log(t_i, t1_i, t2_i, p['sp'], p['pct'], p['fn'],
+                        spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
+                        fw_ts=None, state=p['state'],
+                        keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
+                        heat=p['heat'])
+
+    def _flush_pending_keithley_rows_fallback(self):
+        """Uzywane wylacznie przy cyc_stop() - jesli w buforze zostaly probki
+        Keithleya czekajace na kolejne tykniecie, ktore juz nigdy nie
+        nadejdzie (cykl sie konczy), zapisujemy je z EKSTRAPOLACJA (patrz
+        _estimate_temp_now) zamiast je zgubic - to jedyny rozsadny fallback
+        gdy naprawde nie ma zadnego 'po' do interpolacji."""
+        with self._pending_keithley_lock:
+            if not self._pending_keithley_rows:
+                return
+            pending = self._pending_keithley_rows
+            self._pending_keithley_rows = []
+        for p in pending:
+            def extrap_one(before, before_prev, dt_ticks, t_since):
+                if before is None: return None
+                if before_prev is None or dt_ticks is None or dt_ticks <= 0.001:
+                    return before
+                rate = (before - before_prev) / dt_ticks
+                return before + rate * min(t_since, 0.25)
+            t_since = p['t_wallclock'] - p['ts_before_wallclock']
+            dt_ticks = self.last_known_prev_wallclock_ts and \
+                (p['ts_before_wallclock'] - self.last_known_prev_wallclock_ts)
+            t1_i = extrap_one(p['t1_before'], self.last_known_t1_prev, dt_ticks, t_since)
+            t2_i = extrap_one(p['t2_before'], self.last_known_t2_prev, dt_ticks, t_since)
+            self.cyc_log(p['t_before'] + t_since, t1_i, t2_i, p['sp'], p['pct'], p['fn'],
+                        spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
+                        fw_ts=None, state=p['state'],
+                        keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
+                        heat=p['heat'])
+
+    def _estimate_temp_now(self):
+        """Szacuje AKTUALNA temperature (T1, T2) w chwili wywolania, na
+        podstawie LINIOWEJ EKSTRAPOLACJI trendu z dwoch ostatnich tykniec
+        firmware - zamiast plaskiego trzymania ostatniej znanej wartosci
+        (zero-order hold). Uzywane do wierszy Keithleya wstawianych MIEDZY
+        tykniecia temperatury (co 100ms), gdy Keithley probkuje szybciej.
+
+        Przyklad: jesli temperatura rosla z 25.0C do 25.5C w ciagu ostatnich
+        100ms (predkosc 5C/s), a probka Keithleya przychodzi 30ms po
+        ostatnim tyknieciu, szacujemy T1 = 25.5 + 5.0*0.030 = 25.65C zamiast
+        plasko powtarzac 25.5C - znacznie dokladniejsze przy aktywnej rampie
+        grzania/chlodzenia, gdzie temperatura realnie zmienia sie miedzy
+        tykniedziami, nie stoi w miejscu.
+
+        Ekstrapolacja jest ograniczona do max EXTRAP_CAP_S do przodu - przy
+        dluzszej przerwie (np. chwilowy zanik komunikacji z firmware) trend
+        sprzed dawna staje sie zawodny, wiec po tym czasie zapada z powrotem
+        na plaskie trzymanie ostatniej wartosci (bezpieczniejsze niz
+        ekstrapolowac coraz dalej w nieznane)."""
+        EXTRAP_CAP_S = 0.25
+        now = time.time()
+        t_since_tick = min(now - self.last_known_rel_wallclock_ts, EXTRAP_CAP_S)
+
+        def extrap(cur, prev, dt_between_ticks):
+            if cur is None:
+                return None
+            if prev is None or dt_between_ticks is None or dt_between_ticks <= 0.001:
+                return cur  # brak wystarczajacych danych do trendu - plaskie trzymanie
+            rate = (cur - prev) / dt_between_ticks
+            return cur + rate * t_since_tick
+
+        dt_between_ticks = self.last_known_rel_wallclock_ts - self.last_known_prev_wallclock_ts
+        t1_est = extrap(self.last_known_t1, self.last_known_t1_prev, dt_between_ticks)
+        t2_est = extrap(self.last_known_t2, self.last_known_t2_prev, dt_between_ticks)
+        return t1_est, t2_est
 
     def _keithley_latest(self, max_age_s=0.5):
         """Zwraca (i, v) ostatniego pomiaru jesli swiezy, inaczej (None, None)."""
@@ -4928,9 +5043,26 @@ class PeltierControl:
                 self.fanv.append(fn)
 
                 # Ostatnia znana temp/czas - do odczytu przez watek sweep (korelacja
-                # kazdego punktu I-V z temperatura w momencie pomiaru)
+                # kazdego punktu I-V z temperatura w momencie pomiaru).
+                # Najpierw zachowaj STARE wartosci jako "prev" (zanim je nadpiszemy) -
+                # potrzebne do liczenia trendu/predkosci zmiany przy liniowej
+                # ekstrapolacji temperatury dla wierszy Keithleya wstawianych
+                # miedzy tykniecami (patrz _estimate_temp_now).
+                self.last_known_t1_prev = self.last_known_t1
+                self.last_known_t2_prev = self.last_known_t2
+                self.last_known_prev_wallclock_ts = self.last_known_rel_wallclock_ts
+
+                now_ts = time.time()
+                # Zanim nadpiszemy last_known_* nowymi wartosciami, mamy juz
+                # wszystko czego trzeba (t1,t2,rel swieze z tego tyknięcia) -
+                # to wlasnie ten moment, w ktorym kazda probka Keithleya
+                # oczekujaca w buforze (zebrana OD POPRZEDNIEGO tykniecia)
+                # dostaje swoje prawdziwe 'po' i moze zostac poprawnie
+                # zinterpolowana miedzy dwoma faktycznie zmierzonymi punktami.
+                self._flush_pending_keithley_rows(t1, t2, rel, now_ts)
+
                 self.last_known_rel = rel
-                self.last_known_rel_wallclock_ts = time.time()
+                self.last_known_rel_wallclock_ts = now_ts
                 self.last_known_t1 = t1
                 self.last_known_t2 = t2
                 self.last_known_sp = sp
@@ -5241,6 +5373,11 @@ class PeltierControl:
                         pass
 
     def cyc_stop(self, reason=""):
+        # Zanim zamkniemy plik: jesli w buforze zostaly probki Keithleya
+        # czekajace na kolejne tykniecie (ktore juz nigdy nie nadejdzie, bo
+        # cykl sie konczy), zapisz je fallbackiem (ekstrapolacja) zamiast
+        # bezpowrotnie gubic.
+        self._flush_pending_keithley_rows_fallback()
         if self.cyc_file:
             try: self.cyc_file.close()
             except: pass
