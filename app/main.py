@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.21"
+BUILD_VERSION = "2026-07-11.23"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -3604,7 +3604,34 @@ class PeltierControl:
             got_new = True
 
         if got_new:
-            self._redraw_sweep_chart()
+            # NAPRAWIONE: przy bardzo dlugich pomiarach ciaglych (dziesiatki
+            # tysiecy zakumulowanych punktow) PELNE przerysowanie wykresu
+            # matplotlib (bez uproszczen renderingu, celowo - patrz path.simplify
+            # wylaczone) zaczyna zajmowac coraz wiecej czasu. Poniewaz dzieje
+            # sie to na WATKU GLOWNYM i trzyma GIL, cyklicznie "gloduje" watek
+            # Keithleya (ktory tez potrzebuje GIL-a miedzy pomiarami sprzetowymi)
+            # - stad regularne, powtarzajace sie zacięcia w tempie probkowania
+            # widoczne w logu przy dlugich pomiarach.
+            #
+            # Ten throttling dotyczy WYLACZNIE tego, jak CZESTO wykres na zywo
+            # sie fizycznie przerysowuje - self.sweep_points (i plik CSV) nadal
+            # zbieraja KAZDA probke bez wyjatku, zero utraty/redukcji danych.
+            # Po prostu przy bardzo duzych zbiorach nie placimy kosztu pelnego
+            # przerysowania przy KAZDYM z wielu ticków na sekunde, tylko
+            # rzadziej - proporcjonalnie do tego jak duzy/kosztowny zrobil sie
+            # pojedynczy redraw.
+            n_pts = len(self.sweep_points)
+            if n_pts < 3000:
+                min_redraw_interval = 0.0       # male zbiory - bez zmian, jak dotychczas
+            elif n_pts < 15000:
+                min_redraw_interval = 0.5
+            else:
+                min_redraw_interval = 1.5
+            now_ts = time.time()
+            last_redraw = getattr(self, '_last_sweep_redraw_ts', 0.0)
+            if (now_ts - last_redraw) >= min_redraw_interval:
+                self._redraw_sweep_chart()
+                self._last_sweep_redraw_ts = now_ts
             self.sweep_pts_lbl.config(text=f"{len(self.sweep_points)} points")
 
             if last_pt is not None:
@@ -4066,6 +4093,19 @@ class PeltierControl:
         mk_segmented(atb2,
                      [("temperature / time", 'time'), ("Keithley current / temperature", 'iT')],
                      self.arch_chart_mode, command=self._redraw_arch)
+
+        atb2c = tk.Frame(cf, bg=C['panel'])
+        atb2c.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Label(atb2c, text="TEMP SOURCE (for I vs T, x-axis):", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        # Pozwala porownac czy T1, T2, czy ich SREDNIA lepiej wyrownuje
+        # miejsca przejscia (skoki/artefakty) na wykresie prad-temperatura -
+        # jesli krysztal fizycznie lezy gdzies "miedzy" dwoma czujnikami,
+        # srednia moze byc dokladniejszym przyblizeniem jego rzeczywistej
+        # temperatury niz kazdy z osobna czujnik.
+        self.arch_temp_source = tk.StringVar(value='T1')
+        mk_segmented(atb2c, [("T1", 'T1'), ("T2", 'T2'), ("Average (T1+T2)/2", 'avg')],
+                     self.arch_temp_source, command=self._redraw_arch, accent=C['orange'])
 
         atb2b = tk.Frame(cf, bg=C['panel'])
         atb2b.pack(fill='x', padx=8, pady=(0, 8))
@@ -4621,7 +4661,7 @@ class PeltierControl:
             has_v = any(v is not None for v in kv)
             any_current_data = any_current_data or has_i
             any_voltage_data = any_voltage_data or has_v
-            loaded.append((path, t, t1, sp, ki, kv, has_i, has_v))
+            loaded.append((path, t, t1, t2, sp, ki, kv, has_i, has_v))
 
         # checkboxy prad/napiecie i wyrownanie maja sens tylko w widoku czasowym
         if hasattr(self, 'arch_show_current_chk'):
@@ -4642,7 +4682,7 @@ class PeltierControl:
                 self.arch_align_entry.config(state='normal')
 
         if mode == 'iT':
-            self._redraw_arch_iT(sel, [(p,t,t1,s,ki,hi) for p,t,t1,s,ki,kv,hi,hv in loaded], forder)
+            self._redraw_arch_iT(sel, [(p,t,t1,t2,s,ki,hi) for p,t,t1,t2,s,ki,kv,hi,hv in loaded], forder)
             return
 
         # Przebuduj uklad figury od zera (jedna os lub dwie jedna pod druga).
@@ -4686,7 +4726,7 @@ class PeltierControl:
         align_missed = []  # nazwy cykli ktore nie osiagnely progu - uzyty naturalny start
         show_i_curve = show_current and any_current_data
         show_v_curve = show_voltage and any_voltage_data
-        for path, t, t1, sp, ki, kv, has_i, has_v in loaded:
+        for path, t, t1, t2, sp, ki, kv, has_i, has_v in loaded:
             ci = forder.get(path,0)%len(self._arch_colors)
             col = self._arch_colors[ci]
             nm = self._cycle_display_name(path)
@@ -4771,10 +4811,15 @@ class PeltierControl:
         self.cv_a.draw()
 
     def _redraw_arch_iT(self, sel, loaded, forder):
-        """Wykres prad Keithleya (Y) w funkcji temperatury T1 (X), oddzielnie dla
+        """Wykres prad Keithleya (Y) w funkcji temperatury (X), oddzielnie dla
         kazdego zaznaczonego cyklu. Punkty polaczone linia w kolejnosci czasowej,
         wiec widac petle grzanie/chlodzenie (histereza) jesli wystepuje - typowe
-        dla sygnalu piroelektrycznego, ktory zalezy od dT/dt, a nie tylko od T."""
+        dla sygnalu piroelektrycznego, ktory zalezy od dT/dt, a nie tylko od T.
+
+        Zrodlo temperatury dla osi X jest wybieralne (patrz self.arch_temp_source):
+        T1, T2, albo ich SREDNIA - przydatne do sprawdzenia czy usrednienie obu
+        czujnikow lepiej wyrownuje miejsca przejscia/artefakty na wykresie, np.
+        jesli krysztal fizycznie lezy gdzies "miedzy" punktami pomiaru T1 i T2."""
         self.fig_a.clear()
         self.ax_a = self.fig_a.add_subplot(111)
         self.fig_a.subplots_adjust(left=0.12, right=0.97, top=0.96, bottom=0.11)
@@ -4789,9 +4834,12 @@ class PeltierControl:
             self._arch_reset_hover()
             self.cv_a.draw(); return
 
+        temp_source = getattr(self, 'arch_temp_source', None)
+        temp_source = temp_source.get() if temp_source is not None else 'T1'
+
         any_i = False
         hover_series = []
-        for path, t, t1, sp, ki, has_i in loaded:
+        for path, t, t1, t2, sp, ki, has_i in loaded:
             if not has_i:
                 continue
             any_i = True
@@ -4800,9 +4848,22 @@ class PeltierControl:
             nm = self._cycle_display_name(path)
             t0 = t[0]
             xs, ys, ts = [], [], []
-            for tt, ii, ttime in zip(t1, ki, t):
-                if ii is not None and tt is not None:
-                    xs.append(tt); ys.append(ii); ts.append(ttime - t0)
+            for t1v, t2v, ii, ttime in zip(t1, t2, ki, t):
+                if ii is None:
+                    continue
+                # Wybor zrodla temperatury dla osi X wg segmented control -
+                # dla 'avg' potrzebujemy OBU odczytow jednoczesnie (pomijamy
+                # probke jesli ktoregos brakuje, zeby nie mieszac niepelnych
+                # usrednien z prawdziwymi).
+                if temp_source == 'T2':
+                    tv = t2v
+                elif temp_source == 'avg':
+                    tv = (t1v + t2v) / 2.0 if (t1v is not None and t2v is not None) else None
+                else:
+                    tv = t1v
+                if tv is None:
+                    continue
+                xs.append(tv); ys.append(ii); ts.append(ttime - t0)
             if not xs:
                 continue
             self.ax_a.plot(xs, ys, color=col, lw=1.1, alpha=0.85,
@@ -4824,7 +4885,9 @@ class PeltierControl:
             self.ax_a.yaxis.set_major_formatter(EngFormatter(unit='A'))
         except Exception:
             pass
-        self.ax_a.set_xlabel('temperature T1 [°C]', color=C['dim'], fontsize=9)
+        xlabel_map = {'T1': 'temperature T1 [°C]', 'T2': 'temperature T2 [°C]',
+                     'avg': 'temperature avg(T1,T2) [°C]'}
+        self.ax_a.set_xlabel(xlabel_map.get(temp_source, 'temperature [°C]'), color=C['dim'], fontsize=9)
         self.ax_a.set_ylabel('Keithley current', color=C['dim'], fontsize=9)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                          labelcolor=C['dim'], fontsize=8)
