@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.23"
+BUILD_VERSION = "2026-07-11.24"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -3890,7 +3890,8 @@ class PeltierControl:
                 return
             pending = self._pending_keithley_rows
             self._pending_keithley_rows = []
-        for p in pending:
+        n = len(pending)
+        for i, p in enumerate(pending):
             span = wallclock_after - p['ts_before_wallclock']
             frac = (p['t_wallclock'] - p['ts_before_wallclock']) / span if span > 0.001 else 0.0
             frac = max(0.0, min(1.0, frac))
@@ -3901,11 +3902,16 @@ class PeltierControl:
             t1_i = interp(p['t1_before'], t1_after)
             t2_i = interp(p['t2_before'], t2_after)
             t_i = interp(p['t_before'], rel_after)
+            # flush=True TYLKO na ostatnim wierszu paczki - patrz obszerny
+            # komentarz w cyc_log(). Zapis kazdego wiersza (writerow) i tak
+            # trafia do bufora Pythona natychmiast, wiec dane NIE gina - po
+            # prostu nie wymuszamy kosztownego syscalla flush() 7-8 razy z
+            # rzedu, tylko raz na koniec calej paczki.
             self.cyc_log(t_i, t1_i, t2_i, p['sp'], p['pct'], p['fn'],
                         spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
                         fw_ts=None, state=p['state'],
                         keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
-                        heat=p['heat'])
+                        heat=p['heat'], flush=(i == n - 1))
 
     def _flush_pending_keithley_rows_fallback(self):
         """Uzywane wylacznie przy cyc_stop() - jesli w buforze zostaly probki
@@ -3918,7 +3924,8 @@ class PeltierControl:
                 return
             pending = self._pending_keithley_rows
             self._pending_keithley_rows = []
-        for p in pending:
+        n = len(pending)
+        for i, p in enumerate(pending):
             def extrap_one(before, before_prev, dt_ticks, t_since):
                 if before is None: return None
                 if before_prev is None or dt_ticks is None or dt_ticks <= 0.001:
@@ -3934,7 +3941,7 @@ class PeltierControl:
                         spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
                         fw_ts=None, state=p['state'],
                         keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
-                        heat=p['heat'])
+                        heat=p['heat'], flush=(i == n - 1))
 
     def _estimate_temp_now(self):
         """Szacuje AKTUALNA temperature (T1, T2) w chwili wywolania, na
@@ -5392,7 +5399,8 @@ class PeltierControl:
         print(f"CYC START T={temp0}")
 
     def cyc_log(self, t, t1, t2, sp, pct, fn, spa=None, kp=None, ki=None, kd=None,
-                fw_ts=None, state=None, keithley_i=None, keithley_v=None, heat=None):
+                fw_ts=None, state=None, keithley_i=None, keithley_v=None, heat=None,
+                flush=True):
         if self.cyc_wr:
             try:
                 t1s = f"{t1:.3f}" if t1 is not None else ""
@@ -5420,9 +5428,25 @@ class PeltierControl:
                 # keithley_sweep_start) - bez blokady dwa jednoczesne
                 # writerow() z roznych watkow moglyby przeplatac bajty i
                 # uszkodzic plik CSV.
+                #
+                # flush=False pozwala pominac kosztowne wywolanie systemowe
+                # file.flush() przy KAZDYM pojedynczym wierszu - istotne przy
+                # _flush_pending_keithley_rows(), ktore potrafi zapisac 7-8
+                # oczekujacych probek Keithleya NA RAZ przy jednym tyknieciu
+                # firmware. Flush po KAZDEJ z osobna (jak bylo wczesniej) to
+                # 7-8 wywolan systemowych z rzedu na watku glownym - kazde
+                # trzymajace GIL na czas trwania syscalla - co bardzo dobrze
+                # pasowalo do obserwowanego wzorca "7-8 probek Keithleya
+                # nastepnie ~200-300ms przerwa" (watek Keithleya byl glodzony
+                # przez te seryjne flushe). Teraz flushujemy RAZ na koniec
+                # calej paczki (patrz _flush_pending_keithley_rows), nie po
+                # kazdym wierszu z osobna - dane nadal trafiaja na dysk (bufor
+                # Pythona i tak flushuje sie przy zamknieciu pliku/koncu
+                # cyklu), tylko rzadziej wymuszamy to jawnie syscallem.
                 with self.cyc_log_lock:
                     self.cyc_wr.writerow(row)
-                    self.cyc_file.flush()
+                    if flush:
+                        self.cyc_file.flush()
                 self.cyc_rows += 1
             except Exception as e:
                 # NIE gub bledow po cichu - licz je i pokaz w naglowku statusu,
