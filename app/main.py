@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.25"
+BUILD_VERSION = "2026-07-11.26"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -5281,8 +5281,32 @@ class PeltierControl:
             # Wykres aktualizuje dane zawsze (set_data, tanie) - ochrona przed
             # "wyrywaniem" recznego przyblizenia jest teraz wewnatrz _draw_chart
             # (pomija tam tylko autoscale, gdy aktywne narzedzie ZOOM/PAN).
+            #
+            # THROTTLING przy duzych zbiorach: to jest GLOWNA przyczyna przerw
+            # ~200ms w probkowaniu Keithleya (potwierdzone analiza danych -
+            # przerwy dokladnie w tempie tick() co 250ms). Mechanizm: tick()
+            # dziala na WATKU GLOWNYM i przy chart_window=0 (cala historia)
+            # przerysowuje matplotlib nad DZIESIATKAMI TYSIECY punktow -
+            # trzymajac GIL przez caly ten czas (~200ms po kilkunastu minutach).
+            # W tym czasie osobny watek Keithleya NIE MOZE wykonac measure_iv()
+            # (potrzebuje GIL-a do wywolania PyVISA), wiec pomiar "zamiera" na
+            # czas przerysowania - stad regularne dziury "7-8 probek, przerwa,
+            # 7-8 probek". Dwie poprzednie proby (throttling flush) nie pomogly,
+            # bo problemem nie byl zapis, tylko przerysowanie wykresu na tym
+            # samym watku. Dane (self.t itd.) NADAL zbieraja sie w calosci -
+            # throttling dotyczy WYLACZNIE tego jak czesto fizycznie malujemy.
             if self.t and not self.chart_paused:
-                self._draw_chart()
+                n_pts = len(self.t)
+                if n_pts < 5000:
+                    min_draw_interval = 0.0     # male zbiory - bez zmian
+                elif n_pts < 20000:
+                    min_draw_interval = 0.5
+                else:
+                    min_draw_interval = 1.0
+                now_draw = time.time()
+                if (now_draw - getattr(self, '_last_control_draw_ts', 0.0)) >= min_draw_interval:
+                    self._draw_chart()
+                    self._last_control_draw_ts = now_draw
 
         except Exception as e:
             print(f"tick err: {e}")
@@ -5336,6 +5360,30 @@ class PeltierControl:
             cutoff = t[-1]-self.chart_window
             i0 = next((i for i in range(len(t)) if t[i]>=cutoff), 0)
             t=t[i0:]; t1=t1[i0:]; t2=t2[i0:]; sp=sp[i0:]; spa=spa[i0:]; pw=pw[i0:]
+
+        # Downsampling WYLACZNIE do rysowania (dane self.t itd. pozostaja
+        # nietkniete w pelnej rozdzielczosci - to samo dotyczy pliku CSV).
+        # Przy chart_window=0 (cala historia) po kilkunastu minutach zbiera
+        # sie kilkadziesiat tysiecy punktow - rysowanie ich wszystkich co
+        # cykl trzyma GIL bardzo dlugo i glodzi watek pomiarowy Keithleya
+        # (patrz komentarz w tick()). Ekran ma i tak ~1-2 tys. pikseli
+        # szerokosci, wiec rysowanie wiecej niz ~3000 punktow to i tak
+        # niewidoczny detal - bierzemy co n-ty punkt do NARYSOWANIA, ale
+        # NIGDY nie ruszamy przechowywanych danych. Zawsze dokladamy ostatni
+        # punkt, zeby czolo wykresu bylo aktualne.
+        MAX_DRAW_PTS = 3000
+        n = len(t)
+        if n > MAX_DRAW_PTS:
+            step = n // MAX_DRAW_PTS + 1
+            idx = list(range(0, n, step))
+            if idx[-1] != n - 1:
+                idx.append(n - 1)
+            t   = [t[i]   for i in idx]
+            t1  = [t1[i]  for i in idx]
+            t2  = [t2[i]  for i in idx]
+            sp  = [sp[i]  for i in idx]
+            spa = [spa[i] for i in idx]
+            pw  = [pw[i]  for i in idx]
 
         def safe(lst): return [v if v is not None else float('nan') for v in lst]
 
