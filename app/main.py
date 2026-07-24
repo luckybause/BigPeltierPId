@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.27"
+BUILD_VERSION = "2026-07-11.33"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -612,6 +612,18 @@ class PeltierControl:
         # "przed" i "po" i mozemy prawidlowo interpolowac miedzy nimi).
         self._pending_keithley_rows = []
         self._pending_keithley_lock = threading.Lock()
+        # Bufor wierszy TEMPERATURY z biezacej paczki tykniec. Buforujemy je
+        # (zamiast zapisywac od razu), zeby przy wspolnym flushu miec komplet:
+        # probki Keithleya z tego samego okna czasu. Dzieki temu do wiersza
+        # temperatury mozna dopisac INTERPOLOWANY prad - symetrycznie do tego,
+        # ze wiersz Keithleya dostaje interpolowana temperature. Efekt: KAZDY
+        # wiersz w CSV ma komplet danych, bez pustych komorek.
+        # Dotykany wylacznie z watku glownego (tick), wiec bez blokady.
+        self._pending_temp_rows = []
+        # Ostatnia probka Keithleya z POPRZEDNIEJ paczki (rel, i, v) - kotwica
+        # pozwalajaca interpolowac prad takze dla wierszy temperatury, ktore
+        # w biezacej paczce wypadaja PRZED pierwsza probka Keithleya.
+        self._last_k_anchor = None
 
         self.reach_start_t = None
         self.reach_start_temp = None
@@ -2863,6 +2875,14 @@ class PeltierControl:
         self.sweep_settle_entry = _field("SETTLE TIME", "50", "ms")
         self.sweep_nplc_entry = _field("NPLC", "1.0", "PLC")
         self.sweep_avg_entry = _field("AVERAGING", "1", "x")
+        # Staly takt probkowania: 0 = mierz tak szybko jak sie da (kazda probka
+        # trwa tyle ile trwa -> nierowne odstepy, jitter). Wartosc > 0 = po
+        # kazdym pomiarze czekaj do NASTEPNEGO terminu z rownego harmonogramu,
+        # dzieki czemu odstepy sa stale. Terminy liczone sa od startu pomiaru
+        # (t0 + n*interwal), a nie "sleep po kazdej probce" - dzieki temu
+        # chwilowe opoznienie pojedynczej probki NIE przesuwa calego dalszego
+        # harmonogramu (brak kumulacji dryfu).
+        self.sweep_sample_interval_entry = _field("SAMPLE INTERVAL", "0", "ms")
 
         # AUTOZERO/AUTORANGE - wczesniej wpisane na sztywno (zawsze ON), bez
         # zadnej mozliwosci wylaczenia. Wedlug dokumentacji Keithleya i
@@ -2883,6 +2903,31 @@ class PeltierControl:
                    self.sweep_autorange_var)
         tk.Label(az_row, text="Turning either OFF trades some accuracy/range-safety for "
                  "speed - see field descriptions above for details.",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=250).pack(anchor='w', pady=(3, 0))
+
+        # ── ZASADA ZAPISU DANYCH ──────────────────────────────────────────
+        # W logu cyklu przeplataja sie dwa niezalezne strumienie: temperatura
+        # (tykniecia firmware) i prad (probki Keithleya) - mierzone w INNYCH
+        # chwilach. Traktujemy je ROZNIE, i jest to celowe:
+        #
+        #  TEMPERATURA - wolnozmienna wielkosc o duzej bezwladnosci cieplnej.
+        #    Jej wartosc MIEDZY dwoma prawdziwymi odczytami termopary jest
+        #    fizycznie ograniczona przez te dwa punkty, wiec wyliczenie jej
+        #    interpolacja liniowa to uzasadnione przyblizenie. Dopisujemy.
+        #
+        #  PRAD - to jest wlasnie mierzony sygnal (piroelektryczny, rzedu pA,
+        #    szumiacy). Dopisanie go tam, gdzie nie bylo pomiaru, oznaczaloby
+        #    wymyslanie samego wyniku eksperymentu. NIE dopisujemy nigdy.
+        info_row = tk.Frame(self.params_body, bg=C['panel'])
+        info_row.pack(fill='x', pady=(8, 0))
+        tk.Label(info_row, text="ZAPIS DANYCH:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(anchor='w')
+        tk.Label(info_row,
+                 text="Prad zapisywany WYLACZNIE tam, gdzie go zmierzono - nigdy nie "
+                      "jest dopisywany (puste komorki = brak pomiaru). Temperatura dla "
+                      "probek Keithleya jest wyliczana interpolacja miedzy dwoma "
+                      "sasiednimi odczytami termopary.",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left', wraplength=250).pack(anchor='w', pady=(3, 0))
 
@@ -3334,6 +3379,12 @@ class PeltierControl:
             limit = float(self.sweep_limit_entry.get().replace(',', '.'))
             settle_ms = float(self.sweep_settle_entry.get().replace(',', '.'))
             nplc = float(self.sweep_nplc_entry.get().replace(',', '.'))
+            try:
+                sample_interval_ms = float(
+                    self.sweep_sample_interval_entry.get().replace(',', '.'))
+            except Exception:
+                sample_interval_ms = 0.0
+            sample_interval_ms = max(0.0, sample_interval_ms)
             avg_count = int(round(float(self.sweep_avg_entry.get().replace(',', '.'))))
             if nplc <= 0: nplc = 1.0
             if avg_count < 1: avg_count = 1
@@ -3450,6 +3501,11 @@ class PeltierControl:
                 first_pass = True
                 first_pass_value_set = False  # gate dla measure_iv() - patrz petla for p in points
                 last_sweep_flush_ts = time.time()  # throttling flush() pliku sweep - patrz przy zapisie ponizej
+                # Harmonogram stalego taktu (patrz SAMPLE INTERVAL w petli).
+                # Terminy liczone bezwzglednie od tego punktu: t0 + n*interwal.
+                schedule_t0 = time.time()
+                sample_idx = -1
+                late_count = 0
                 while True:
                     if self.sweep_abort:
                         break
@@ -3467,6 +3523,34 @@ class PeltierControl:
                     for p in points:
                         if self.sweep_abort:
                             break
+
+                        # STALY TAKT: czekaj do nastepnego terminu z rownego
+                        # harmonogramu (t0 + n*interwal). Terminy sa BEZWZGLEDNE
+                        # wzgledem startu, nie "sleep po kazdej probce" - dzieki
+                        # temu jedna spozniona probka nie przesuwa wszystkich
+                        # kolejnych (bez kumulacji dryfu). Jesli pomiar trwa
+                        # dluzej niz zadany interwal, nie da sie go dotrzymac -
+                        # liczymy takie przypadki, zeby moc ostrzec uzytkownika.
+                        if sample_interval_ms > 0:
+                            sample_idx += 1
+                            due = schedule_t0 + sample_idx * (sample_interval_ms / 1000.0)
+                            wait = due - time.time()
+                            if wait > 0:
+                                # drobne kawalki - zeby STOP dzialal od razu,
+                                # a nie dopiero po odczekaniu calego interwalu
+                                end = time.time() + wait
+                                while True:
+                                    left = end - time.time()
+                                    if left <= 0 or self.sweep_abort:
+                                        break
+                                    time.sleep(min(left, 0.02))
+                                if self.sweep_abort:
+                                    break
+                            elif wait < -(sample_interval_ms / 1000.0):
+                                # spoznieni o wiecej niz caly interwal - pomiar
+                                # fizycznie nie nadaza za zadanym taktem
+                                late_count += 1
+
                         settle_s = max(0.0, settle_ms / 1000.0)
                         # W trybie ciaglym wartosc zrodlowa jest ustawiana RAZ
                         # (przy setup_source_*_measure_* powyzej + pierwsza
@@ -3475,6 +3559,15 @@ class PeltierControl:
                         # nie zmienilo. To realnie przyspiesza tempo pomiaru
                         # (usuwa SETTLE_TIME+ponowny zapis z kazdej kolejnej
                         # probki, zostawiajac tylko czas integracji NPLC).
+                        # Znacznik czasu bierzemy PRZED wywolaniem pomiaru, nie
+                        # po. Wczesniej brany "po" dziedziczyl zmienny czas
+                        # trwania samego odczytu (integracja NPLC + narzut USB),
+                        # wiec nawet przy idealnie rownym harmonogramie zapisane
+                        # odstepy mialy jitter rzedu kilkunastu ms. Chwila
+                        # zlecenia odczytu lezy dokladnie na siatce taktu, a
+                        # opoznienie integracji jest w praktyce stale - czyli
+                        # przechodzi w staly offset, nie w rozrzut.
+                        t_meas_wall = time.time()
                         use_fast_path = continuous and first_pass_value_set
                         if use_fast_path:
                             i_meas, v_meas = self.keithley.measure_iv("a")
@@ -3484,7 +3577,7 @@ class PeltierControl:
                             i_meas, v_meas = self.keithley.set_current_and_measure("a", p, settle_s)
                         first_pass_value_set = True
                         self.sweep_done += 1
-                        t_elapsed = time.time() - self.sweep_t0
+                        t_elapsed = t_meas_wall - self.sweep_t0
                         self.sweep_queue.put((t_elapsed, p, i_meas, v_meas))
 
                         # Nakarm te same "ostatnie znane" pola co stary tryb ciaglego
@@ -3557,7 +3650,7 @@ class PeltierControl:
                         if self.cyc_on:
                             with self._pending_keithley_lock:
                                 self._pending_keithley_rows.append({
-                                    't_wallclock': time.time(),
+                                    't_wallclock': t_meas_wall,
                                     't_before': self.last_known_rel,
                                     't1_before': self.last_known_t1,
                                     't2_before': self.last_known_t2,
@@ -3576,6 +3669,20 @@ class PeltierControl:
                         time.sleep(loop_pause_ms / 1000.0)
 
                 self.keithley.output_off("a")
+
+                # Jesli pomiar nie nadazal za zadanym taktem, powiedz to wprost -
+                # inaczej uzytkownik dostalby nierowne odstepy sadzac, ze sa rowne.
+                if late_count > 0 and not self.sweep_abort:
+                    n_late = late_count
+                    iv = sample_interval_ms
+                    self.root.after(0, lambda n=n_late, iv=iv: messagebox.showwarning(
+                        "Takt probkowania niedotrzymany",
+                        f"{n} probek nie zmiescilo sie w zadanym takcie {iv:.0f} ms - "
+                        f"pojedynczy pomiar trwa dluzej niz ten interwal, wiec odstepy "
+                        f"w tych miejscach sa dluzsze.\n\n"
+                        f"Zwieksz SAMPLE INTERVAL, albo przyspiesz pomiar: odznacz "
+                        f"AUTOZERO i AUTORANGE, ustaw AVERAGING na 1, a w ostatniej "
+                        f"kolejnosci zmniejsz NPLC (kosztem szumu)."))
             except Exception as e:
                 self.root.after(0, lambda e=e: messagebox.showerror("Sweep error", str(e)))
             finally:
@@ -3905,62 +4012,102 @@ class PeltierControl:
         tego problemu - zawsze trafia dokladnie na linie prosta miedzy dwoma
         faktycznie zmierzonymi punktami."""
         with self._pending_keithley_lock:
-            if not self._pending_keithley_rows:
-                return
             pending = self._pending_keithley_rows
             self._pending_keithley_rows = []
-        n = len(pending)
-        for i, p in enumerate(pending):
+        temp_rows = self._pending_temp_rows
+        self._pending_temp_rows = []
+        if not pending and not temp_rows:
+            return
+
+        # ── 1) Wiersze KEITHLEYA: zmierzony prad + WYLICZONA temperatura ────
+        # Temperature interpolujemy MIEDZY dwoma prawdziwymi odczytami
+        # termopary ('przed' zanotowany w chwili probki, 'po' z tego tyknięcia).
+        # Oba punkty sa zmierzone, a temperatura miedzy nimi jest fizycznie
+        # ograniczona - to uzasadnione przyblizenie, nie zgadywanie.
+        k_rows = []
+        for p in pending:
             span = wallclock_after - p['ts_before_wallclock']
             frac = (p['t_wallclock'] - p['ts_before_wallclock']) / span if span > 0.001 else 0.0
             frac = max(0.0, min(1.0, frac))
-            def interp(before, after):
+            def interp(before, after, f=frac):
                 if before is None: return after
                 if after is None: return before
-                return before + frac * (after - before)
-            t1_i = interp(p['t1_before'], t1_after)
-            t2_i = interp(p['t2_before'], t2_after)
-            t_i = interp(p['t_before'], rel_after)
-            # flush=True TYLKO na ostatnim wierszu paczki - patrz obszerny
-            # komentarz w cyc_log(). Zapis kazdego wiersza (writerow) i tak
-            # trafia do bufora Pythona natychmiast, wiec dane NIE gina - po
-            # prostu nie wymuszamy kosztownego syscalla flush() 7-8 razy z
-            # rzedu, tylko raz na koniec calej paczki.
-            self.cyc_log(t_i, t1_i, t2_i, p['sp'], p['pct'], p['fn'],
-                        spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
-                        fw_ts=None, state=p['state'],
-                        keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
-                        heat=p['heat'], flush=(i == n - 1))
+                return before + f * (after - before)
+            k_rows.append({
+                'pc_wall': p['t_wallclock'],   # chwila POMIARU, nie zapisu
+                'rel': interp(p['t_before'], rel_after),
+                't1': interp(p['t1_before'], t1_after),
+                't2': interp(p['t2_before'], t2_after),
+                'sp': p['sp'], 'pct': p['pct'], 'fn': p['fn'], 'spa': p['spa'],
+                'kp': p['kp'], 'ki': p['ki'], 'kd': p['kd'],
+                'fw_ts': None, 'state': p['state'], 'heat': p['heat'],
+                'k_i': p['keithley_i'], 'k_v': p['keithley_v'],
+            })
+
+        # ── 2) Wiersze TEMPERATURY: zmierzona temperatura, prad PUSTY ───────
+        # Pradu NIE dopisujemy - to mierzony sygnal, a nie wielkosc, ktora
+        # wolno przyblizac. Pusta komorka znaczy uczciwie: tu nie mierzono.
+        for tr in temp_rows:
+            tr['k_i'] = tr['k_v'] = None
+
+        # ── 3) Zapis wszystkiego CHRONOLOGICZNIE, jeden flush na koncu ──────
+        # flush=True tylko przy ostatnim wierszu - patrz komentarz w cyc_log():
+        # writerow i tak trafia natychmiast do bufora Pythona (dane nie gina),
+        # nie ma potrzeby wymuszac syscalla przy kazdym z kilkunastu wierszy.
+        all_rows = sorted(k_rows + temp_rows, key=lambda r: r['rel'])
+        n = len(all_rows)
+        for i, r in enumerate(all_rows):
+            self.cyc_log(r['rel'], r['t1'], r['t2'], r['sp'], r['pct'], r['fn'],
+                        spa=r['spa'], kp=r['kp'], ki=r['ki'], kd=r['kd'],
+                        fw_ts=r.get('fw_ts'), state=r['state'],
+                        keithley_i=r.get('k_i'), keithley_v=r.get('k_v'),
+                        heat=r['heat'], flush=(i == n - 1),
+                        pc_wallclock=r.get('pc_wall'))
 
     def _flush_pending_keithley_rows_fallback(self):
         """Uzywane wylacznie przy cyc_stop() - jesli w buforze zostaly probki
         Keithleya czekajace na kolejne tykniecie, ktore juz nigdy nie
-        nadejdzie (cykl sie konczy), zapisujemy je z EKSTRAPOLACJA (patrz
-        _estimate_temp_now) zamiast je zgubic - to jedyny rozsadny fallback
-        gdy naprawde nie ma zadnego 'po' do interpolacji."""
+        nadejdzie (cykl sie konczy), zapisujemy je mimo to - zeby zaden
+        zmierzony prad nie przepadl. Temperatury dla nich NIE da sie juz
+        wyliczyc (brak odczytu 'po', wiec nie ma miedzy czym interpolowac),
+        wiec zostaje pusta - nie zgadujemy jej ekstrapolacja."""
+        # Najpierw zbuforowane wiersze TEMPERATURY - nie moga przepasc tylko
+        # dlatego, ze cykl skonczyl sie zanim doszlo do wspolnego flushu.
+        # Prad bierzemy z ostatniej znanej kotwicy (nie ma juz 'po' do
+        # interpolacji); brak kotwicy -> pusto, jak dawniej.
+        temp_rows = self._pending_temp_rows
+        self._pending_temp_rows = []
+        if temp_rows:
+            for tr in temp_rows:
+                # prad zostaje pusty - nie dopisujemy go nigdy
+                self.cyc_log(tr['rel'], tr['t1'], tr['t2'], tr['sp'], tr['pct'], tr['fn'],
+                             spa=tr['spa'], kp=tr['kp'], ki=tr['ki'], kd=tr['kd'],
+                             fw_ts=tr['fw_ts'], state=tr['state'],
+                             keithley_i=None, keithley_v=None, heat=tr['heat'], flush=False,
+                             pc_wallclock=tr.get('pc_wall'))
+
         with self._pending_keithley_lock:
             if not self._pending_keithley_rows:
+                if temp_rows:
+                    try: self.cyc_file.flush()
+                    except Exception: pass
                 return
             pending = self._pending_keithley_rows
             self._pending_keithley_rows = []
         n = len(pending)
         for i, p in enumerate(pending):
-            def extrap_one(before, before_prev, dt_ticks, t_since):
-                if before is None: return None
-                if before_prev is None or dt_ticks is None or dt_ticks <= 0.001:
-                    return before
-                rate = (before - before_prev) / dt_ticks
-                return before + rate * min(t_since, 0.25)
             t_since = p['t_wallclock'] - p['ts_before_wallclock']
-            dt_ticks = self.last_known_prev_wallclock_ts and \
-                (p['ts_before_wallclock'] - self.last_known_prev_wallclock_ts)
-            t1_i = extrap_one(p['t1_before'], self.last_known_t1_prev, dt_ticks, t_since)
-            t2_i = extrap_one(p['t2_before'], self.last_known_t2_prev, dt_ticks, t_since)
+            # Cykl sie konczy - dla tych ostatnich probek NIE MA juz odczytu
+            # 'po', wiec nie da sie interpolowac MIEDZY dwoma pomiarami.
+            # Ekstrapolacja bylaby zgadywaniem poza zakresem danych, wiec
+            # temperatura zostaje PUSTA. Sam pomiar pradu jest zachowany.
+            t1_i = t2_i = None
             self.cyc_log(p['t_before'] + t_since, t1_i, t2_i, p['sp'], p['pct'], p['fn'],
                         spa=p['spa'], kp=p['kp'], ki=p['ki'], kd=p['kd'],
                         fw_ts=None, state=p['state'],
                         keithley_i=p['keithley_i'], keithley_v=p['keithley_v'],
-                        heat=p['heat'], flush=(i == n - 1))
+                        heat=p['heat'], flush=(i == n - 1),
+                        pc_wallclock=p.get('t_wallclock'))
 
     def _estimate_temp_now(self):
         """Szacuje AKTUALNA temperature (T1, T2) w chwili wywolania, na
@@ -4133,6 +4280,29 @@ class PeltierControl:
         mk_segmented(atb2c, [("T1", 'T1'), ("T2", 'T2'), ("Average (T1+T2)/2", 'avg')],
                      self.arch_temp_source, command=self._redraw_arch, accent=C['orange'])
 
+        # ── Eksport na ROWNA SIATKE czasu ────────────────────────────────
+        # Dziala na dowolnym zaznaczonym cyklu, takze na STARYCH plikach
+        # zebranych wczesniej. Tworzy kopie obok oryginalu - zrodlo nietkniete.
+        atb2d = tk.Frame(cf, bg=C['panel'])
+        atb2d.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Label(atb2d, text="EXPORT NA ROWNA SIATKE:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        tk.Label(atb2d, text="krok", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left')
+        self.arch_grid_step_entry = tk.Entry(atb2d, width=6, bg=C['bg2'], fg=C['text'],
+                                             insertbackground=C['text'], relief='flat',
+                                             font=(FONT, fsz(9)))
+        self.arch_grid_step_entry.insert(0, "auto")
+        self.arch_grid_step_entry.pack(side='left', padx=4)
+        tk.Label(atb2d, text="ms", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left', padx=(0, 8))
+        self.arch_grid_mode = tk.StringVar(value='interp')
+        mk_segmented(atb2d, [("interpolacja", 'interp'), ("srednia w przedziale", 'avg')],
+                     self.arch_grid_mode, accent=C['cyan'])
+        tk.Button(atb2d, text="EXPORT", command=self._export_selected_to_grid,
+                  bg=C['cyan'], fg=C['bg'], relief='flat', bd=0, padx=10,
+                  font=(FONT, fsz(8), 'bold'), cursor='hand2').pack(side='left', padx=8)
+
         atb2b = tk.Frame(cf, bg=C['panel'])
         atb2b.pack(fill='x', padx=8, pady=(0, 8))
         self.arch_show_current_var = tk.BooleanVar(value=True)
@@ -4292,7 +4462,13 @@ class PeltierControl:
         return sorted(
             [f for f in self.log_dir.glob("*.csv")
              if (f.name.startswith("cykl_") or f.name.startswith("c_"))
-             and not f.name.startswith("_tmp")],
+             and not f.name.startswith("_tmp")
+             # Pliki przepróbkowane na rowna siatke (_siatkaNNNms) sa wersja
+             # POCHODNA istniejacego cyklu - gdyby trafily na liste, kazdy
+             # pomiar pokazywalby sie podwojnie. Maja tez inny zestaw kolumn
+             # (bez timestamp_pc/czas_firmware_s), wiec i tak nie wczytalyby
+             # sie poprawnie. Sa przeznaczone do analizy poza aplikacja.
+             and "_siatka" not in f.name],
             key=lambda f: f.stat().st_mtime, reverse=True)
 
     def _arch_date_header_text(self, d):
@@ -5204,10 +5380,18 @@ class PeltierControl:
                 # (temperatura co 100ms, Keithley co jego wlasne tempo) trafiaja
                 # do TEGO SAMEGO pliku cyklu, przeplatane wg rzeczywistego czasu.
                 if self.cyc_on:
-                    self.cyc_log(rel, t1, t2, sp, pct, fn,
-                                 spa=spa, kp=d.get('kp'), ki=d.get('ki'), kd=d.get('kd'),
-                                 fw_ts=tsr, state=d.get('state'),
-                                 keithley_i=None, keithley_v=None, heat=heat_dir)
+                    # Nie zapisujemy od razu - wiersz czeka na wspolny flush po
+                    # calej paczce, gdzie dostanie INTERPOLOWANY prad Keithleya
+                    # (patrz _flush_pending_keithley_rows). Bez tego mialby
+                    # pusta komorke pradu.
+                    self._pending_temp_rows.append({
+                        'rel': rel, 't1': t1, 't2': t2, 'sp': sp, 'pct': pct, 'fn': fn,
+                        'spa': spa, 'kp': d.get('kp'), 'ki': d.get('ki'), 'kd': d.get('kd'),
+                        'fw_ts': tsr, 'state': d.get('state'), 'heat': heat_dir,
+                        # chwila odebrania tej porcji danych z firmware - to ona
+                        # trafi do kolumny timestamp_pc, nie czas zapisu do pliku
+                        'pc_wall': now_ts,
+                    })
 
                 pc_now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 self._raw_append((tsr, pc_now, t1, t2, sp, spa, pct, fn, d.get('state',''), k_i, k_v, heat_dir))
@@ -5487,7 +5671,7 @@ class PeltierControl:
 
     def cyc_log(self, t, t1, t2, sp, pct, fn, spa=None, kp=None, ki=None, kd=None,
                 fw_ts=None, state=None, keithley_i=None, keithley_v=None, heat=None,
-                flush=True):
+                flush=True, pc_wallclock=None):
         if self.cyc_wr:
             try:
                 t1s = f"{t1:.3f}" if t1 is not None else ""
@@ -5500,7 +5684,14 @@ class PeltierControl:
                 kis_a = f"{keithley_i:.9e}" if keithley_i is not None else ""
                 kvs = f"{keithley_v:.9e}" if keithley_v is not None else ""
                 dirs = "" if heat is None else ("HEAT" if heat else "COOL")
-                pc_ts = datetime.now().isoformat(timespec="milliseconds")
+                # Znacznik zegara PC MUSI pochodzic z chwili POMIARU, nie z
+                # chwili zapisu. Wiersze zapisujemy paczkami (raz na tykniecie
+                # tick()), wiec datetime.now() w tym miejscu nadalby calej
+                # paczce jeden wspolny czas - kolumna wygladalaby jak czas
+                # pomiaru, a byla by czasem zapisu. pc_wallclock=None (np.
+                # zapis awaryjny) -> fallback na czas biezacy.
+                pc_ts = (datetime.fromtimestamp(pc_wallclock) if pc_wallclock
+                         else datetime.now()).isoformat(timespec="milliseconds")
                 row = [
                     pc_ts, fwts, f"{t:.3f}",
                     t1s, t2s,
@@ -5568,6 +5759,173 @@ class PeltierControl:
     def _ask_save_name(self, tmp_path):
         SaveCycleDialog(self.root, self, tmp_path)
 
+    # Kolumny liczbowe interpolowane na rowna siatke. 'stan'/'kierunek' sa
+    # tekstowe - bierzemy wartosc z najblizszego wiersza zrodlowego.
+    _GRID_NUM_COLS = ['temperatura1_C', 'temperatura2_C', 'setpoint_aktywny_C',
+                      'setpoint_cel_C', 'peltier_pct', 'fan_pct',
+                      'Kp', 'Ki', 'Kd', 'keithley_prad_A', 'keithley_napiecie_V']
+    _GRID_TXT_COLS = ['kierunek', 'stan']
+
+    def _export_selected_to_grid(self):
+        """Eksportuje ZAZNACZONE w archiwum cykle na rowna siatke czasu.
+        Zrodlowe pliki pozostaja nietkniete - powstaja kopie obok nich."""
+        sel = [p for p, v in self.arch_vars.items() if v.get()]
+        if not sel:
+            messagebox.showinfo("Export na siatke",
+                                "Zaznacz najpierw co najmniej jeden cykl na liscie.")
+            return
+        raw = (self.arch_grid_step_entry.get() or '').strip().lower()
+        if raw in ('', 'auto'):
+            step_s = None
+        else:
+            try:
+                step_s = float(raw.replace(',', '.')) / 1000.0
+                if step_s <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Export na siatke",
+                                     "Krok musi byc liczba dodatnia w ms, albo 'auto'.")
+                return
+        mode = self.arch_grid_mode.get()
+        done, errs = [], []
+        for p in sel:
+            try:
+                done.append(self.resample_cycle_to_grid(p, step_s=step_s, mode=mode).name)
+            except Exception as e:
+                errs.append(f"{Path(p).name}: {e}")
+        msg = ""
+        if done:
+            msg += "Utworzono:\n" + "\n".join(f"  • {n}" for n in done)
+        if errs:
+            msg += ("\n\n" if msg else "") + "Pominieto:\n" + "\n".join(f"  • {e}" for e in errs)
+        (messagebox.showinfo if done else messagebox.showerror)("Export na siatke", msg)
+        try:
+            self.refresh_arch()
+        except Exception:
+            pass
+
+    def resample_cycle_to_grid(self, src_path, step_s=None, mode='interp'):
+        """Tworzy OBOK pliku zrodlowego jego wersje przepróbkowana na ROWNA
+        siatke czasu (co step_s sekund). Plik zrodlowy pozostaje NIETKNIETY -
+        to on jest prawdziwym rekordem pomiaru, siatka jest wersja pochodna,
+        wygodna do analizy i wykresow.
+
+        step_s=None -> krok dobierany automatycznie: mediana rzeczywistych
+        odstepow miedzy probkami Keithleya (zaokraglona do 1ms). Dzieki temu
+        siatka nie jest gestsza niz realne dane (nie udajemy rozdzielczosci,
+        ktorej nie ma) ani rzadsza (nie tracimy informacji).
+
+        mode:
+          'interp' - wartosc w wezle siatki interpolowana liniowo miedzy
+                     sasiednimi pomiarami (wierne odwzorowanie przebiegu)
+          'avg'    - srednia ze WSZYSTKICH probek wpadajacych w dany przedzial
+                     siatki; przy szumiacym sygnale pA redukuje szum ~sqrt(N),
+                     ale wygladza szybkie zmiany
+
+        Zwraca sciezke utworzonego pliku."""
+        src_path = Path(src_path)
+        with open(src_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise ValueError("plik jest pusty")
+
+        def fnum(r, col):
+            v = (r.get(col) or '').strip()
+            if not v:
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
+        pts = []
+        for r in rows:
+            t = fnum(r, 'czas_od_startu_s')
+            if t is not None:
+                pts.append((t, r))
+        if len(pts) < 2:
+            raise ValueError("za malo wierszy z czasem, zeby zbudowac siatke")
+        pts.sort(key=lambda x: x[0])
+        times = [p[0] for p in pts]
+
+        # krok siatki: mediana odstepow miedzy wierszami Keithleya
+        if step_s is None:
+            kt = [t for t, r in pts if (r.get('keithley_prad_A') or '').strip()]
+            base = kt if len(kt) >= 3 else times
+            diffs = sorted(base[i + 1] - base[i] for i in range(len(base) - 1))
+            diffs = [d for d in diffs if d > 1e-6]
+            if not diffs:
+                raise ValueError("nie mozna wyznaczyc kroku siatki")
+            step_s = round(diffs[len(diffs) // 2], 3)
+        if step_s <= 0:
+            raise ValueError("krok siatki musi byc dodatni")
+
+        t_start, t_end = times[0], times[-1]
+        n_nodes = int((t_end - t_start) / step_s) + 1
+        if n_nodes > 2_000_000:
+            raise ValueError(f"krok {step_s}s dalby {n_nodes} wierszy - zbyt gesta siatka")
+
+        # dla kazdej kolumny lista (czas, wartosc) tylko z wierszy, ktore ja maja
+        series = {}
+        for col in self._GRID_NUM_COLS:
+            s = [(t, fnum(r, col)) for t, r in pts]
+            series[col] = [(t, v) for t, v in s if v is not None]
+
+        def interp_at(col, t):
+            s = series[col]
+            if not s:
+                return None
+            if t <= s[0][0]:
+                return s[0][1]
+            if t >= s[-1][0]:
+                return s[-1][1]
+            i = bisect.bisect_left([x[0] for x in s], t)
+            t0, v0 = s[i - 1]
+            t1, v1 = s[i]
+            if t1 - t0 <= 1e-12:
+                return v1
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+
+        out_path = src_path.with_name(src_path.stem + f"_siatka{int(round(step_s*1000))}ms.csv")
+        header = (['czas_od_startu_s'] + self._GRID_NUM_COLS + self._GRID_TXT_COLS
+                  + ['n_probek_w_przedziale'])
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            src_t = times
+            for k in range(n_nodes):
+                t = t_start + k * step_s
+                # ile realnych probek wpadlo w ten przedzial - kolumna kontrolna:
+                # 0 oznacza wezel powstaly wylacznie z interpolacji (rzadziej
+                # probkowany fragment), >1 ze bylo tam wiecej danych niz siatka
+                lo = bisect.bisect_left(src_t, t - step_s / 2)
+                hi = bisect.bisect_right(src_t, t + step_s / 2)
+                n_in = hi - lo
+                row = [f"{t:.4f}"]
+                for col in self._GRID_NUM_COLS:
+                    if mode == 'avg' and n_in > 0:
+                        vals = [fnum(pts[j][1], col) for j in range(lo, hi)]
+                        vals = [v for v in vals if v is not None]
+                        v = sum(vals) / len(vals) if vals else interp_at(col, t)
+                    else:
+                        v = interp_at(col, t)
+                    if v is None:
+                        row.append("")
+                    elif col in ('keithley_prad_A', 'keithley_napiecie_V'):
+                        row.append(f"{v:.9e}")
+                    else:
+                        row.append(f"{v:.4f}")
+                # kolumny tekstowe: z najblizszego wiersza zrodlowego
+                j = min(range(len(src_t)), key=lambda idx: abs(src_t[idx] - t)) \
+                    if len(src_t) < 20000 else max(0, min(len(src_t) - 1,
+                                                          bisect.bisect_left(src_t, t)))
+                for col in self._GRID_TXT_COLS:
+                    row.append((pts[j][1].get(col) or '').strip())
+                row.append(n_in)
+                w.writerow(row)
+        print(f"Siatka: {out_path.name}  ({n_nodes} wierszy, krok {step_s*1000:.0f} ms)")
+        return out_path
+
     def save_cycle_as(self, tmp_path, name):
         import re as _re
         safe = _re.sub(r'[^\w\-\s]', '', name.strip())
@@ -5580,6 +5938,18 @@ class PeltierControl:
             tmp_path.rename(dest)
             print(f"Saved: {dest.name}")
         except Exception as e: print(f"err: {e}")
+        # Obok surowego pliku generujemy automatycznie wersje przepróbkowana
+        # na rowna siatke czasu. Surowy plik zostaje nietkniety - to on jest
+        # prawdziwym rekordem pomiaru i zabezpieczeniem na wypadek awarii;
+        # siatka jest wersja pochodna, gotowa do analizy/wykresow.
+        # Blad generowania siatki NIE MOZE zepsuc zapisu surowych danych.
+        # Plik z rowna siatka to dane POCHODNE (interpolowane). W trybie
+        # surowym nie tworzymy go automatycznie - zostaje dostepny na zadanie,
+        # przyciskiem EXPORT NA ROWNA SIATKE w zakladce ARCHIVE.
+        # Plik z rowna siatka czasu to dane POCHODNE (interpolowany takze
+        # PRAD) - dlatego NIE powstaje automatycznie. Jest dostepny wylacznie
+        # na wyrazne zadanie, przyciskiem EXPORT NA ROWNA SIATKE w zakladce
+        # ARCHIVE, i zawsze jako OSOBNY plik; zrodlo pozostaje nietkniete.
         if hasattr(self, 'refresh_arch'):
             try: self.refresh_arch()
             except: pass
