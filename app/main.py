@@ -77,7 +77,7 @@ RAMP_MAX_UI = 150.0
 # Widoczny w gornym pasku aplikacji numer builda - podbijany przy kazdej
 # wiekszej zmianie. Pozwala od razu sprawdzic "na oko" czy uruchomiony plik
 # to faktycznie najnowsza wersja main.py, bez zgadywania po samym wygladzie.
-BUILD_VERSION = "2026-07-11.26"
+BUILD_VERSION = "2026-07-11.27"
 
 _SI_PREFIXES = [(1e0, ''), (1e-3, 'm'), (1e-6, 'µ'), (1e-9, 'n'), (1e-12, 'p')]
 def fmt_si(value, digits=3):
@@ -5142,13 +5142,18 @@ class PeltierControl:
                 self.last_known_prev_wallclock_ts = self.last_known_rel_wallclock_ts
 
                 now_ts = time.time()
-                # Zanim nadpiszemy last_known_* nowymi wartosciami, mamy juz
-                # wszystko czego trzeba (t1,t2,rel swieze z tego tyknięcia) -
-                # to wlasnie ten moment, w ktorym kazda probka Keithleya
-                # oczekujaca w buforze (zebrana OD POPRZEDNIEGO tykniecia)
-                # dostaje swoje prawdziwe 'po' i moze zostac poprawnie
-                # zinterpolowana miedzy dwoma faktycznie zmierzonymi punktami.
-                self._flush_pending_keithley_rows(t1, t2, rel, now_ts)
+                # UWAGA: flush oczekujacych probek Keithleya NIE moze byc tutaj,
+                # wewnatrz petli po kolejce! tick() przetwarza CALA kolejke
+                # naraz, a firmware zdazy przyslac 2-4 tykniecia miedzy
+                # kolejnymi wywolaniami tick(). Flush wewnatrz petli oproznial
+                # caly bufor juz przy PIERWSZYM tyknieciu z paczki - wiec
+                # wszystkie probki (zebrane przez ~250-300ms realnego czasu)
+                # byly sciskane w interwal JEDNEGO tykniecia (0.1s), a
+                # pozostale 1-3 tykniecia dostawaly pusty bufor. Stad brala sie
+                # POZORNA luka w kolumnie czasu: dokladnie (liczba_tykniec-1) x
+                # 100ms, czyli obserwowane 114 / 213 / 312 ms. Prawdziwe tempo
+                # probkowania bylo rowne - to interpolacja je znieksztalcala.
+                # Flush jest teraz wywolywany RAZ, po calej petli (nizej).
 
                 self.last_known_rel = rel
                 self.last_known_rel_wallclock_ts = now_ts
@@ -5271,6 +5276,21 @@ class PeltierControl:
                     self.reach_lbl.config(text=f"→ reaching {self.reach_target:.1f}°C · {tstr}", fg=C['yellow'])
                 elif not pid_on:
                     self.reach_lbl.config(text="")
+
+            # FLUSH oczekujacych probek Keithleya - RAZ, po przetworzeniu CALEJ
+            # paczki z kolejki (nie w srodku petli!). last_known_* trzymaja
+            # teraz wartosci z OSTATNIEGO tykniecia paczki, wiec probki zebrane
+            # od poprzedniego wywolania tick() rozkladaja sie interpolacja na
+            # PELNY zakres czasu firmware objety ta paczka.
+            #
+            # Poprzednio flush byl w srodku petli i oprozniał bufor juz przy
+            # PIERWSZYM tyknieciu - przez co ~250-300ms realnych probek ladowalo
+            # w interwale 0.1s, a kolejne 1-3 tykniecia zostawaly puste. W pliku
+            # wygladalo to jak regularna luka (liczba_tykniec-1) x 100ms, czyli
+            # obserwowane 114/213/312ms - mimo ze Keithley mierzyl ROWNO.
+            self._flush_pending_keithley_rows(
+                self.last_known_t1, self.last_known_t2,
+                self.last_known_rel, self.last_known_rel_wallclock_ts)
 
             # Programator: maszyna stanow krokow (grzej/trzymaj/schlodz/trzymaj)
             # dziala na najswiezszej znanej temperaturze, niezaleznie czy w tym
